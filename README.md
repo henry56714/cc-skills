@@ -8,7 +8,7 @@ Skills follow a common format (SKILL.md + scripts + rules) and are compatible wi
 
 | Skill | Trigger | What it does |
 |---|---|---|
-| **[scan-android](#scan-android)** | `/scan-android` · "scan code" | Incremental security / stability / performance scan for any Android project — outputs structured findings and a Markdown report |
+| **[scan-android](#scan-android)** | `/scan-android` · "scan code" | Source/APK scanner for any Android project (security, stability & performance defects) — outputs structured findings and a Markdown report |
 
 ---
 
@@ -46,7 +46,7 @@ Rules are self-gating by technology — only patterns relevant to the tech stack
 
 ```
 /scan-android
-/scan-android --module=app --checks=security
+/scan-android --module=app
 /scan-android --full
 ```
 

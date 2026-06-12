@@ -1,6 +1,6 @@
 ---
 name: scan-android
-description: 通用 Android 代码扫描器，对任意 Android/APK 工程做单次、无状态扫描，覆盖安全、稳定性、性能三个通用维度。规则按「技术存在与否」自动适用——用到某项技术（数据库 / 长连接 / AIDL 等）才扫，没用到自动跳过。当用户要求"扫描代码""扫描 bug""找出代码库中的问题"或调用 `/scan-android` 时触发。支持参数 --diff（默认 HEAD~1）、--full、--module=NAME、--files=GLOB、--checks=security,stability,perf。
+description: 通用 Android 代码扫描器，对任意 Android/APK 工程做单次、无状态扫描，覆盖安全、稳定性、性能等常见缺陷。每次跑全部规则（无维度/子集开关）。规则按「技术存在与否」自动适用——用到某项技术（数据库 / 长连接 / AIDL 等）才扫，没用到自动跳过。当用户要求"扫描代码""扫描 bug""找出代码库中的问题"或调用 `/scan-android` 时触发。支持参数 --diff（默认 HEAD~1）、--full、--module=NAME、--files=GLOB。
 ---
 
 # scan-android
@@ -13,19 +13,16 @@ skill 不内置任何特定项目的模块名 / flavor / 路径——这些通�
 
 用户表述如："扫描代码"、"scan for bugs"、"找出隐藏问题"、"run scan-android"、"对 X 模块做一次稳定性扫描"。若用户只是要求评审单个 PR 或单个 diff 的某次讨论，那是 *review* 任务，不要使用本 skill。
 
-## 检查维度
+## 检查覆盖
 
-三个维度全部**通用**，对所有 Android 工程适用：
+**一次扫描跑全部规则——不再按维度分，也没有 `--checks` 子集。** 两类来源：
 
-> **规则来源（v3）：** 广度规则来自**引擎自带 / 社区库**（Semgrep registry + Detekt + PMD + Lint），随上游更新，不由本 skill 维护。跨文件/逻辑类的深层缺陷由 **AI 支线**（`rules/ai/hunting.md`）覆盖。本 skill 不再维护单行检测规则（旧 `rules/*.md` 已退役）。
+- **工具引擎（广度，规则来自社区库 / 引擎自带，随上游更新，本 skill 不维护单行规则）：** Semgrep（社区 registry 包 `p/security-audit·owasp·secrets·java·kotlin` + `queries/semgrep/` 本地补充）、Detekt（Kotlin）、PMD（errorprone / 多线程 / 性能）、Android Lint、Joern（跨文件 CPG）。
+- **AI 支线（深度，`rules/ai/hunting.md`）：** 鉴权绕过、跨文件越权数据流、并发竞态、生命周期错配、非幂等重试、缓存一致性、资源 / WakeLock 释放、主线程阻塞、算法劣化等规则编不出的逻辑缺陷。
 
-| 维度 | 工具引擎（广度） | AI 支线（深度，`rules/ai/`） |
-|---|---|---|
-| security | Semgrep `p/security-audit·owasp·secrets·java·kotlin`、Lint | 鉴权绕过、跨文件越权数据流、凭证误用、组件暴露语义、Binder 调用方校验、Intent 重定向 |
-| stability | Detekt（Kotlin）、PMD errorprone/多线程、Lint | 并发竞态、生命周期错配、非幂等重试、缓存一致性、register/unregister 对称、WakeLock/异步释放、重连退避 |
-| perf | PMD performance、Lint | 主线程阻塞（调用链回溯）、算法劣化（N+1/O(n²)）、资源未及时释放 |
+> 仍会发现安全 / 稳定性 / 性能类问题，但这只是**覆盖范围的描述**，不再是可选择、可分批的扫描维度。
 
-**没有业务 / 定制维度。** 凡是某项技术（数据库、长连接、AIDL、周期调度…）相关的规则，都是**模式自门控**的：只在用到该技术的工程里命中，没用到的 APK 不会产生任何候选——「用了就扫，没用就跳」是模式锚定架构的天然行为，无需任何配置或能力探测。
+**没有业务 / 定制维度。** 凡涉及某项技术（数据库、长连接、AIDL、周期调度…）的规则都是**模式自门控**：只在用到该技术的工程里命中，没用到自动跳过——无需任何配置或能力探测。
 
 ## 参数
 
@@ -37,7 +34,6 @@ skill 不内置任何特定项目的模块名 / flavor / 路径——这些通�
 | `--full` | off | 作用域 = 整个仓库。开销大，必须用户显式启用。 |
 | `--module=X` | — | 限定到模块 `X/`。模块名由 `detect_project.py` 自动探测（见第 2 步）；若用户给的模块不在探测列表中，提示可用模块。 |
 | `--files=GLOB` | — | 限定到 glob（相对仓库根）。 |
-| `--checks=A,B,...` | `security,stability,perf` | 通用三项的子集。 |
 
 作用域参数可组合：`--module=app --files=**/db/**` ⇒ 匹配该 glob 的 `app/` 下文件。
 
@@ -66,9 +62,7 @@ skill 不内置任何特定项目的模块名 / flavor / 路径——这些通�
 >   `joern` 加入 `excluded_engines` 后重新运行"，然后等待用户决定。
 
 ```
-python3 <SKILL_DIR>/scripts/preflight.py \
-    --checks <CSV> \
-    --repo-root .
+python3 <SKILL_DIR>/scripts/preflight.py --repo-root .
 ```
 
 脚本先读取 `.scan/config.json` 确定哪些引擎是"needed"，然后循环执行"检测 → 安装缺失项 → 再检测"，直到没有新的可安装项为止：
@@ -106,7 +100,7 @@ python3 <SKILL_DIR>/scripts/preflight.py \
 python3 <SKILL_DIR>/scripts/detect_project.py
 ```
 
-stdout JSON 给出：`modules`（模块目录列表）、`has_flavors` / `flavors`、`suggested_lint_tasks`（第 3 步用）、`default_excludes` + `extra_excludes`（合并为排除集）、`project_context`（第 6 步注入 verifier）、`default_checks`、`is_git`、`language`（`"zh"` 或 `"en"`，第 6 步语言约束用）。后续步骤复用这些值——**不要**再凭记忆假设模块名或路径。
+stdout JSON 给出：`modules`（模块目录列表）、`has_flavors` / `flavors`、`suggested_lint_tasks`（第 3 步用）、`default_excludes` + `extra_excludes`（合并为排除集）、`project_context`（第 6 步注入 verifier）、`is_git`、`language`（`"zh"` 或 `"en"`，第 6 步语言约束用）。后续步骤复用这些值——**不要**再凭记忆假设模块名或路径。
 
 然后生成具体的文件列表：
 - `--diff REF`：先用 `detect_project.py` 的 `is_git`（或 `git rev-parse --is-inside-work-tree`）确认是 git 仓库。**若不是 git 仓库，立即中止**，并提示三种替代方案：`--module=X`、`--files=GLOB` 或 `--full`。**不要**退回到 mtime、"最近改动"或其它启发式——静默 fallback 会掩盖真正的问题并使作用域不可复现。若存在 git，运行 `git diff --name-only REF`，过滤出源文件扩展名（`detect_project.py` 的 `source_extensions`，即 `*.{java,kt,xml,aidl}`）和 `**/AndroidManifest.xml`。应用排除集（`default_excludes + extra_excludes`），除非检查类别显式面向测试。
@@ -136,8 +130,7 @@ stdout JSON 给出：`modules`（模块目录列表）、`has_flavors` / `flavor
 **不要**手工调 Grep 工具遍历规则。调用引擎编排器：
 
 ```
-python3 <SKILL_DIR>/scripts/run_engines.py \
-    --checks <CSV> --scope-files .scan/tmp/scope.txt
+python3 <SKILL_DIR>/scripts/run_engines.py --scope-files .scan/tmp/scope.txt
 ```
 
 `run_engines.py` 按 v2 可插拔架构注册并运行所有**可用**引擎 adapter，把各引擎产出归一化为统一**候选契约**后聚合：

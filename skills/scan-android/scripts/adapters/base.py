@@ -30,7 +30,6 @@ class ScanContext:
 
     repo: Path
     scope_files: list[str]
-    checks: list[str]
     rules_dir: Path
     max_per_rule: int = 100
     detect_info: dict = field(default_factory=dict)

@@ -35,26 +35,25 @@ skill 不内置任何特定项目的模块名 / flavor / 路径：这些由 `det
 /scan-android
 ```
 
-不带任何参数时默认扫描 `--diff HEAD~1`（最近一次提交的改动），检查集为通用三维 `security,stability,perf`。
+不带任何参数时默认扫描 `--diff HEAD~1`（最近一次提交的改动），每次跑全部规则（无维度/子集开关）。
 
 也可以用自然语言触发：
 
 - "扫描代码"
 - "扫描 bug"
 - "找出代码库中的问题"
-- "对 app 模块做一次稳定性扫描"
+- "对 app 模块做一次扫描"
 
 ---
 
-## 三个通用维度
+## 检查覆盖
 
-| 维度 | 重点 |
-|---|---|
-| **security** | 密钥硬编码、弱加密、TLS 信任任意、WebView 配置、导出组件/Provider、PendingIntent 可变性、明文传输、日志泄露、SQL/命令注入、IPC 调用方校验、Manifest 配置（debuggable/allowBackup）、Intent 重定向、receiver 导出标志、不安全反序列化/动态加载、敏感数据外部存储 |
-| **stability** | 资源泄漏、生命周期泄漏、register/unregister 对称性、空 catch、NPE 路径、并发正确性、WakeLock、已弃用 API、Room 迁移、长连接重连、AIDL 兼容、崩溃处理器、周期任务回压、外部输入解析、前台服务启动时序/类型（Android 12/14）、非线程安全格式化器、ConcurrentModification、LiveData owner |
-| **perf** | 主线程 I/O / DB / 网络、onDraw 分配、热路径反射、循环内拼接、Bitmap OOM、无界缓存、IPC 载荷、批量 DB 写未包事务、onReceive 重活 ANR |
+**一次扫描跑全部规则——不再按维度分、没有 `--checks` 子集。** 两类来源:
 
-这三者对所有 Android 工程通用,即全部检查集。**没有业务 / 定制维度**——凡是某项技术（数据库、长连接、AIDL、周期调度…）相关的规则都是**模式自门控**的:只在用到该技术的工程命中,没用到的 APK 不会产生候选。「用了就扫、没用就跳」是模式锚定架构的天然行为,无需配置或能力探测。
+- **工具引擎(广度,规则来自社区库/引擎自带):** Semgrep(社区 registry 包 + `queries/semgrep/` 本地补充)、Detekt(Kotlin)、PMD(errorprone/多线程/性能)、Android Lint、Joern(跨文件 CPG)。随上游更新,本 skill 不维护单行规则。
+- **AI 支线(深度,`rules/ai/hunting.md`):** 鉴权绕过、跨文件越权数据流、并发竞态、生命周期错配、非幂等重试、缓存一致性、资源/WakeLock 释放、主线程阻塞、算法劣化等规则编不出的逻辑缺陷。
+
+仍会发现安全/稳定性/性能类问题,但这只是覆盖范围的描述,不再是可选择的扫描维度。**没有业务/定制维度**——涉及某项技术(数据库、长连接、AIDL…)的规则都是**模式自门控**:用到才命中,没用到自动跳过。
 
 ---
 
@@ -66,14 +65,13 @@ skill 不内置任何特定项目的模块名 / flavor / 路径：这些由 `det
 | `--full` | 关 | 扫描整个仓库。开销大，需显式声明。 |
 | `--module=X` | — | 限定模块。模块名由 `detect_project.py` 自动探测；给错会提示可用模块。 |
 | `--files=GLOB` | — | 限定 glob，例如 `**/db/**`。 |
-| `--checks=A,B,...` | `security,stability,perf` | 通用三项的子集。 |
 
 作用域参数可组合，例如：
 
 ```
-/scan-android --module=app --checks=security,perf
-/scan-android --files=core/**/*.java --checks=stability
-/scan-android --full --checks=security,stability,perf   # 需要确认
+/scan-android --module=app
+/scan-android --files=core/**/*.java
+/scan-android --full   # 需要确认
 ```
 
 > 若仓库不是 git 仓库，`--diff` 会中止。请改用 `--module`、`--files` 或 `--full`。
@@ -111,7 +109,7 @@ skill 不内置任何特定项目的模块名 / flavor / 路径：这些由 `det
 - `extra_excludes` —— 追加项目级排除 glob（vendored 目录等）。
 - `lint_tasks` —— 覆盖 L0 lint 任务建议（按序尝试，取首个成功）。
 - `project_context` —— 注入 verifier，帮助 LLM 区分项目语境下可接受的写法（如故意常驻的单例、后台线程的同步 I/O）。
-- `modules` / `default_checks` —— 覆盖自动探测。
+- `modules` —— 覆盖自动探测的模块列表。
 
 字段说明见 `CONVENTIONS.md §项目配置`。
 

@@ -20,11 +20,12 @@ from lib_scan import Candidate
 from .base import AdapterResult, EngineAdapter, ScanContext
 
 # 按 check 类别选择 PMD 内置规则集（随 PMD 发行版自带，无需自写）。
-_RULESETS_BY_CHECK = {
-    "security": ["category/java/errorprone.xml"],
-    "stability": ["category/java/errorprone.xml", "category/java/multithreading.xml"],
-    "perf": ["category/java/performance.xml"],
-}
+# PMD 内置规则集（随发行版自带）。每次扫描全部挂上，不再按维度分。
+_RULESETS = [
+    "category/java/errorprone.xml",
+    "category/java/multithreading.xml",
+    "category/java/performance.xml",
+]
 
 # PMD ruleset → 我们的维度（用于归一化 category 前缀）
 _RULESET_DIM = {
@@ -80,10 +81,7 @@ class PMDAdapter(EngineAdapter):
             result.notes.append({"engine": self.name, "note": "作用域内无 Java 文件，跳过"})
             return result
 
-        rulesets = _rulesets_for_checks(ctx.checks)
-        if not rulesets:
-            result.notes.append({"engine": self.name, "note": "无匹配 PMD 规则集"})
-            return result
+        rulesets = _RULESETS
 
         # 把作用域内 java 文件写入 file-list，精确限定 PMD 扫描范围
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as flf:
@@ -149,17 +147,6 @@ class PMDAdapter(EngineAdapter):
         result.rules_run = len(rules_seen)
         result.rules_total = len(rules_seen)
         return result
-
-
-def _rulesets_for_checks(checks: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in checks:
-        for rs in _RULESETS_BY_CHECK.get(c, []):
-            if rs not in seen:
-                seen.add(rs)
-                out.append(rs)
-    return out
 
 
 def _parse_violation(v: dict, rel: str) -> Candidate | None:

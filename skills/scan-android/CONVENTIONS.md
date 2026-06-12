@@ -12,16 +12,15 @@
   CONVENTIONS.md       # 本文件
   requirements.txt     # Python 依赖（由 installer 写入 venv）
   rules/
-    security.md        # 通用
-    stability.md       # 通用
-    perf.md            # 通用
+    ai/hunting.md      # AI 支线狩猎启发集（自然语言，R-AI-* id）
   queries/
-    semgrep/           # Semgrep YAML 规则（security / stability / perf）
+    semgrep/           # 本地补充 Semgrep 规则（全部加载；社区 registry 包另由 adapter 挂载）
     detekt/            # Detekt 配置（detekt.yml）
     joern/             # Joern CPGQL 查询（all_queries.sc）
-    codeql/            # CodeQL 查询（android.ql）
+    codeql/            # CodeQL 查询（opt-in）
   agents/
-    verifier.md        # 验证子代理提示词模板
+    hunter.md          # AI 狩猎子代理提示词模板
+    verifier.md        # 独立验证子代理提示词模板
   docs/
     install-engines.md # 引擎安装指南（venv / JVM 工具 / opt-in）
   scripts/
@@ -30,7 +29,7 @@
     adapters/          # 引擎 adapter（base.py / semgrep / detekt / pmd / lint / joern / codeql / mobsf / flowdroid）
     tools/
       installer.py     # 依赖管理：ensure_venv() + ensure_semgrep() + ensure_detekt() + ensure_joern() + ...
-    lib_scan.py        # 共享库：Candidate 契约、Rule 解析、id 计算、JSON I/O
+    lib_scan.py        # 共享库：Candidate 契约、id 计算、JSON I/O
     dynamic_poc.py     # P5 动态 PoC 验证（ADB）
     nav_tools.py       # P3 LLM 导航工具（Joern server HTTP API）
     ...
@@ -55,7 +54,7 @@
 
 ## 作用域语义
 
-一次扫描由 **作用域（scope）** 与 **检查集（check set）** 两个维度参数化。作用域决定检查的文件；检查集决定使用的规则。
+一次扫描只由 **作用域（scope）** 参数化——决定检查**哪些文件**。规则不再分维度/子集：每次都跑全部规则（v3 去掉了 `--checks`）。
 
 | 作用域参数 | 解析方式 |
 |---|---|
@@ -79,7 +78,6 @@ skill 默认对任意 Android 工程零配置工作（模块 / flavor / lint 任
   "modules": ["app", "core", "feature/login"],
   "extra_excludes": ["vendor/**", "third_party/**", "prebuilt/**"],
   "lint_tasks": ["lintPaidDebug", "lint"],
-  "default_checks": ["security", "stability", "perf"],
   "language": "zh",
   "opt_in_engines": ["codeql"],
   "project_context": "（可选）一句话项目背景，帮助验证器消歧。例如：长期运行的后台服务，进程级单例常驻属预期；或：纯前台 App，无后台常驻组件。"
@@ -91,7 +89,6 @@ skill 默认对任意 Android 工程零配置工作（模块 / flavor / lint 任
 | `modules` | 覆盖自动探测的模块列表（探测不准或需收窄时用） |
 | `extra_excludes` | 追加到默认排除之外的项目级排除 glob |
 | `lint_tasks` | 覆盖 L0 lint 任务建议（按顺序尝试，取首个成功） |
-| `default_checks` | 覆盖默认检查集（一般保持 `security,stability,perf`） |
 | `language` | 生成文本字段（`title`/`why`/`repro`/`suggestion`）使用的语言：`"zh"` 或 `"en"`。未设置时自动检测系统 locale（`$LANG`），检测不到则默认 `"zh"` |
 | `opt_in_engines` | 为本仓库持久化启用 opt-in 引擎，可选值 `"codeql"`、`"mobsf"`、`"flowdroid"`。等效于对应的环境变量（`SCAN_ANDROID_ENABLE_CODEQL` 等），两者取并集。使用 CodeQL 前请确认已持有 GitHub Advanced Security 许可 |
 | `project_context` | 注入 verifier 子代理 `{PROJECT_CONTEXT}` 占位符的项目背景；帮助 LLM 区分「单例故意常驻」「后台线程可接受同步 I/O」等项目语境 |

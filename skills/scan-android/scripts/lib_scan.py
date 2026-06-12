@@ -82,19 +82,6 @@ class Rule:
     excludes: list[str] = field(default_factory=list)
     raw: str = ""  # 原始段落文本，便于调试
 
-    @property
-    def check(self) -> str:
-        """从 rule_id 推导检查类别：R-SEC-* → security, R-STB-* → stability, etc."""
-        prefix = self.rule_id.split("-")[1]
-        return _CHECK_PREFIX_MAP[prefix]
-
-
-_CHECK_PREFIX_MAP = {
-    "SEC": "security",
-    "STB": "stability",
-    "PRF": "perf",
-}
-
 
 _HEADER_RE = re.compile(r"^##\s+(R-[A-Z]+-\d+)\s+[—–-]+\s+(.+?)\s*$", re.MULTILINE)
 _BACKTICK_RE = re.compile(r"`([^`]+)`")

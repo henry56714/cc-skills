@@ -8,7 +8,7 @@ Skills 遵循通用格式（SKILL.md + 脚本 + 规则），兼容 [Claude Code]
 
 | Skill | 触发方式 | 能做什么 |
 |---|---|---|
-| **[scan-android](#scan-android)** | `/scan-android` · "扫描代码" | 对任意 Android 工程做安全 / 稳定性 / 性能三维增量扫描，产出结构化 finding 与 Markdown 报告 |
+| **[scan-android](#scan-android)** | `/scan-android` · "扫描代码" | 任意 Android 工程的源码/APK 扫描器（安全、稳定性、性能缺陷），产出结构化 finding 与 Markdown 报告 |
 
 ---
 
@@ -46,7 +46,7 @@ ln -s /path/to/cc-skills/skills/scan-android ~/.claude/skills/scan-android
 
 ```
 /scan-android
-/scan-android --module=app --checks=security
+/scan-android --module=app
 /scan-android --full
 ```
 

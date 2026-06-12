@@ -7,7 +7,7 @@
 本编排器与下游管线（LLM 验证 / 去重 / 报告）均无需改动。
 
 用法:
-    run_engines.py --checks CSV --scope-files PATH [--rules-dir DIR]
+    run_engines.py --scope-files PATH [--rules-dir DIR]
                    [--max-per-rule N] [--repo-root DIR] [--engines CSV|auto]
 
 --engines:
@@ -73,23 +73,20 @@ _DEFAULT_RULES_DIR = str(Path(__file__).resolve().parent.parent / "rules")
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checks", required=True)
     ap.add_argument("--scope-files", required=True)
     ap.add_argument("--rules-dir", default=_DEFAULT_RULES_DIR)
     ap.add_argument("--max-per-rule", type=int, default=100)
     ap.add_argument("--repo-root", default=".")
-    ap.add_argument("--engines", default="auto", help='auto 或 CSV，如 regex,semgrep')
+    ap.add_argument("--engines", default="auto", help='auto 或 CSV，如 semgrep,pmd')
     args = ap.parse_args()
 
     repo = Path(args.repo_root).resolve()
     scope_files = _read_scope(args.scope_files)
-    checks = [c.strip() for c in args.checks.split(",") if c.strip()]
 
     opt_in, excluded = _load_engine_config(repo)
     ctx = ScanContext(
         repo=repo,
         scope_files=scope_files,
-        checks=checks,
         rules_dir=Path(args.rules_dir),
         max_per_rule=args.max_per_rule,
         opt_in_engines=opt_in,

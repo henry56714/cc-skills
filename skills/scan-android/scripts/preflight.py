@@ -6,9 +6,8 @@ scan-android 预检工具
 循环"检测 → 安装 → 再检测"直到 ready=true 或出现无法自动修复的阻塞项。
 
 用法:
-    python3 preflight.py [--checks CSV] [--repo-root DIR]
+    python3 preflight.py [--repo-root DIR]
 
---checks CSV    检查集 CSV（决定需要哪些引擎，默认 security,stability,perf）
 --repo-root DIR 被扫描的仓库根目录（默认 .）
 
 退出码:
@@ -372,7 +371,7 @@ def _try_install(name: str) -> tuple[bool, str]:
 # 主流程：检测 → 安装 → 再检测，循环直到 ready 或无可安装项
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_preflight(checks: list[str], repo_root: Path) -> dict:
+def run_preflight(repo_root: Path) -> dict:
     config = _read_scan_config(repo_root)
     opt_in_engines: list[str] = list(
         dict.fromkeys(config.get("opt_in_engines", []) + _env_opt_in_engines())
@@ -512,19 +511,14 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument(
-        "--checks", default="security,stability,perf",
-        help="检查集 CSV（影响引擎需求判断，默认 security,stability,perf）",
-    )
-    ap.add_argument(
         "--repo-root", default=".",
         help="被扫描的仓库根目录（默认 .）",
     )
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
-    checks = [c.strip() for c in args.checks.split(",") if c.strip()]
 
-    result = run_preflight(checks, repo_root)
+    result = run_preflight(repo_root)
 
     _print_summary(result)
 

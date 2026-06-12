@@ -25,7 +25,6 @@
       "extra_excludes": [...],              # 来自 config 的项目级额外排除
       "source_extensions": [".java", ".kt", ".xml", ".aidl"],
       "project_context": "",               # 注入 verifier 的项目背景（来自 config，可空）
-      "default_checks": ["security", "stability", "perf"],
       "language": "zh",                    # 生成文本字段的语言："zh" 或 "en"
       "config_path": ".scan/config.json",  # 若存在
       "notes": [...]
@@ -54,7 +53,6 @@ DEFAULT_EXCLUDES = [
 ]
 
 SOURCE_EXTENSIONS = [".java", ".kt", ".xml", ".aidl"]
-DEFAULT_CHECKS = ["security", "stability", "perf"]
 
 # settings.gradle(.kts) 里的 include 声明，覆盖 Groovy / Kotlin DSL 两种写法：
 #   include ':app'
@@ -91,7 +89,6 @@ def main() -> int:
     project_context = config.get("project_context", "")
     if config.get("lint_tasks"):
         suggested = list(config["lint_tasks"])
-    default_checks = list(config.get("default_checks", DEFAULT_CHECKS))
     language = _detect_language(config)
 
     out = {
@@ -105,7 +102,6 @@ def main() -> int:
         "extra_excludes": extra_excludes,
         "source_extensions": SOURCE_EXTENSIONS,
         "project_context": project_context,
-        "default_checks": default_checks,
         "language": language,
         "config_path": args.config if config else None,
         "notes": notes,

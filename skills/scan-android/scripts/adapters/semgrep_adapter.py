@@ -33,13 +33,11 @@ _SEV_MAP = {
     "EXPERIMENT": "info",
 }
 
-# 社区 registry 规则包（v3：广度主力杠杆）。按 check 类别选择。
-# 安全类挂安全/OWASP/密钥包；各类都挂语言通用包（p/java、p/kotlin）兜底。
-_REGISTRY_PACKS = {
-    "security": ["p/security-audit", "p/owasp-top-ten", "p/secrets", "p/java", "p/kotlin"],
-    "stability": ["p/java", "p/kotlin"],
-    "perf": ["p/java", "p/kotlin"],
-}
+# 社区 registry 规则包（v3：广度主力杠杆）。每次扫描全部挂上——
+# 安全/OWASP/密钥 + 语言通用（p/java、p/kotlin）。不再按维度分。
+_DEFAULT_REGISTRY_PACKS = [
+    "p/security-audit", "p/owasp-top-ten", "p/secrets", "p/java", "p/kotlin",
+]
 
 
 def _load_semgrep_config(repo: Path) -> tuple[bool, list[str] | None]:
@@ -47,7 +45,7 @@ def _load_semgrep_config(repo: Path) -> tuple[bool, list[str] | None]:
 
     返回 (use_registry, packs_override)：
     - use_registry: 默认 True；离线场景可设 false。
-    - packs_override: 显式覆盖默认 registry 包清单；None = 用默认映射。
+    - packs_override: 显式覆盖默认 registry 包清单；None = 用默认全集。
     """
     cfg: dict = {}
     p = repo / ".scan" / "config.json"
@@ -62,19 +60,6 @@ def _load_semgrep_config(repo: Path) -> tuple[bool, list[str] | None]:
     if isinstance(packs, list) and packs:
         return use_registry, [str(x) for x in packs]
     return use_registry, None
-
-
-def _registry_packs_for_checks(checks: list[str], override: list[str] | None) -> list[str]:
-    if override is not None:
-        return override
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in checks:
-        for pack in _REGISTRY_PACKS.get(c, []):
-            if pack not in seen:
-                seen.add(pack)
-                out.append(pack)
-    return out
 
 
 class SemgrepAdapter(EngineAdapter):
@@ -107,12 +92,12 @@ class SemgrepAdapter(EngineAdapter):
             result.unavailable_reason = f"Semgrep 规则目录不存在: {_QUERIES_DIR}"
             return result
 
-        # 本地自写规则（只补社区库未覆盖的缺口）
-        rule_files = _rule_files_for_checks(ctx.checks)
+        # 本地自写规则：queries/semgrep/ 下的全部 yaml（只补社区库未覆盖的缺口）
+        rule_files = sorted(_QUERIES_DIR.glob("*.yaml"))
 
         # 社区 registry 规则包（v3 广度主力）。默认开，离线可在配置关闭。
         use_registry, packs_override = _load_semgrep_config(ctx.repo)
-        registry_packs = _registry_packs_for_checks(ctx.checks, packs_override) if use_registry else []
+        registry_packs = (packs_override if packs_override is not None else _DEFAULT_REGISTRY_PACKS) if use_registry else []
 
         if not rule_files and not registry_packs:
             result.notes.append({"engine": self.name, "note": "没有匹配的 semgrep 规则（本地 + registry 均为空）"})
@@ -215,15 +200,6 @@ def _find_semgrep() -> str | None:
     # 2. 系统 PATH 已有安装（兼容用户自行安装或 conda 环境中的 semgrep）
     import shutil
     return shutil.which("semgrep")
-
-
-def _rule_files_for_checks(checks: list[str]) -> list[Path]:
-    mapping = {
-        "security": _QUERIES_DIR / "security.yaml",
-        "stability": _QUERIES_DIR / "stability.yaml",
-        "perf": _QUERIES_DIR / "perf.yaml",
-    }
-    return [p for check, p in mapping.items() if check in checks and p.exists()]
 
 
 def _parse_result(item: dict, repo: Path, scope_set: set[str]) -> Candidate | None:
