@@ -1,0 +1,35 @@
+{
+  "_usage": "将本文件拷贝到被扫描项目根目录的 .scan/config.json，删除所有 _ 开头的注释键，按需修改。",
+
+  "_opt_in_engines_note": "P4 引擎默认关闭。可选值：codeql / mobsf / flowdroid。启用 codeql 时建议同时把 joern 加入 excluded_engines，避免重复深度分析。",
+  "opt_in_engines": [],
+
+  "_excluded_engines_note": "关闭指定引擎，对所有引擎生效（semgrep / detekt / pmd / lint / joern / codeql / mobsf / flowdroid），优先级高于 opt_in_engines。被关闭的引擎其对应工具不计入 preflight strict 的中断判定——例如无 Gradle wrapper 的库工程可加入 'lint' 关闭它，避免因缺 gradlew 而中断。",
+  "excluded_engines": [],
+
+  "_semgrep_registry_note": "Semgrep 社区 registry 规则包开关与覆盖。semgrep_use_registry=false 可在离线环境关闭在线规则包（只跑本地 queries/semgrep/）；semgrep_registry_packs 显式覆盖默认包清单（如 ['p/java','p/security-audit']），留空用按 check 类别的默认映射。",
+  "semgrep_use_registry": true,
+  "semgrep_registry_packs": [],
+
+  "_models_note": "模型分层（v3，按任务难度控成本）。triage=机械结构化/初筛/跨源去重；verify=AI狩猎+验证（主力）；escalate=可选，对 critical 候选二次复核（留空=关）。可换任意模型 id。",
+  "models": {
+    "triage": "claude-haiku-4-5",
+    "verify": "claude-sonnet-4-6",
+    "escalate": ""
+  },
+
+  "_modules_note": "强制指定模块列表，覆盖 detect_project.py 的自动探测。留空则自动探测。",
+  "modules": [],
+
+  "_extra_excludes_note": "额外的排除 glob，叠加到默认排除集之上。",
+  "extra_excludes": [],
+
+  "_lint_tasks_note": "覆盖推断的 Gradle lint 任务列表，按序尝试取第一个成功的。",
+  "lint_tasks": [],
+
+  "_apk_path_note": "显式指定 APK 路径，供 mobsf / flowdroid 使用。留空则自动在 build/outputs/apk/ 下搜索。",
+  "apk_path": "",
+
+  "_language_note": "报告语言，覆盖 detect_project.py 的推断。可选值：zh / en。留空则自动推断。",
+  "language": ""
+}

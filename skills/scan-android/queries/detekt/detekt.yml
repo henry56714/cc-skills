@@ -1,0 +1,276 @@
+# scan-android Detekt 配置
+# 专注于映射到我们规则库的检查项
+
+build:
+  maxIssues: 0
+  excludeCorrectable: false
+  weights:
+    complexity: 2
+    LongParameterList: 1
+    style: 1
+
+config:
+  validation: false
+  warningsAsErrors: false
+  excludes: ""
+
+processors:
+  active: true
+  exclude:
+    - "DetektProgressListener"
+
+console-reports:
+  active: true
+  exclude:
+    - "ProjectStatisticsReport"
+    - "ComplexityReport"
+    - "NotificationReport"
+
+output-reports:
+  active: true
+
+# ============================================================
+# R-STB-008: 空 catch / 吞异常
+# ============================================================
+exceptions:
+  active: true
+  TooGenericExceptionCaught:
+    active: true
+    excludes: ["**/test/**", "**/androidTest/**"]
+    allowedExceptionNameRegex: "_|(ignore|expected).*"
+    exceptionNames:
+      - ArrayIndexOutOfBoundsException
+      - Error
+      - Exception
+      - IllegalMonitorStateException
+      - NullPointerException
+      - IndexOutOfBoundsException
+      - RuntimeException
+      - Throwable
+  SwallowedException:
+    active: true
+    excludes: ["**/test/**", "**/androidTest/**"]
+    ignoredExceptionTypes:
+      - InterruptedException
+      - MalformedURLException
+      - NumberFormatException
+    allowedExceptionNameRegex: "_|(ignore|expected).*"
+  TooGenericExceptionThrown:
+    active: false
+  InstanceOfChain:
+    active: false
+
+# ============================================================
+# R-STB-012: Kotlin !! / 不安全操作
+# ============================================================
+potential-bugs:
+  active: true
+  UnsafeCallOnNullableType:
+    active: true
+    excludes: ["**/test/**", "**/androidTest/**"]
+  UnnecessaryNotNullOperator:
+    active: true
+  UnsafeCast:
+    active: true
+  LateinitUsage:
+    active: true
+    excludes: ["**/test/**", "**/androidTest/**"]
+    ignoreAnnotated: ["Inject", "Autowired", "Rule"]
+  NullableToStringCall:
+    active: true
+  HasPlatformType:
+    active: true
+  UnreachableCode:
+    active: true
+  RedundantElseInWhen:
+    active: true
+  MissingWhenCase:
+    active: true
+  ElseCaseInsteadOfExhaustiveWhen:
+    active: false
+  CastToNullableType:
+    active: true
+  DontDowncastCollectionTypes:
+    active: false
+  AvoidReferenceToMutableProperty:
+    active: false
+  ImplicitDefaultLocale:
+    active: false
+  InvalidRange:
+    active: true
+  IteratorHasNextCallsNextMethod:
+    active: true
+  IteratorNotThrowingNoSuchElementException:
+    active: true
+  MapGetWithNotNullAssertionOperator:
+    active: true
+  UnconditionalJumpStatementInLoop:
+    active: true
+  UselessPostfixExpression:
+    active: true
+  WrongEqualsTypeParameter:
+    active: true
+
+# ============================================================
+# R-STB-013: GlobalScope
+# ============================================================
+coroutines:
+  active: true
+  GlobalCoroutineUsage:
+    active: true
+  RedundantSuspendModifier:
+    active: false
+  SleepInsteadOfDelay:
+    active: true
+  SuspendFunWithFlowReturnType:
+    active: true
+  InjectDispatcher:
+    active: false
+
+# ============================================================
+# Style（关闭大部分风格检查，只保留有安全/稳定性意义的）
+# ============================================================
+style:
+  active: true
+  ForbiddenComment:
+    active: false
+  HardCodedStringLiteral:
+    active: false
+  MagicNumber:
+    active: false
+  MaxLineLength:
+    active: false
+  NewLineAtEndOfFile:
+    active: false
+  OptionalAbstractKeyword:
+    active: false
+  RedundantVisibilityModifierRule:
+    active: false
+  ReturnCount:
+    active: false
+  ThrowsCount:
+    active: false
+  TooManyFunctions:
+    active: false
+  UnusedImports:
+    active: false
+  UnusedPrivateMember:
+    active: false
+  UseCheckOrError:
+    active: false
+  WildcardImport:
+    active: false
+  ClassOrdering:
+    active: false
+  CollapsibleIfStatements:
+    active: false
+  DataClassContainsFunctions:
+    active: false
+  DestructuringDeclarationWithTooManyEntries:
+    active: false
+  EqualsNullCall:
+    active: true
+  ExplicitCollectionElementAccessMethod:
+    active: false
+  ExplicitItLambdaParameter:
+    active: false
+  ExpressionBodySyntax:
+    active: false
+  ForbiddenVoid:
+    active: false
+  FunctionOnlyReturningConstant:
+    active: false
+  LoopWithTooManyJumpStatements:
+    active: false
+  MandatoryBracesIfStatements:
+    active: false
+  MandatoryBracesLoops:
+    active: false
+  NestedClassesVisibility:
+    active: false
+  NoTabs:
+    active: false
+  ObjectLiteralToLambda:
+    active: false
+  OptionalUnit:
+    active: false
+  PreferToOverPairSyntax:
+    active: false
+  ProtectedMemberInFinalClass:
+    active: false
+  SafeCast:
+    active: false
+  SerialVersionUIDInSerializableClass:
+    active: false
+  SpacingBetweenPackageAndImports:
+    active: false
+  TrailingWhitespace:
+    active: false
+  UnderscoresInNumericLiterals:
+    active: false
+  UnnecessaryAbstractClass:
+    active: false
+  UnnecessaryAnnotationUseSiteTarget:
+    active: false
+  UnnecessaryApply:
+    active: false
+  UnnecessaryBackticks:
+    active: false
+  UnnecessaryInheritance:
+    active: false
+  UnnecessaryLet:
+    active: false
+  UnnecessaryParentheses:
+    active: false
+  UntilInsteadOfRangeTo:
+    active: false
+  UnusedPrivateClass:
+    active: false
+  UseAnyOrNoneInsteadOfFind:
+    active: false
+  UseArrayLiteralsInAnnotations:
+    active: false
+  UseCheckNotNull:
+    active: false
+  UseEmptyCounterpart:
+    active: false
+  UseIfEmptyOrIfBlank:
+    active: false
+  UseIfInsteadOfWhen:
+    active: false
+  UseIsNullOrEmpty:
+    active: false
+  UseOrEmpty:
+    active: false
+  UseRequire:
+    active: false
+  UseRequireNotNull:
+    active: false
+  UseSumOfInsteadOfFlatMapSize:
+    active: false
+  VarCouldBeVal:
+    active: false
+  VarCouldBeValProperty:
+    active: false
+  WhenWithOnlyElse:
+    active: false
+
+# 关闭 complexity 规则（噪音大）
+complexity:
+  active: false
+
+# 关闭 naming 规则
+naming:
+  active: false
+
+# 关闭 performance 规则（我们用自己的）
+performance:
+  active: false
+
+# 关闭 empty-blocks 规则（用我们的 exceptions.SwallowedException 代替）
+empty-blocks:
+  active: false
+
+# 关闭格式化规则
+formatting:
+  active: false

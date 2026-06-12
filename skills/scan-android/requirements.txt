@@ -1,0 +1,13 @@
+# scan-android v2 — Python 依赖
+#
+# 这些包由 scripts/tools/installer.py 在首次扫描时自动安装到
+# 专属虚拟环境 ~/.scan-android/venv/（不污染系统/conda 环境）。
+#
+# 手动安装（CI 或预热场景）:
+#   python3 -m venv ~/.scan-android/venv
+#   ~/.scan-android/venv/bin/pip install -r requirements.txt
+#
+# 覆盖虚拟环境路径:
+#   export SCAN_ANDROID_VENV_DIR=/path/to/custom/venv
+
+semgrep>=1.100.0

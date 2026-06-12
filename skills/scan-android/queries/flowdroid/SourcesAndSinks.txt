@@ -1,0 +1,18 @@
+# FlowDroid Sources and Sinks for scan-android
+# Sources: user-controlled input
+<android.content.Intent: java.lang.String getStringExtra(java.lang.String)> -> _SOURCE_
+<android.content.Intent: android.os.Bundle getExtras()> -> _SOURCE_
+<android.content.Intent: java.io.Serializable getSerializableExtra(java.lang.String)> -> _SOURCE_
+<android.telephony.TelephonyManager: java.lang.String getDeviceId()> -> _SOURCE_
+<android.location.Location: double getLatitude()> -> _SOURCE_
+<android.location.Location: double getLongitude()> -> _SOURCE_
+
+# Sinks: dangerous operations
+<android.database.sqlite.SQLiteDatabase: android.database.Cursor rawQuery(java.lang.String,java.lang.String[])> -> _SINK_
+<android.database.sqlite.SQLiteDatabase: void execSQL(java.lang.String)> -> _SINK_
+<java.lang.Runtime: java.lang.Process exec(java.lang.String)> -> _SINK_
+<java.lang.ProcessBuilder: java.lang.ProcessBuilder command(java.lang.String[])> -> _SINK_
+<android.util.Log: int d(java.lang.String,java.lang.String)> -> _SINK_
+<android.util.Log: int i(java.lang.String,java.lang.String)> -> _SINK_
+<android.util.Log: int w(java.lang.String,java.lang.String)> -> _SINK_
+<android.util.Log: int e(java.lang.String,java.lang.String)> -> _SINK_
