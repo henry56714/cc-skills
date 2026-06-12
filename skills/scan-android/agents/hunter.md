@@ -44,7 +44,7 @@
   {
     "file": "app/src/main/java/.../PayManager.java",
     "line": 88,
-    "rule_id": "R-AI-STB-003",
+    "rule_id": "R-AI-007",
     "category": "stability/retry-non-idempotent",
     "severity": "major",
     "snippet": "for (int i=0;i<3;i++) { submitOrder(req); ... }",

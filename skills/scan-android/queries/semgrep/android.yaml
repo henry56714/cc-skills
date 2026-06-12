@@ -1,0 +1,1227 @@
+# scan-android 本地补充 Semgrep 规则（社区库未覆盖的 Android/项目特定项）。
+# 全部规则集中于此文件，不再按维度分文件。
+rules:
+- id: scan-android-r-sec-001-hardcoded-secret-java
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-001: 检测到可能的硬编码密钥'
+  pattern-regex: (?i)\b(api[_\-]?key|secret|password|access[_\-]?key|private[_\-]?key|auth[_\-]?token|bearer)\s*[:=]\s*"[^"]{8,}"
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+    exclude:
+    - '**/test/**'
+    - '**/androidTest/**'
+    - '**/*.example.*'
+    - '**/*Test*'
+  metadata:
+    rule_id: R-SEC-001
+    category: security/hardcoded-secret
+    severity: critical
+- id: scan-android-r-sec-001-hardcoded-secret-props
+  languages:
+  - yaml
+  severity: ERROR
+  message: 'R-SEC-001: 检测到可能的硬编码密钥（properties/gradle 文件）'
+  pattern-regex: (?i)(api[_\-]?key|secret|password|access[_\-]?key|private[_\-]?key|auth[_\-]?token|bearer)\s*[=:]\s*[^\s]{8,}
+  paths:
+    include:
+    - '**/*.properties'
+    - '**/*.gradle'
+    - '**/*.gradle.kts'
+    exclude:
+    - '**/test/**'
+  metadata:
+    rule_id: R-SEC-001
+    category: security/hardcoded-secret
+    severity: critical
+- id: scan-android-r-sec-002-weak-crypto
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-002: 使用弱加密或弱哈希算法'
+  pattern: $X.getInstance("...")
+  metavariable-regex:
+    metavariable: '...'
+    regex: ^(DES|RC4|MD5|SHA-?1|AES/ECB/.*)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-002
+    category: security/weak-crypto
+    severity: critical
+- id: scan-android-r-sec-003-trust-all-java
+  languages:
+  - java
+  severity: ERROR
+  message: 'R-SEC-003: checkServerTrusted 方法体为空，信任所有证书'
+  pattern: 'public void checkServerTrusted(java.security.cert.X509Certificate[] $CHAIN, String $TYPE) throws java.security.cert.CertificateException {
+
+    }
+
+    '
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-SEC-003
+    category: security/tls-trust-all
+    severity: critical
+- id: scan-android-r-sec-003-trust-all-kt
+  languages:
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-003: checkServerTrusted 实现为空，信任所有证书'
+  pattern: 'override fun checkServerTrusted($CHAIN: Array<java.security.cert.X509Certificate>, $TYPE: String) {
+
+    }
+
+    '
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-003
+    category: security/tls-trust-all
+    severity: critical
+- id: scan-android-r-sec-003-hostname-verifier
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-003: HostnameVerifier 永久返回 true'
+  pattern-regex: HostnameVerifier[^{]*\{[^}]*return\s+true
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-003
+    category: security/tls-trust-all
+    severity: critical
+- id: scan-android-r-sec-004-webview-js-enabled
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-004: WebView 开启了 JavaScript'
+  patterns:
+  - pattern: $WEBVIEW.getSettings().setJavaScriptEnabled(true)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-004
+    category: security/webview
+    severity: major
+- id: scan-android-r-sec-004-webview-file-access
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-004: WebView 允许文件访问'
+  patterns:
+  - pattern-either:
+    - pattern: $WS.setAllowFileAccess(true)
+    - pattern: $WS.setAllowFileAccessFromFileURLs(true)
+    - pattern: $WS.setAllowUniversalAccessFromFileURLs(true)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-004
+    category: security/webview
+    severity: major
+- id: scan-android-r-sec-004-webview-addjavascript-interface
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-004: addJavascriptInterface 暴露 Java 对象到 WebView'
+  pattern: $WV.addJavascriptInterface(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-004
+    category: security/webview
+    severity: major
+- id: scan-android-r-sec-005-cleartext-traffic-manifest
+  languages:
+  - xml
+  severity: WARNING
+  message: 'R-SEC-005: manifest 中 usesCleartextTraffic=true'
+  pattern-regex: android:usesCleartextTraffic\s*=\s*"true"
+  paths:
+    include:
+    - '**/AndroidManifest.xml'
+    - '**/network_security_config.xml'
+  metadata:
+    rule_id: R-SEC-005
+    category: security/cleartext
+    severity: major
+- id: scan-android-r-sec-005-cleartext-http-url
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-005: 代码中存在 HTTP 明文 URL'
+  pattern-regex: '"http://[^"]{4,}"'
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-005
+    category: security/cleartext
+    severity: major
+- id: scan-android-r-sec-006-pendingintent-mutability
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-006: PendingIntent 调用，需确认 FLAG_IMMUTABLE 或 FLAG_MUTABLE'
+  patterns:
+  - pattern-either:
+    - pattern: PendingIntent.getActivity(...)
+    - pattern: PendingIntent.getBroadcast(...)
+    - pattern: PendingIntent.getService(...)
+    - pattern: PendingIntent.getActivities(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-006
+    category: security/pendingintent-mutability
+    severity: major
+- id: scan-android-r-sec-007-exported-unprotected
+  languages:
+  - xml
+  severity: ERROR
+  message: 'R-SEC-007: 组件设置 exported=true，需确认是否有权限保护'
+  pattern-regex: android:exported\s*=\s*"true"
+  paths:
+    include:
+    - '**/AndroidManifest.xml'
+  metadata:
+    rule_id: R-SEC-007
+    category: security/exported-unprotected
+    severity: critical
+- id: scan-android-r-sec-008-world-readable
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-008: 使用已废弃的 MODE_WORLD_READABLE/WRITEABLE'
+  pattern-regex: MODE_WORLD_(READABLE|WRITEABLE)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-008
+    category: security/world-readable
+    severity: critical
+- id: scan-android-r-sec-009-weak-random-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-SEC-009: 使用 java.util.Random，可能不适合安全用途'
+  pattern: new Random()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-009
+    category: security/weak-random
+    severity: major
+- id: scan-android-r-sec-009-math-random
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-009: Math.random() 不适合安全用途'
+  pattern: Math.random()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-009
+    category: security/weak-random
+    severity: major
+- id: scan-android-r-sec-010-log-leakage
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-010: 日志中可能包含敏感数据（token/password/location 等）'
+  pattern-regex: \bLog\.(v|d|i|w|e|wtf)\s*\([^)]*\b(vin|imei|token|password|phone|latitude|longitude|location|uid|deviceId|mac)\b
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-010
+    category: security/log-leakage
+    severity: major
+- id: scan-android-r-sec-011-sql-injection-java
+  languages:
+  - java
+  severity: ERROR
+  message: 'R-SEC-011: rawQuery/execSQL 使用字符串拼接，可能存在 SQL 注入'
+  patterns:
+  - pattern-either:
+    - pattern: $DB.rawQuery("..." + $X, $ARGS)
+    - pattern: $DB.execSQL("..." + $X)
+    - pattern: $DB.rawQuery($SQL + $X, $ARGS)
+    - pattern: $DB.execSQL($SQL + $X)
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-SEC-011
+    category: security/sql-injection
+    severity: critical
+- id: scan-android-r-sec-011-sql-injection-kt
+  languages:
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-011: rawQuery/execSQL 使用字符串拼接或模板，可能存在 SQL 注入'
+  patterns:
+  - pattern-either:
+    - pattern: $DB.rawQuery("...$X...", $ARGS)
+    - pattern: $DB.execSQL("...$X...")
+    - pattern: $DB.rawQuery($SQL + $X, $ARGS)
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-011
+    category: security/sql-injection
+    severity: critical
+- id: scan-android-r-sec-012-command-injection
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-012: Runtime.exec 或 ProcessBuilder 使用动态参数'
+  patterns:
+  - pattern-either:
+    - pattern: Runtime.getRuntime().exec(...)
+    - pattern: new ProcessBuilder(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-012
+    category: security/command-injection
+    severity: critical
+- id: scan-android-r-sec-013-ipc-caller-unverified-java
+  languages:
+  - java
+  severity: ERROR
+  message: 'R-SEC-013: AIDL Stub 实现，需确认所有特权方法都校验了调用方'
+  pattern: class $C extends $IFACE.Stub { ... }
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-SEC-013
+    category: security/ipc-caller-unverified
+    severity: critical
+- id: scan-android-r-sec-014-debuggable-manifest
+  languages:
+  - xml
+  severity: ERROR
+  message: 'R-SEC-014: manifest 中 android:debuggable=true'
+  pattern-regex: android:debuggable\s*=\s*"true"
+  paths:
+    include:
+    - '**/AndroidManifest.xml'
+  metadata:
+    rule_id: R-SEC-014
+    category: security/debuggable-enabled
+    severity: critical
+- id: scan-android-r-sec-014-debuggable-gradle
+  languages:
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-014: build.gradle 中 debuggable true（可能在 release buildType）'
+  pattern-regex: ^\s*debuggable\s+true\b
+  paths:
+    include:
+    - '**/*.gradle'
+    - '**/*.gradle.kts'
+  metadata:
+    rule_id: R-SEC-014
+    category: security/debuggable-enabled
+    severity: critical
+- id: scan-android-r-sec-015-allow-backup
+  languages:
+  - xml
+  severity: WARNING
+  message: 'R-SEC-015: android:allowBackup=true 允许 adb 导出私有数据'
+  pattern-regex: android:allowBackup\s*=\s*"true"
+  paths:
+    include:
+    - '**/AndroidManifest.xml'
+  metadata:
+    rule_id: R-SEC-015
+    category: security/backup-allowed
+    severity: major
+- id: scan-android-r-sec-016-intent-redirection
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-016: 从 extra 中取出的对象可能被用作 Intent 转发（Intent 重定向）'
+  patterns:
+  - pattern-either:
+    - pattern: $I.getParcelableExtra(...)
+    - pattern: $I.getSerializableExtra(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-016
+    category: security/intent-redirection
+    severity: critical
+- id: scan-android-r-sec-017-receiver-export-flag
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-017: registerReceiver 调用，targetSdk>=34 需要明确传入 RECEIVER_EXPORTED 或 RECEIVER_NOT_EXPORTED'
+  pattern-either:
+  - pattern: $CTX.registerReceiver($R, $F)
+  - pattern: $CTX.registerReceiver($R, $F, $PERM, $H)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-017
+    category: security/receiver-export-flag
+    severity: major
+- id: scan-android-r-sec-018-exported-provider
+  languages:
+  - xml
+  severity: ERROR
+  message: 'R-SEC-018: ContentProvider 设置 exported=true，需确认是否有权限保护'
+  pattern-regex: <provider\b[^>]*android:exported\s*=\s*"true"
+  paths:
+    include:
+    - '**/AndroidManifest.xml'
+  metadata:
+    rule_id: R-SEC-018
+    category: security/exported-provider
+    severity: critical
+- id: scan-android-r-sec-019-unsafe-deserialize
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-019: ObjectInputStream 反序列化，需确认输入来源是否可信'
+  pattern: new ObjectInputStream(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-019
+    category: security/unsafe-deserialization
+    severity: major
+- id: scan-android-r-sec-019-dynamic-dex-load
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SEC-019: 动态代码加载（DexClassLoader），需确认来源安全性'
+  patterns:
+  - pattern-either:
+    - pattern: new DexClassLoader(...)
+    - pattern: new InMemoryDexClassLoader(...)
+    - pattern: System.load(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-019
+    category: security/unsafe-deserialization
+    severity: critical
+- id: scan-android-r-sec-020-sensitive-external-storage
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SEC-020: 使用外部存储路径，敏感数据不应写入外部存储'
+  patterns:
+  - pattern-either:
+    - pattern: $CTX.getExternalStorageDirectory()
+    - pattern: $CTX.getExternalStoragePublicDirectory(...)
+    - pattern: $CTX.getExternalFilesDir(...)
+    - pattern: $CTX.getExternalCacheDir()
+    - pattern: Environment.getExternalStorageDirectory()
+    - pattern: Environment.getExternalStoragePublicDirectory(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SEC-020
+    category: security/sensitive-external-storage
+    severity: major
+- id: scan-android-r-stb-001-cursor-not-closed-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-STB-001: rawQuery/query 返回 Cursor，需确认所有路径都关闭了它'
+  patterns:
+  - pattern: '$CURSOR = $DB.$QUERY(...);
+
+      ...
+
+      '
+  - pattern-not: '$CURSOR = $DB.$QUERY(...);
+
+      ...
+
+      $CURSOR.close();
+
+      '
+  - pattern-not: 'try ($CURSOR = $DB.$QUERY(...)) { ... }
+
+      '
+  - metavariable-regex:
+      metavariable: $QUERY
+      regex: ^(rawQuery|query)$
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-STB-001
+    category: stability/resource-leak-cursor
+    severity: major
+- id: scan-android-r-stb-002-stream-not-closed-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-STB-002: Stream 创建后需确认在所有路径都关闭'
+  patterns:
+  - pattern: '$S = new $STREAM($ARGS);
+
+      ...
+
+      '
+  - pattern-not: 'try ($S = new $STREAM($ARGS)) { ... }
+
+      '
+  - pattern-not: '$S = new $STREAM($ARGS);
+
+      ...
+
+      $S.close();
+
+      '
+  - metavariable-regex:
+      metavariable: $STREAM
+      regex: ^(FileInputStream|FileOutputStream|BufferedReader|BufferedWriter|FileReader|FileWriter|InputStreamReader)$
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-STB-002
+    category: stability/resource-leak-stream
+    severity: major
+- id: scan-android-r-stb-003-listener-not-unregistered
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-003: 注册了 Receiver/Observer/Listener，需确认在所有生命周期退出路径都注销'
+  pattern-regex: \b(registerReceiver|registerContentObserver|registerListener|addCallback|addListener)\s*\(
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-003
+    category: stability/listener-leak
+    severity: major
+- id: scan-android-r-stb-004-static-context-leak-java
+  languages:
+  - java
+  severity: ERROR
+  message: 'R-STB-004: 静态字段持有 Context/Activity/View 导致内存泄漏'
+  patterns:
+  - pattern-either:
+    - pattern: static Context $FIELD;
+    - pattern: static Activity $FIELD;
+    - pattern: static View $FIELD;
+    - pattern: static Fragment $FIELD;
+    - pattern: static Dialog $FIELD;
+    - pattern: static final Context $FIELD = ...;
+    - pattern: static final Activity $FIELD = ...;
+    - pattern: static final View $FIELD = ...;
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-STB-004
+    category: stability/static-context-leak
+    severity: critical
+- id: scan-android-r-stb-004-static-context-leak-kt
+  languages:
+  - kotlin
+  severity: ERROR
+  message: 'R-STB-004: companion object 或顶层属性持有 Context/Activity/View'
+  patterns:
+  - pattern-either:
+    - pattern: "companion object {\n  ...\n  var $FIELD: Context = ...\n  ...\n}\n"
+    - pattern: "companion object {\n  ...\n  var $FIELD: Activity = ...\n  ...\n}\n"
+    - pattern: "companion object {\n  ...\n  var $FIELD: View = ...\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-004
+    category: stability/static-context-leak
+    severity: critical
+- id: scan-android-r-stb-005-inner-handler-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-STB-005: 匿名/非静态内部 Handler 或 Runnable 持有外部类引用，可能导致内存泄漏'
+  patterns:
+  - pattern-either:
+    - pattern: new Handler() { ... }
+    - pattern: new Handler($L) { ... }
+    - pattern: new Runnable() { ... }
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-STB-005
+    category: stability/inner-class-leak
+    severity: major
+- id: scan-android-r-stb-006-asynctask-deprecated
+  languages:
+  - java
+  - kotlin
+  severity: INFO
+  message: 'R-STB-006: AsyncTask 已在 API 30 弃用，建议迁移到 coroutines/Executor'
+  patterns:
+  - pattern-either:
+    - pattern: class $C extends AsyncTask<$A, $B, $D> { ... }
+    - pattern: new AsyncTask<$A, $B, $D>() { ... }
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-006
+    category: stability/deprecated-asynctask
+    severity: minor
+- id: scan-android-r-stb-007-unnamed-thread
+  languages:
+  - java
+  - kotlin
+  severity: INFO
+  message: 'R-STB-007: 创建未命名线程，生产 ANR/crash 分析困难'
+  patterns:
+  - pattern-either:
+    - pattern: new Thread($R).start()
+    - pattern: Executors.newFixedThreadPool($N)
+    - pattern: Executors.newCachedThreadPool()
+    - pattern: Executors.newSingleThreadExecutor()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-007
+    category: stability/unnamed-thread
+    severity: minor
+- id: scan-android-r-stb-008-empty-catch-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-STB-008: 空 catch 块，异常被静默吞掉'
+  pattern: "try {\n  ...\n} catch ($E $EX) {\n}\n"
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-STB-008
+    category: stability/swallowed-exception
+    severity: major
+- id: scan-android-r-stb-008-empty-catch-kt
+  languages:
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-008: 空 catch 块，异常被静默吞掉'
+  pattern: "try {\n  ...\n} catch ($E: $EX) {\n}\n"
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-008
+    category: stability/swallowed-exception
+    severity: major
+- id: scan-android-r-stb-009-rxjava-disposable
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-009: subscribe() 返回的 Disposable 可能未加入 CompositeDisposable'
+  pattern-regex: \.subscribe\s*\(
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-009
+    category: stability/rxjava-disposable-leak
+    severity: major
+- id: scan-android-r-stb-010-sp-commit-sync
+  languages:
+  - java
+  - kotlin
+  severity: INFO
+  message: 'R-STB-010: SharedPreferences.commit() 是同步 I/O，建议改用 apply()'
+  pattern: $EDITOR.commit()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-010
+    category: stability/sp-commit-sync
+    severity: minor
+- id: scan-android-r-stb-011-commit-allowing-state-loss
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-011: commitAllowingStateLoss() 通常掩盖生命周期 bug'
+  patterns:
+  - pattern-either:
+    - pattern: $FM.commitAllowingStateLoss()
+    - pattern: $FT.commitAllowingStateLoss()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-011
+    category: stability/fragment-state-loss
+    severity: major
+- id: scan-android-r-stb-012-not-null-assert
+  languages:
+  - kotlin
+  severity: INFO
+  message: 'R-STB-012: !! 操作符，对 platform 类型或可空链使用时会在运行时抛 NPE'
+  pattern-regex: '!!(?![=])'
+  paths:
+    include:
+    - '**/*.kt'
+    exclude:
+    - '**/test/**'
+    - '**/androidTest/**'
+  metadata:
+    rule_id: R-STB-012
+    category: stability/kotlin-not-null-assert
+    severity: minor
+- id: scan-android-r-stb-013-globalscope
+  languages:
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-013: GlobalScope.launch/async 比创建它的组件活得更久，导致泄漏'
+  patterns:
+  - pattern-either:
+    - pattern: GlobalScope.launch { ... }
+    - pattern: GlobalScope.async { ... }
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-013
+    category: stability/globalscope
+    severity: major
+- id: scan-android-r-stb-014-wrong-lock-object-java
+  languages:
+  - java
+  severity: ERROR
+  message: 'R-STB-014: 对 Boolean/Integer 字面量或字符串字面量加锁，可能导致跨类竞争'
+  patterns:
+  - pattern-either:
+    - pattern: synchronized(Boolean.TRUE) { ... }
+    - pattern: synchronized(Boolean.FALSE) { ... }
+    - pattern: synchronized(Integer.valueOf($N)) { ... }
+    - pattern: synchronized("...") { ... }
+    - pattern: synchronized(true) { ... }
+    - pattern: synchronized(false) { ... }
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-STB-014
+    category: stability/wrong-lock-object
+    severity: critical
+- id: scan-android-r-stb-016-wakelock-acquire
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-016: WakeLock.acquire()，需确认所有路径都在 finally 中调用了 release()'
+  pattern: $WAKELOCK.acquire(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-016
+    category: stability/wakelock-leak
+    severity: major
+- id: scan-android-r-stb-017-async-ui-update
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-017: runOnUiThread/mainLooper.post，需确认 Activity 未销毁'
+  patterns:
+  - pattern-either:
+    - pattern: $A.runOnUiThread(...)
+    - pattern: new Handler(Looper.getMainLooper()).post(...)
+    - pattern: Handler(Looper.getMainLooper()).post(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-017
+    category: stability/async-ui-update
+    severity: major
+- id: scan-android-r-stb-020-room-destructive-migration
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-STB-020: fallbackToDestructiveMigration() 在 schema 不匹配时会清空所有数据'
+  patterns:
+  - pattern-either:
+    - pattern: $BUILDER.fallbackToDestructiveMigration()
+    - pattern: $BUILDER.fallbackToDestructiveMigration(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-020
+    category: stability/room-migration
+    severity: critical
+- id: scan-android-r-stb-024-crash-handler
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-STB-024: 实现 UncaughtExceptionHandler，需确认 handler 内部不会再次抛出异常'
+  pattern-regex: UncaughtExceptionHandler|setDefaultUncaughtExceptionHandler
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-024
+    category: stability/crash-handler-recursion
+    severity: critical
+- id: scan-android-r-stb-026-aidl-backward-compat
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-STB-026: AIDL 接口定义，新增方法必须追加到末尾'
+  pattern-regex: interface\s+[A-Za-z_]\w*
+  paths:
+    include:
+    - '**/aidl/**/*.java'
+    - '**/aidl/**/*.kt'
+    - '**/*Stub*.java'
+    - '**/*Aidl*.java'
+  metadata:
+    rule_id: R-STB-026
+    category: stability/aidl-backward-compat
+    severity: critical
+- id: scan-android-r-stb-027-aidl-checked-exception
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-027: AIDL 方法声明 throws 非 RemoteException 的受检异常，可能被 Binder 吞掉'
+  pattern-regex: throws\s+[A-Z]\w+Exception
+  paths:
+    include:
+    - '**/aidl/**/*.java'
+    - '**/aidl/**/*.kt'
+    - '**/*Stub*.java'
+    - '**/*Aidl*.java'
+  metadata:
+    rule_id: R-STB-027
+    category: stability/aidl-checked-exception
+    severity: major
+- id: scan-android-r-stb-028-fgs-start-timeout
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-STB-028: startForegroundService() 调用后，目标 Service 必须在 5s 内调用 startForeground()'
+  patterns:
+  - pattern-either:
+    - pattern: $CTX.startForegroundService(...)
+    - pattern: ContextCompat.startForegroundService(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-028
+    category: stability/fgs-start-timeout
+    severity: critical
+- id: scan-android-r-stb-029-fgs-type-missing
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-STB-029: startForeground() 调用，targetSdk>=34 需要在 manifest 声明 foregroundServiceType'
+  pattern: $S.startForeground($ID, $NOTIF)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-029
+    category: stability/fgs-type-missing
+    severity: critical
+- id: scan-android-r-stb-030-non-threadsafe-formatter
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-STB-030: SimpleDateFormat/DecimalFormat 非线程安全，不应作为 static 共享实例'
+  patterns:
+  - pattern-either:
+    - pattern: static SimpleDateFormat $F = ...;
+    - pattern: static final SimpleDateFormat $F = ...;
+    - pattern: static DecimalFormat $F = ...;
+    - pattern: static final DecimalFormat $F = ...;
+    - pattern: static NumberFormat $F = ...;
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-STB-030
+    category: stability/non-threadsafe-formatter
+    severity: major
+- id: scan-android-r-stb-032-livedata-wrong-owner
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-STB-032: Fragment 中使用 this 作为 LiveData observe 的 owner，应改用 viewLifecycleOwner'
+  pattern: $LIVEDATA.observe(this, $OBSERVER)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-STB-032
+    category: stability/livedata-wrong-owner
+    severity: major
+- id: scan-android-r-prf-001-main-thread-io
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-PRF-001: 文件 I/O 操作，需确认不在主线程调用（会导致 ANR）'
+  patterns:
+  - pattern-either:
+    - pattern: new FileInputStream(...)
+    - pattern: new FileOutputStream(...)
+    - pattern: new FileReader(...)
+    - pattern: new FileWriter(...)
+    - pattern: Files.readAllBytes(...)
+    - pattern: Files.write(...)
+    - pattern: Files.newInputStream(...)
+    - pattern: Files.newOutputStream(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-001
+    category: perf/main-thread-io
+    severity: major
+- id: scan-android-r-prf-002-main-thread-db-allow-main
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-PRF-002: allowMainThreadQueries() 关闭了 Room 的主线程保护，可能导致 ANR'
+  pattern: $BUILDER.allowMainThreadQueries()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-002
+    category: perf/main-thread-db
+    severity: major
+- id: scan-android-r-prf-002-main-thread-db-sqlite
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-PRF-002: SQLiteOpenHelper.getWritableDatabase/getReadableDatabase，需确认不在主线程同步调用'
+  patterns:
+  - pattern-either:
+    - pattern: $HELPER.getWritableDatabase()
+    - pattern: $HELPER.getReadableDatabase()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-002
+    category: perf/main-thread-db
+    severity: major
+- id: scan-android-r-prf-003-main-thread-network-execute
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-PRF-003: Call.execute() 是同步网络调用，在主线程会导致 ANR 和 NetworkOnMainThreadException'
+  patterns:
+  - pattern: $CALL.execute()
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-003
+    category: perf/main-thread-network
+    severity: critical
+- id: scan-android-r-prf-003-http-url-connection
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-PRF-003: HttpURLConnection 是同步网络，需确认不在主线程调用'
+  pattern-regex: new\s+URL\s*\([^)]+\)\.openConnection
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-003
+    category: perf/main-thread-network
+    severity: critical
+- id: scan-android-r-prf-004-ondraw-allocation-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-PRF-004: onDraw 中分配了对象（Paint/Path/Rect等），每帧执行会产生 GC 压力'
+  patterns:
+  - pattern: new $OBJ(...)
+  - pattern-inside: "protected void onDraw(Canvas $C) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-PRF-004
+    category: perf/hotpath-allocation
+    severity: major
+- id: scan-android-r-prf-004-ondraw-allocation-kt
+  languages:
+  - kotlin
+  severity: WARNING
+  message: 'R-PRF-004: onDraw 中分配对象，建议移到构造函数或 onSizeChanged'
+  patterns:
+  - pattern: $T(...)
+  - pattern-inside: "override fun onDraw($C: Canvas) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-004
+    category: perf/hotpath-allocation
+    severity: major
+- id: scan-android-r-prf-005-rv-findviewbyid-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-PRF-005: onBindViewHolder 中调用 findViewById，应在 onCreateViewHolder 中缓存'
+  patterns:
+  - pattern: $V.findViewById(...)
+  - pattern-inside: "public void onBindViewHolder($VH $HOLDER, int $POS) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-PRF-005
+    category: perf/rv-findviewbyid
+    severity: major
+- id: scan-android-r-prf-005-rv-findviewbyid-kt
+  languages:
+  - kotlin
+  severity: WARNING
+  message: 'R-PRF-005: onBindViewHolder 中调用 findViewById，应缓存到 ViewHolder'
+  patterns:
+  - pattern: $V.findViewById(...)
+  - pattern-inside: "override fun onBindViewHolder($HOLDER: $VH, $POS: Int) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-005
+    category: perf/rv-findviewbyid
+    severity: major
+- id: scan-android-r-prf-008-regex-recompile-java
+  languages:
+  - java
+  severity: INFO
+  message: 'R-PRF-008: Pattern.compile 在非 static 上下文，每次调用都会重新编译正则'
+  patterns:
+  - pattern: Pattern.compile("...")
+  - pattern-not-inside: static $TYPE $VAR = Pattern.compile("...");
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-PRF-008
+    category: perf/regex-recompile
+    severity: minor
+- id: scan-android-r-prf-010-bitmap-oom
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-PRF-010: BitmapFactory.decode* 未传 BitmapFactory.Options，大图会 OOM'
+  patterns:
+  - pattern-either:
+    - pattern: BitmapFactory.decodeFile($PATH)
+    - pattern: BitmapFactory.decodeResource($RES, $ID)
+    - pattern: BitmapFactory.decodeStream($IS)
+    - pattern: BitmapFactory.decodeByteArray($BYTES, $OFF, $LEN)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-010
+    category: perf/bitmap-oom-risk
+    severity: major
+- id: scan-android-r-prf-013-inflate-in-loop-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-PRF-013: 循环内调用 LayoutInflater.inflate，代价高昂'
+  patterns:
+  - pattern: $INFLATER.inflate(...)
+  - pattern-inside: "for (...) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-PRF-013
+    category: perf/inflate-in-loop
+    severity: major
+- id: scan-android-r-prf-014-select-star
+  languages:
+  - java
+  - kotlin
+  severity: INFO
+  message: 'R-PRF-014: SELECT * 会读取所有列，宽表时浪费 I/O'
+  pattern-regex: '"(?i)SELECT\s+\*'
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-014
+    category: perf/inefficient-sql
+    severity: minor
+- id: scan-android-r-prf-015-db-write-no-transaction-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-PRF-015: 循环内逐条 DB 写入未包事务，比批量事务慢一个数量级'
+  patterns:
+  - pattern: $DB.$METHOD(...)
+  - metavariable-regex:
+      metavariable: $METHOD
+      regex: ^(insert|insertOrThrow|insertWithOnConflict|execSQL|update|delete|replace)$
+  - pattern-inside: "for (...) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-PRF-015
+    category: perf/db-write-no-transaction
+    severity: major
+- id: scan-android-r-prf-016-heavy-onreceive-java
+  languages:
+  - java
+  severity: WARNING
+  message: 'R-PRF-016: onReceive 运行在主线程，其中不应有重 I/O 或耗时操作'
+  patterns:
+  - pattern-either:
+    - pattern: new FileInputStream(...)
+    - pattern: new FileOutputStream(...)
+    - pattern: $DB.getWritableDatabase()
+    - pattern: $DB.getReadableDatabase()
+    - pattern: $DB.rawQuery(...)
+    - pattern: $DB.query(...)
+    - pattern: Thread.sleep(...)
+  - pattern-inside: "public void onReceive(Context $CTX, Intent $INTENT) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.java'
+  metadata:
+    rule_id: R-PRF-016
+    category: perf/heavy-onreceive
+    severity: major
+- id: scan-android-r-prf-016-heavy-onreceive-kt
+  languages:
+  - kotlin
+  severity: WARNING
+  message: 'R-PRF-016: onReceive 运行在主线程，其中不应有重 I/O 或耗时操作'
+  patterns:
+  - pattern-either:
+    - pattern: FileInputStream(...)
+    - pattern: FileOutputStream(...)
+    - pattern: $DB.getWritableDatabase()
+    - pattern: $DB.getReadableDatabase()
+    - pattern: $DB.rawQuery(...)
+    - pattern: Thread.sleep(...)
+  - pattern-inside: "override fun onReceive($CTX: Context, $INTENT: Intent) {\n  ...\n}\n"
+  paths:
+    include:
+    - '**/*.kt'
+  metadata:
+    rule_id: R-PRF-016
+    category: perf/heavy-onreceive
+    severity: major
