@@ -85,11 +85,8 @@ class JoernAdapter(EngineAdapter):
         ) as tf:
             out_file = tf.name
 
-        joern_workspace = ctx.repo / ".scan" / "joern-workspace"
-        joern_workspace.mkdir(parents=True, exist_ok=True)
         cmd = [
             str(joern),
-            "--workspace", str(joern_workspace),
             "--script", str(_QUERIES_SCRIPT),
             "--param", f"srcDir={ctx.repo}",
             "--param", f"outFile={out_file}",

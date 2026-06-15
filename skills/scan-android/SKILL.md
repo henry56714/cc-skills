@@ -167,9 +167,39 @@ python3 <SKILL_DIR>/scripts/run_engines.py --scope-files .scan/tmp/scope.txt
 
 工具支线（第 5 步）给广度；AI 支线找规则编不出来的深层逻辑 bug（鉴权绕过、跨文件越权数据流、非幂等重试、缓存一致性、并发竞态…）。**可在 `.scan/config.json` 的 `excluded_engines` 加入 `"ai"` 跳过本支线（纯工具扫描）。**
 
-1. **降维出业务文件列表**：在第 2 步 `.scan/tmp/scope.txt` 基础上，排除生成码 / vendored / 第三方 / framework 包，把剩下的**业务代码**相对路径写入 `.scan/tmp/hunt_scope.txt`。
-2. **派发 hunter 子代理**：用 `<SKILL_DIR>/agents/hunter.md` 作提示词模板，填充 `{PROJECT_CONTEXT}`、`{LANGUAGE}`、`{HUNTING_RULES}` = `<SKILL_DIR>/rules/ai/hunting.md` 的完整内容、`{SCOPE_FILES_PATH}` = `.scan/tmp/hunt_scope.txt`。大作用域按文件分批并发。用配置的 **verify 档模型**跑狩猎（见 §模型分层）。
-3. **合并候选**：hunter 返回的 JSON 数组（`rule_id` 以 `R-AI-` 开头，带缺陷假设 + 可选 `dataflow_path`）**并入第 5 步的工具候选池**，一同进入第 6 步验证。按下方「子代理输出提取约定」从 hunter 回复中稳健取出 JSON。
+#### 5.5.1 降维出业务文件列表
+
+在第 2 步 `.scan/tmp/scope.txt` 基础上，排除生成码 / vendored / 第三方 / framework 包，把剩下的**业务代码**相对路径写入 `.scan/tmp/hunt_scope.txt`。
+
+#### 5.5.2 生成代码骨架（orchestrator 执行一次，hunter 不做）
+
+在派发 hunter **之前**，生成一份紧凑的**代码结构骨架**存入 `.scan/tmp/code_skeleton.json`。骨架只含类名、字段声明、方法签名和调用度，不含方法体，供 hunter 在不大量读取原始文件的情况下定位可疑目标。
+
+调用 `nav_tools.py --action skeleton`（Joern server 模式，CPG 构建完成后直接写 JSON 文件）：
+
+```bash
+python3 <SKILL_DIR>/scripts/nav_tools.py \
+  --repo "$(pwd)" \
+  --action skeleton \
+  --output-file "$(pwd)/.scan/tmp/code_skeleton.json"
+```
+
+Joern server 首次启动 + CPG 构建约需 2–5 分钟（workspace 有缓存时更快）。若命令以非零退出码退出，**中止 AI 支线并向用户报错**——骨架是 hunter 的前提，无骨架不得派发 hunter。用户可在 `.scan/config.json` 的 `excluded_engines` 加入 `"ai"` 跳过整条 AI 支线。
+
+#### 5.5.3 派发 hunter 子代理
+
+用 `<SKILL_DIR>/agents/hunter.md` 作提示词模板，填充：
+- `{PROJECT_CONTEXT}`
+- `{LANGUAGE}`
+- `{HUNTING_RULES}` = `<SKILL_DIR>/rules/ai/hunting.md` 的完整内容
+- `{SCOPE_FILES_PATH}` = `.scan/tmp/hunt_scope.txt`
+- `{SKELETON_FILE}` = `.scan/tmp/code_skeleton.json` 的**绝对路径**（骨架文件不存在时传字面量 `null`）
+
+用配置的 **verify 档模型**跑狩猎（见 §模型分层）。大作用域可并发多个 hunter，每个 hunter 独立读取完整骨架后自行决定深读哪些文件，无需再按文件分批——hunter 的 Read 调用上限（≤ 20 次）自然控制了每个 agent 的开销。
+
+#### 5.5.4 合并候选
+
+hunter 返回的 JSON 数组（`rule_id` 以 `R-AI-` 开头，带缺陷假设 + 可选 `dataflow_path`）**并入第 5 步的工具候选池**，一同进入第 6 步验证。按下方「子代理输出提取约定」从 hunter 回复中稳健取出 JSON。
 
 > **AI 支线只产候选、不下结论。** 它的发现和工具候选一样，必须过第 6 步的**独立验证闸**取证才会上报——发现者不给自己盖章。
 
