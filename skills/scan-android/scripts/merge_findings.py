@@ -15,11 +15,17 @@ v3 决定：去掉跨扫描状态机。本脚本**不**读取旧 findings、不�
       "rule_id": "R-STB-007", "category": "stability/unnamed-thread",
       "severity": "minor", "title": "...", "evidence": "...",
       "why": "...", "repro": "...", "suggestion": "...",
-      "dataflow_path": [...], "poc_result": {...}   (均可选)
+      "dataflow_path": [...], "poc_result": {...}, "origin_trace": [...]  (均可选)
     }
 
+取证闸（C）：条件触发型类别（static-context-leak / 主线程阻塞 / 越权数据流 等，见
+_needs_origin）的 finding 必须带回溯源头链（非空 `dataflow_path` 或 `origin_trace`），
+否则视为未取证被丢弃，不进入报告（计入 findings_dropped_no_origin）。
+
 输出:
-    stdout 一行 JSON 统计：{"findings_total": N, "findings_duplicate": N}
+    stdout 一行 JSON 统计：
+    {"findings_total": N, "findings_duplicate": N, "findings_dropped_no_origin": N,
+     "dropped_no_origin": [...]}  (后者仅在有丢弃时出现)
 """
 
 from __future__ import annotations
@@ -38,7 +44,30 @@ REQUIRED_INPUT_FIELDS = {
 }
 
 # 可选、若存在则原样透传到 finding 记录
-PASSTHROUGH_OPTIONAL = ("dataflow_path", "poc_result")
+PASSTHROUGH_OPTIONAL = ("dataflow_path", "poc_result", "origin_trace")
+
+# 取证闸（C）：以下「条件触发型」类别的缺陷只有在关键值（Context/输入/调用线程）
+# 回溯到终端源头后才成立。verifier 须用 nav_tools `trace-origin`（tree-sitter 精确层）取证并把源头链写入
+# `dataflow_path`（或显式 `origin_trace`）。缺失源头链的此类 finding 视为**取证未完成**，
+# 在此被丢弃，不进入报告——防止「仅凭 sink 模式」的未取证结论混入（见 agents/verifier.md）。
+ORIGIN_REQUIRED_PREFIXES = (
+    "stability/static-context-leak",
+    "perf/main-thread",
+    "performance/thread-starvation",
+    "performance/main-thread",
+)
+ORIGIN_REQUIRED_SUBSTRINGS = ("-data-flow", "unvalidated-input", "越权")
+
+
+def _needs_origin(category: str) -> bool:
+    c = category or ""
+    if any(c.startswith(p) for p in ORIGIN_REQUIRED_PREFIXES):
+        return True
+    return any(s in c for s in ORIGIN_REQUIRED_SUBSTRINGS)
+
+
+def _has_origin(cand: dict) -> bool:
+    return bool(cand.get("dataflow_path")) or bool(cand.get("origin_trace"))
 
 
 def main() -> int:
@@ -56,12 +85,26 @@ def main() -> int:
 
     records: dict[str, dict] = {}
     duplicates = 0
+    dropped_no_origin: list[dict] = []
 
     for cand in new_candidates:
         missing = REQUIRED_INPUT_FIELDS - cand.keys()
         if missing:
             print(f"候选缺失字段 {missing}: {cand}", file=sys.stderr)
             return 2
+
+        # 取证闸（C）：条件触发型缺陷缺少回溯源头链 → 视为未取证，丢弃。
+        if _needs_origin(cand.get("category", "")) and not _has_origin(cand):
+            dropped_no_origin.append({
+                "file": cand.get("file"), "line": cand.get("line"),
+                "rule_id": cand.get("rule_id"), "category": cand.get("category"),
+            })
+            print(
+                f"[merge] 丢弃未取证的条件触发型 finding（缺 trace-origin 源头链）: "
+                f"{cand.get('rule_id')} @ {cand.get('file')}:{cand.get('line')}",
+                file=sys.stderr,
+            )
+            continue
 
         fid = finding_id(cand["file"], int(cand["line"]), cand["category"])
         if fid in records:
@@ -91,10 +134,14 @@ def main() -> int:
     findings_list = list(records.values())
     atomic_write_json(args.findings, {"schema_version": 2, "findings": findings_list})
 
-    print(json.dumps({
+    out = {
         "findings_total": len(findings_list),
         "findings_duplicate": duplicates,
-    }, ensure_ascii=False))
+        "findings_dropped_no_origin": len(dropped_no_origin),
+    }
+    if dropped_no_origin:
+        out["dropped_no_origin"] = dropped_no_origin
+    print(json.dumps(out, ensure_ascii=False))
     return 0
 
 

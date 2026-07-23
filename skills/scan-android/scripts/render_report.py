@@ -36,7 +36,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--findings", default=".scan/findings.json")
     ap.add_argument("--output", default=".scan/reports/findings.md")
-    ap.add_argument("--engines-used", default=None, help="已使用引擎 CSV（如 semgrep,joern）；写入报告头")
+    ap.add_argument("--engines-used", default=None, help="已使用引擎 CSV（如 semgrep,detekt）；写入报告头")
     ap.add_argument("--engine-stats", default=None,
                     help='每引擎规则/候选数的 JSON（run_engines 的 engine_stats 字段），'
                          '如 \'[{"engine":"semgrep","rules_run":412,"candidates":520}]\'')
@@ -70,7 +70,6 @@ def main() -> int:
 
 def _render(findings: list[dict], engines_used: list[str] | None = None, models: list[str] | None = None, engine_stats: list[dict] | None = None) -> str:
     open_items = [f for f in findings if f.get("status") == "open"]
-    resolved = [f for f in findings if f.get("status") != "open"]
 
     counts = {sev: 0 for sev, _ in SEVERITY_LABELS}
     for f in open_items:
@@ -163,7 +162,7 @@ def _render_item(f: dict) -> str:
         parts.append(f"Repro: {f['repro']}")
     if f.get("suggestion"):
         parts.append(f"Suggestion: {f['suggestion']}")
-    # 渲染数据流路径（Joern/CodeQL/FlowDroid 产出）
+    # 渲染数据流路径（FlowDroid 产出；Semgrep taint 亦可能带路径）
     dataflow = f.get("dataflow_path", [])
     if dataflow:
         parts.append("")

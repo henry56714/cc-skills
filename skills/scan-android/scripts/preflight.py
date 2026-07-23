@@ -23,8 +23,7 @@ stdout JSON:
         {"name": "venv",           "status": "fixed",   "detail": "/path/to/venv"},
         {"name": "semgrep",        "status": "fixed",   "detail": "/path/to/semgrep"},
         {"name": "detekt",         "status": "fixed",   "detail": "/path/to/detekt.jar"},
-        {"name": "joern",          "status": "fixed",   "detail": "/path/to/joern"},
-        {"name": "codeql",         "status": "skip",    "detail": "未在 opt_in_engines 中配置"},
+        {"name": "repomap",        "status": "fixed",   "detail": "/path/to/repomap-venv"},
         {"name": "gradle_wrapper", "status": "ok",      "detail": "./gradlew"},
         {"name": "git",            "status": "ok",      "detail": "git 2.39.3"}
       ],
@@ -43,10 +42,11 @@ status 值语义:
 
 引擎预检范围规则（excluded_engines 中的引擎 → 工具 skip，不参与中断判定）:
     • venv / semgrep / detekt / pmd — 默认必需 + 自动安装（装不上即阻塞）
-    • joern                      — 默认必需 + 自动安装
     • lint                       — 默认必需；依赖 gradlew，缺失即阻塞（gradlew 属工程无法自动安装）
-    • java                       — 仅检测；Detekt/Joern/Lint 依赖它，缺失即阻塞（需手动装 JDK）
-    • codeql                     — 若 opt-in，则预检 + 自动安装，必需
+    • repomap                    — tree-sitter 精确层（唯一精确层）：独立 venv 装 tree-sitter，
+                                    自动安装但**非阻塞**——缺失则 hunter 地图降级、导航回退纯标准库 source-nav
+    • gradle_wrapper             — Lint 启用即必需（需 `./gradlew`）；缺失即阻塞
+    • java                       — 仅检测；Detekt/Lint 依赖它，缺失即阻塞（需手动装 JDK）
     • git                        — 仅检测，软依赖（仅影响 --diff，不阻塞）
 """
 
@@ -58,7 +58,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,7 +67,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _SKILL_ROOT = _SCRIPTS_DIR.parent
 
 sys.path.insert(0, str(_SCRIPTS_DIR))
-from tools.installer import (
+from tools.installer import (  # noqa: E402  (依赖上方 sys.path.insert)
     TOOLS_DIR,
     VENV_DIR,
     _DETEKT_VERSION,
@@ -79,9 +78,9 @@ from tools.installer import (
     ensure_semgrep,
     ensure_detekt,
     ensure_pmd,
-    ensure_joern,
-    ensure_codeql,
     find_pmd,
+    ensure_repomap_venv,
+    REPOMAP_VENV_DIR,
 )
 
 
@@ -142,7 +141,6 @@ def _read_scan_config(repo_root: Path) -> dict:
 
 def _env_opt_in_engines() -> list[str]:
     env_map = {
-        "SCAN_ANDROID_ENABLE_CODEQL": "codeql",
         "SCAN_ANDROID_ENABLE_MOBSF": "mobsf",
         "SCAN_ANDROID_ENABLE_FLOWDROID": "flowdroid",
     }
@@ -170,10 +168,10 @@ def _detect_java(java_needed: bool) -> CheckResult:
     ok, detail = check_java()
     if ok:
         return CheckResult("java", "ok", detail)
-    # strict：Detekt / Joern / Lint 依赖 Java，Java 缺失即阻塞（Java 不自动安装，需手动）
+    # strict：Detekt / Lint 依赖 Java，Java 缺失即阻塞（Java 不自动安装，需手动）
     return CheckResult(
         "java", "missing",
-        detail + "  → Detekt / Joern / Lint 依赖 Java；strict 模式无法继续，请安装 JDK 17+。",
+        detail + "  → Detekt / Lint 依赖 Java；strict 模式无法继续，请安装 JDK 17+。",
         is_hard_required=True,
     )
 
@@ -213,7 +211,7 @@ def _detect_detekt(detekt_needed: bool) -> CheckResult:
         return CheckResult("detekt", "ok", str(jar))
     # Java 缺失时由 _detect_java 阻塞；此处仍标为必需，安装失败即阻塞
     return CheckResult(
-        "detekt", "missing", f"JAR 未下载 (~64 MB)",
+        "detekt", "missing", "JAR 未下载 (~64 MB)",
         can_auto_install=True, is_hard_required=True,
     )
 
@@ -229,61 +227,42 @@ def _detect_pmd(pmd_needed: bool) -> CheckResult:
     )
 
 
-def _detect_joern(joern_needed: bool) -> CheckResult:
-    if not joern_needed:
-        return CheckResult("joern", "skip", "已在 excluded_engines 中排除")
-    if shutil.which("joern"):
-        return CheckResult("joern", "ok", shutil.which("joern"))  # type: ignore[arg-type]
-    local_bin = TOOLS_DIR / "joern" / "joern-cli" / "joern"
-    if local_bin.exists():
-        return CheckResult("joern", "ok", str(local_bin))
-    # 检查失败冷却标记
-    fail_marker = TOOLS_DIR / "joern" / ".download-failed"
-    if fail_marker.exists():
-        age = time.time() - fail_marker.stat().st_mtime
-        remaining = max(0, int((3600 - age) / 60))
-        if remaining > 0:
-            return CheckResult(
-                "joern", "missing",
-                f"上次下载失败，冷却中（{remaining} 分钟后可重试）",
-                can_auto_install=False, is_hard_required=True,
-            )
-    # Java 是运行 Joern 的前提
-    ok, _ = check_java()
-    if not ok:
-        return CheckResult(
-            "joern", "missing",
-            "未安装 (~2 GB)，且 Java 不可用无法安装",
-            can_auto_install=False, is_hard_required=True,
-        )
+def _detect_repomap_venv(repo_root: Path) -> CheckResult:
+    """tree-sitter 精确层（唯一精确层，nav_backend=auto/treesitter 时启用）。
+
+    tree-sitter + tree-sitter-language-pack 装在独立 venv（~/.scan-android/repomap-venv/，
+    比照 semgrep 隔离）。用于 hunter 的 RepoMap（签名骨架 + PageRank + 跨文件关系）与 verifier
+    的 AST 精确导航。**永不阻塞**——venv/包缺失则地图降级、导航自动回退 source-nav（纯标准库）。"""
+    pref = (os.environ.get("SCAN_ANDROID_NAV_BACKEND") or "").strip().lower()
+    if not pref:
+        pref = str(_read_scan_config(repo_root).get("nav_backend", "")).strip().lower()
+    if pref == "source":
+        return CheckResult("repomap", "skip", "nav_backend=source（纯标准库，无需 tree-sitter）")
+    venv_py = REPOMAP_VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if venv_py.exists():
+        # 校验包可导入
+        try:
+            r = subprocess.run([str(venv_py), "-c", "import tree_sitter, tree_sitter_language_pack"],
+                               capture_output=True, timeout=30)
+            if r.returncode == 0:
+                return CheckResult("repomap", "ok", f"{REPOMAP_VENV_DIR}（tree-sitter 精确层）")
+        except Exception:
+            pass
     return CheckResult(
-        "joern", "missing", "未安装 (~2 GB)",
-        can_auto_install=True, is_hard_required=True,
+        "repomap", "missing",
+        f"尚未就绪: {REPOMAP_VENV_DIR}（tree-sitter 精确层；非阻塞，缺失则地图降级、导航回退 source-nav）",
+        can_auto_install=True, is_hard_required=False,
     )
 
 
-def _detect_codeql(codeql_needed: bool) -> CheckResult:
-    if not codeql_needed:
-        return CheckResult("codeql", "skip", "未在 opt_in_engines 中配置")
-    if shutil.which("codeql"):
-        return CheckResult("codeql", "ok", shutil.which("codeql"))  # type: ignore[arg-type]
-    local_bin = TOOLS_DIR / "codeql" / "codeql"
-    if local_bin.exists():
-        return CheckResult("codeql", "ok", str(local_bin))
-    # codeql 是显式 opt-in，安装失败构成阻塞
-    return CheckResult(
-        "codeql", "missing", "未安装 (~2 GB)",
-        can_auto_install=True, is_hard_required=True,
-    )
-
-
-def _detect_gradle_wrapper(lint_needed: bool, repo_root: Path) -> CheckResult:
-    if not lint_needed:
-        return CheckResult("gradle_wrapper", "skip", "lint 已在 excluded_engines 中关闭")
+def _detect_gradle_wrapper(gradle_needed: bool, repo_root: Path) -> CheckResult:
+    """gradlew：Lint 依赖它。"""
+    if not gradle_needed:
+        return CheckResult("gradle_wrapper", "skip", "lint 已关闭，无需 gradlew")
     gradlew = repo_root / "gradlew"
     if gradlew.exists():
         return CheckResult("gradle_wrapper", "ok", str(gradlew))
-    # strict + lint 启用：Lint 依赖 gradlew，缺失即阻塞（gradlew 属工程，无法自动安装）
+    # strict：Lint 依赖 gradlew，缺失即阻塞（gradlew 属工程，无法自动安装）
     return CheckResult(
         "gradle_wrapper", "missing",
         "gradlew 不存在 — Lint 无法运行（strict 中断）。若该工程无 Gradle wrapper，"
@@ -314,9 +293,7 @@ def _detect_all(
     semgrep_needed: bool,
     detekt_needed: bool,
     pmd_needed: bool,
-    joern_needed: bool,
-    lint_needed: bool,
-    codeql_needed: bool,
+    gradle_needed: bool,
 ) -> list[CheckResult]:
     results: list[CheckResult] = [
         _detect_python(),
@@ -325,9 +302,8 @@ def _detect_all(
         _detect_semgrep(semgrep_needed),
         _detect_detekt(detekt_needed),
         _detect_pmd(pmd_needed),
-        _detect_joern(joern_needed),
-        _detect_codeql(codeql_needed),
-        _detect_gradle_wrapper(lint_needed, repo_root),
+        _detect_repomap_venv(repo_root),
+        _detect_gradle_wrapper(gradle_needed, repo_root),
         _detect_git(),
     ]
     return results
@@ -355,12 +331,9 @@ def _try_install(name: str) -> tuple[bool, str]:
         elif name == "pmd":
             path, _ = ensure_pmd()
             return True, path
-        elif name == "joern":
-            path, _ = ensure_joern()
-            return True, path
-        elif name == "codeql":
-            path, _ = ensure_codeql()
-            return True, path
+        elif name == "repomap":
+            path = ensure_repomap_venv()
+            return True, str(path)
         else:
             return False, f"不支持自动安装: {name}"
     except Exception as e:
@@ -373,9 +346,6 @@ def _try_install(name: str) -> tuple[bool, str]:
 
 def run_preflight(repo_root: Path) -> dict:
     config = _read_scan_config(repo_root)
-    opt_in_engines: list[str] = list(
-        dict.fromkeys(config.get("opt_in_engines", []) + _env_opt_in_engines())
-    )
     excluded_engines: list[str] = config.get("excluded_engines", [])
 
     # 每个引擎是否需要（决定其工具是否计入 strict 中断判定）。
@@ -383,12 +353,12 @@ def run_preflight(repo_root: Path) -> dict:
     semgrep_needed = "semgrep" not in excluded_engines
     detekt_needed = "detekt" not in excluded_engines
     pmd_needed = "pmd" not in excluded_engines
-    joern_needed = "joern" not in excluded_engines
     lint_needed = "lint" not in excluded_engines
-    codeql_needed = ("codeql" in opt_in_engines) and ("codeql" not in excluded_engines)
-    # 依赖关系：Detekt / PMD / Joern / Lint 需要 Java；Semgrep 需要 venv。
-    java_needed = detekt_needed or pmd_needed or joern_needed or lint_needed
+    # 依赖关系：Detekt / PMD / Lint 需要 Java；Semgrep 需要 venv。
+    java_needed = detekt_needed or pmd_needed or lint_needed
     venv_needed = semgrep_needed
+    # gradlew：Lint 依赖它。
+    gradle_needed = lint_needed
 
     detect_kwargs = dict(
         java_needed=java_needed,
@@ -396,9 +366,7 @@ def run_preflight(repo_root: Path) -> dict:
         semgrep_needed=semgrep_needed,
         detekt_needed=detekt_needed,
         pmd_needed=pmd_needed,
-        joern_needed=joern_needed,
-        lint_needed=lint_needed,
-        codeql_needed=codeql_needed,
+        gradle_needed=gradle_needed,
     )
 
     # 跟踪已尝试安装的引擎，防止无限重试
@@ -436,7 +404,7 @@ def run_preflight(repo_root: Path) -> dict:
 
     # ── 后处理（strict）：标记 fixed / 任何 hard-required 仍缺失即升级为 blocker ──
     # v3 决定：只有 strict 模式，绝不降级。必需引擎未就绪即中断，无论是否尝试过安装、
-    # 能否自动安装（如 Java 不自动装、Joern 下载失败均构成阻塞）。
+    # 能否自动安装（如 Java 不自动装均构成阻塞）。repomap 精确层非必需，缺失不阻塞（回退 source-nav）。
     for r in results:
         if r.name in newly_installed and r.status == "ok":
             r.status = "fixed"

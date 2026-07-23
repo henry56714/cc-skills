@@ -7,6 +7,12 @@
 from __future__ import annotations
 
 import sys
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lib_scan import Candidate
 
 
 class InstallationError(Exception):
@@ -16,12 +22,6 @@ class InstallationError(Exception):
     - 未启用   → 返回 (False, reason)，run_engines 静默跳过
     - 安装失败 → 抛出 InstallationError，run_engines 中止整次扫描并报错
     """
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lib_scan import Candidate
 
 
 @dataclass

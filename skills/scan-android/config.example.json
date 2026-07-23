@@ -1,11 +1,15 @@
 {
   "_usage": "将本文件拷贝到被扫描项目根目录的 .scan/config.json，删除所有 _ 开头的注释键，按需修改。",
 
-  "_opt_in_engines_note": "P4 引擎默认关闭。可选值：codeql / mobsf / flowdroid。启用 codeql 时建议同时把 joern 加入 excluded_engines，避免重复深度分析。",
+  "_opt_in_engines_note": "P4 引擎默认关闭。可选值：mobsf / flowdroid（需对应 APK / 环境）。",
   "opt_in_engines": [],
 
-  "_excluded_engines_note": "关闭指定引擎，对所有引擎生效（semgrep / detekt / pmd / lint / joern / codeql / mobsf / flowdroid），优先级高于 opt_in_engines。被关闭的引擎其对应工具不计入 preflight strict 的中断判定——例如无 Gradle wrapper 的库工程可加入 'lint' 关闭它，避免因缺 gradlew 而中断。",
+  "_excluded_engines_note": "关闭指定引擎，对所有引擎生效（semgrep / detekt / pmd / lint / mobsf / flowdroid），优先级高于 opt_in_engines。被关闭的引擎其对应工具不计入 preflight strict 的中断判定——例如无 Gradle wrapper 的库工程可加入 'lint' 关闭它。",
   "excluded_engines": [],
+
+  "_nav_backend_note": "跨文件调用/类型导航后端 + hunter 的 RepoMap。唯一精确层是 tree-sitter（AST 精确，Java+Kotlin 无盲区，装在独立 venv ~/.scan-android/repomap-venv/，比照 semgrep 隔离），preflight 自动安装、非阻塞。tree-sitter 不可用时自动回退纯标准库 source-nav，并打印 [WARN] nav-degraded 告警（精度下降，请修复 repomap venv）。",
+  "_nav_backend_select_note": "导航后端选择：auto（默认=treesitter→source）/ treesitter（强制 tree-sitter 精确层，唯一精确层）/ source（强制纯标准库兜底）。tree-sitter 用 AST 精确识别 def/ref、Kotlin 无盲区，并产出 source-nav 做不到的 RepoMap（签名骨架 + PageRank + 跨文件关系）；同名重载不消歧，由 verifier 逐跳 Read 复核（基准实测导航精度与 source-nav 持平，采纳理由是 RepoMap 能力）。",
+  "nav_backend": "auto",
 
   "_semgrep_registry_note": "Semgrep 社区 registry 规则包开关与覆盖。semgrep_use_registry=false 可在离线环境关闭在线规则包（只跑本地 queries/semgrep/）；semgrep_registry_packs 显式覆盖默认包清单（如 ['p/java','p/security-audit']），留空用按 check 类别的默认映射。",
   "semgrep_use_registry": true,
@@ -17,6 +21,12 @@
     "verify": "claude-sonnet-4-6",
     "escalate": ""
   },
+
+  "_hunt_samples_note": "AI 狩猎支线每批的采样次数（self-consistency 提召回）。默认 1；>1 时对每批跑多次 hunter，候选并集后交第 6 步验证去重。--full 大作用域可设 2：召回更高但 hunter 成本翻倍。",
+  "hunt_samples": 1,
+
+  "_hunt_batch_size_note": "build_hunt_batches.py 每批文件数上限（默认 15）。hunter 逐文件通读，过大易超上下文/漏读，过小则子代理数量多。",
+  "hunt_batch_size": 15,
 
   "_modules_note": "强制指定模块列表，覆盖 detect_project.py 的自动探测。留空则自动探测。",
   "modules": [],

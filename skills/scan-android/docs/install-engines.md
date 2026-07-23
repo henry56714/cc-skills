@@ -6,8 +6,8 @@ scan-android v2 采用**分层自动安装**策略：
 |---|---|---|---|
 | Python 包 | semgrep | pip → venv | `~/.scan-android/venv/` |
 | JVM 工具 | Detekt | JAR 下载 | `~/.scan-android/tools/detekt/` |
-| JVM 工具（骨干） | Joern | ZIP 下载（~2 GB） | `~/.scan-android/tools/joern/` |
-| Opt-in | CodeQL | bundle 下载（~2 GB） | `~/.scan-android/tools/codeql/` |
+| JVM 工具 | PMD | ZIP 下载（~40 MB） | `~/.scan-android/tools/pmd/` |
+| 验证导航 + RepoMap | tree-sitter | pip 装独立 venv（自动、非阻塞） | `~/.scan-android/repomap-venv/` |
 | Opt-in | FlowDroid | JAR 下载（Maven） | `~/.scan-android/tools/flowdroid/` |
 | Opt-in | MobSF | 需本地服务 | — |
 | 系统工具（手动） | Java 11+ | brew / apt / 系统包管理 | 系统 PATH |
@@ -23,7 +23,7 @@ scan-android v2 采用**分层自动安装**策略：
 2. 安装 semgrep 到 venv
 3. 下载 Detekt JAR
 
-Joern 因体积大（~2 GB）同样会自动下载，但首次需要时间，下载失败后 1 小时内不重试。
+跨文件导航的唯一精确层是 **tree-sitter**（AST 精确，装在独立 venv、pip 自动安装、非阻塞，详见下方「跨文件调用/类型导航」节）；tree-sitter 不可用时回退纯标准库 source-nav 并打印 `[WARN] nav-degraded` 告警。
 
 ---
 
@@ -37,15 +37,18 @@ python3 -m venv ~/.scan-android/venv
 # 2. 安装 Detekt（~64 MB）
 python3 scripts/tools/installer.py --install detekt
 
-# 3. 安装 Joern（~2 GB；strict 默认必需，不需要可在 excluded_engines 关闭）
-python3 scripts/tools/installer.py --install joern
+# 3. 安装 PMD（~40 MB）
+python3 scripts/tools/installer.py --install pmd
+
+# 4. 安装 tree-sitter 精确层（preflight 会自动做；非阻塞，装不出回退 source-nav）
+python3 scripts/tools/installer.py --install repomap
 ```
 
 ---
 
 ## 系统依赖（需用户手动安装）
 
-### Java 11+（Detekt / Joern / FlowDroid 必需）
+### Java 11+（Detekt / Lint / FlowDroid 必需）
 
 ```bash
 # macOS
@@ -99,18 +102,16 @@ semgrep_adapter 查找 semgrep 的顺序：
 - **路径：** `~/.scan-android/tools/detekt/detekt-cli-1.23.7-all.jar`
 - **触发：** 首次扫描时自动下载
 
-### Joern（跨文件 CPG 骨干）
+### 跨文件调用/类型导航（唯一精确层 tree-sitter；source-nav 纯标准库兜底）
 
-- **版本：** 最新 release（fallback: 4.0.404）
-- **大小：** ~2 GB（包含 Scala 运行时 + 所有语言前端）
-- **下载源：** GitHub releases（`joern-cli.zip`）
-- **路径：** `~/.scan-android/tools/joern/joern-cli/joern`
-- **触发：** 首次扫描时自动下载；失败后 1 小时内不重试
-- **strict：** Joern 默认必需，装不上即中断；不需要可在 `.scan/config.json` 的 `excluded_engines` 加入 `"joern"` 关闭（关闭后不计入中断判定）
+hunter 的 RepoMap（跨文件代码地图）与 verifier 取证跨文件调用关系都由 tree-sitter 引擎（`repo_map.py`）提供；导航门面 `nav_tools.py` 按 `.scan/config.json` 的 `nav_backend`（或环境变量 `SCAN_ANDROID_NAV_BACKEND`，默认 `auto`）选择后端，缺则回退：
+
+- **tree-sitter（默认，唯一精确层）：** `scripts/repo_map.py` 用 tree-sitter 解析 Java/Kotlin，**AST 精确**识别 def/ref（不误命中注释/字符串、enclosing scope 精确、**自备 `scripts/tags/kotlin-tags.scm` 故 Kotlin 无盲区**），提供 `callers`/`definition`/`hierarchy`/`trace-origin` + `map`（RepoMap）。同名重载/接收者类型**不消歧**——常见名歧义由 verifier 逐跳 Read 复核（基准 `nav_benchmark.py` 实测导航精度与 source-nav 持平；采纳理由是 **source-nav 产不出的 RepoMap 能力**：签名骨架 + PageRank + 跨文件关系，喂给 hunter 做跨文件分析）。**安装：** `tree-sitter` + `tree-sitter-language-pack` 经 pip 装到独立 venv `~/.scan-android/repomap-venv/`（比照 semgrep 隔离；preflight 自动安装，**非阻塞**——装不出只回退 source-nav）。可用 `SCAN_ANDROID_REPOMAP_VENV` 覆盖 venv 路径。
+- **source-nav（纯标准库兜底，无需安装）：** `scripts/source_nav.py` 直接对源码做正则检索，**不需要任何编译**、召回完整、仅用 Python 标准库。**tree-sitter venv 装不出时回退它——保证裸机/离线时导航仍能跑出调用链**；此时 `nav_tools` 会打印 `[WARN] nav-degraded` 告警（精度下降，请修复 repomap venv）。
 
 ```bash
-# 手动安装 Joern（macOS，推荐方式）
-brew install joern
+# 手动安装 tree-sitter 精确层（preflight 会自动做，这里供手动修复）
+python3 scripts/tools/installer.py --install repomap
 ```
 
 ---
@@ -125,23 +126,17 @@ brew install joern
 
 ```json
 {
-  "opt_in_engines": ["codeql"]
+  "opt_in_engines": ["mobsf"]
 }
 ```
 
 **方式二：环境变量（临时 / CI）**
 
 ```bash
-export SCAN_ANDROID_ENABLE_CODEQL=1
+export SCAN_ANDROID_ENABLE_MOBSF=1
 ```
 
 ---
-
-### CodeQL（深度路径污点分析）
-
-- **前置条件：** 已持有 CodeQL 许可（开源项目免费，商业项目需授权）
-- **大小：** bundle ~2 GB
-- **下载源：** github/codeql-action releases
 
 ### MobSF（APK 级别扫描）
 
@@ -185,7 +180,7 @@ python3 <SKILL_DIR>/scripts/dynamic_poc.py \
 v3 strict 无降级：所有必需引擎在 preflight 保证就绪，否则中断。报告头记录本次实际用的引擎：
 
 ```
-> **引擎层级:** joern ✓ · semgrep ✓ · detekt ✓ · lint ✓
+> **引擎层级:** semgrep ✓ · detekt ✓ · pmd ✓ · lint ✓
 ```
 
 若关闭了某引擎（`excluded_engines`），它不出现在此列表，也不参与中断判定。
@@ -202,7 +197,10 @@ export SCAN_ANDROID_VENV_DIR=/shared/scan-android/venv
 export SCAN_ANDROID_TOOLS_DIR=/opt/scan-android/tools
 
 # 启用 opt-in 引擎
-export SCAN_ANDROID_ENABLE_CODEQL=1
 export SCAN_ANDROID_ENABLE_MOBSF=1
 export SCAN_ANDROID_ENABLE_FLOWDROID=1
+
+# 导航后端：默认 auto（tree-sitter→source-nav 兜底）；离线/受限可强制 source
+export SCAN_ANDROID_NAV_BACKEND=source           # 跳过 tree-sitter venv，强制纯标准库导航
+export SCAN_ANDROID_REPOMAP_VENV=/path/to/venv   # 覆盖 tree-sitter 精确层 venv 路径
 ```

@@ -3,8 +3,9 @@
 引擎编排器 —— v2 架构的候选生成入口（替代 v1 的 prefilter.py）。
 
 注册可用的引擎 adapter，逐个运行，把各引擎产出的候选归一化为统一契约后聚合输出。
-后续阶段（Semgrep / Joern / CodeQL ...）只需新增 adapter 并在 _REGISTRY 注册，
+后续阶段只需新增 adapter 并在 _REGISTRY 注册，
 本编排器与下游管线（LLM 验证 / 去重 / 报告）均无需改动。
+（注：tree-sitter 是 verifier 的调用/类型导航后端，不是候选生成引擎，见 nav_tools.py。）
 
 用法:
     run_engines.py --scope-files PATH [--rules-dir DIR]
@@ -46,23 +47,20 @@ from adapters.semgrep_adapter import SemgrepAdapter
 from adapters.detekt_adapter import DetektAdapter
 from adapters.pmd_adapter import PMDAdapter
 from adapters.lint_adapter import LintAdapter
-from adapters.joern_adapter import JoernAdapter
-from adapters.codeql_adapter import CodeQLAdapter
 from adapters.mobsf_adapter import MobSFAdapter
 from adapters.flowdroid_adapter import FlowDroidAdapter
 
-# 已注册引擎，按"广度→深度"优先级排列。规则全部来自社区库/引擎自带（v3：
-# 不再有 regex 引擎——旧 rules/*.md 已退役，其领域知识迁入 rules/ai/）。
-# - P1: semgrep（社区 registry + 本地补充）、detekt（Kotlin）、pmd（Java）、lint（Android）
-# - P2: joern（CPG 跨文件骨干）
-# - P4: codeql / mobsf / flowdroid（opt-in）
+# 已注册引擎，按"广度→深度"优先级排列。规则全部来自社区库/引擎自带。
+# - P1: semgrep（社区 registry + 本地补充，含 taint 模式）、detekt（Kotlin）、pmd（Java）、lint（Android）
+# - P4: mobsf / flowdroid（opt-in）
+# 注：跨文件**调用/类型**导航由 tree-sitter（repo_map.py，唯一精确层）提供，见 nav_tools.py，
+#     供 verifier 取证调用链——它不是候选生成引擎，故不在本注册表内。
+#     深层污点/数据流（原 Joern/CodeQL 角色）现由 Semgrep taint + AI 狩猎（rules/ai/）覆盖。
 _REGISTRY: list[EngineAdapter] = [
-    SemgrepAdapter(),   # P1: 广度（含社区 registry 包）
+    SemgrepAdapter(),   # P1: 广度（含社区 registry 包 + taint 模式）
     DetektAdapter(),    # P1: Kotlin 专项
     PMDAdapter(),       # P1: Java 专项（errorprone / 多线程 / 性能）
     LintAdapter(),      # P1: Android Lint
-    JoernAdapter(),     # P2: CPG 骨干（深度）
-    CodeQLAdapter(),    # P4: opt-in（需 SCAN_ANDROID_ENABLE_CODEQL=1）
     MobSFAdapter(),     # P4: opt-in（需 SCAN_ANDROID_ENABLE_MOBSF=1）
     FlowDroidAdapter(), # P4: opt-in（需 SCAN_ANDROID_ENABLE_FLOWDROID=1）
 ]
@@ -199,7 +197,6 @@ def _load_engine_config(repo: Path) -> tuple[list[str], list[str]]:
     from_config_excluded = [e.strip() for e in cfg.get("excluded_engines", []) if e.strip()]
 
     env_map = {
-        "SCAN_ANDROID_ENABLE_CODEQL": "codeql",
         "SCAN_ANDROID_ENABLE_MOBSF": "mobsf",
         "SCAN_ANDROID_ENABLE_FLOWDROID": "flowdroid",
     }

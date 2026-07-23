@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 import sys
@@ -25,29 +24,29 @@ _DETEKT_CONFIG = _SKILL_ROOT / "queries" / "detekt" / "detekt.yml"
 # Detekt rule ID → 我们的规范 rule_id
 _RULE_MAP: dict[str, tuple[str, str, str]] = {
     # (rule_id, category, severity)
-    "TooGenericExceptionCaught": ("R-STB-008", "stability/swallowed-exception", "major"),
-    "SwallowedException": ("R-STB-008", "stability/swallowed-exception", "major"),
-    "EmptyCatchBlock": ("R-STB-008", "stability/swallowed-exception", "major"),
-    "GlobalCoroutineUsage": ("R-STB-013", "stability/globalscope", "major"),
-    "InjectDispatcher": ("R-STB-013", "stability/globalscope", "minor"),
-    "UnnecessaryNotNullOperator": ("R-STB-012", "stability/kotlin-not-null-assert", "minor"),
-    "UnsafeCallOnNullableType": ("R-STB-012", "stability/kotlin-not-null-assert", "major"),
-    "NullableToStringCall": ("R-STB-012", "stability/kotlin-not-null-assert", "minor"),
-    "UnsafeCast": ("R-STB-012", "stability/kotlin-not-null-assert", "major"),
-    "LateinitUsage": ("R-STB-012", "stability/kotlin-not-null-assert", "minor"),
-    "HardCodedStringLiteral": ("R-SEC-001", "security/hardcoded-secret", "minor"),
-    "ForbiddenComment": ("R-SEC-001", "security/hardcoded-secret", "info"),
-    "MaxLineLength": ("R-PRF-006", "perf/string-concat-in-loop", "info"),
-    "ComplexCondition": ("R-STB-008", "stability/swallowed-exception", "minor"),
-    "LongMethod": ("R-PRF-004", "perf/hotpath-allocation", "minor"),
-    "NestedBlockDepth": ("R-STB-015", "stability/broken-dcl", "minor"),
-    "ThreadSafeValidator": ("R-STB-030", "stability/non-threadsafe-formatter", "major"),
-    "UselessCallOnNotNull": ("R-STB-012", "stability/kotlin-not-null-assert", "info"),
-    "MissingWhenCase": ("R-STB-008", "stability/swallowed-exception", "major"),
-    "SuspendFunWithFlowReturnType": ("R-STB-009", "stability/rxjava-disposable-leak", "major"),
+    "TooGenericExceptionCaught": ("R-DK-001", "stability/swallowed-exception", "major"),
+    "SwallowedException": ("R-DK-001", "stability/swallowed-exception", "major"),
+    "EmptyCatchBlock": ("R-DK-001", "stability/swallowed-exception", "major"),
+    "ComplexCondition": ("R-DK-001", "stability/swallowed-exception", "minor"),
+    "MissingWhenCase": ("R-DK-001", "stability/swallowed-exception", "major"),
+    "GlobalCoroutineUsage": ("R-DK-002", "stability/globalscope", "major"),
+    "InjectDispatcher": ("R-DK-002", "stability/globalscope", "minor"),
+    "UnnecessaryNotNullOperator": ("R-DK-003", "stability/kotlin-not-null-assert", "minor"),
+    "UnsafeCallOnNullableType": ("R-DK-003", "stability/kotlin-not-null-assert", "major"),
+    "NullableToStringCall": ("R-DK-003", "stability/kotlin-not-null-assert", "minor"),
+    "UnsafeCast": ("R-DK-003", "stability/kotlin-not-null-assert", "major"),
+    "LateinitUsage": ("R-DK-003", "stability/kotlin-not-null-assert", "minor"),
+    "UselessCallOnNotNull": ("R-DK-003", "stability/kotlin-not-null-assert", "info"),
+    "HardCodedStringLiteral": ("R-DK-004", "security/hardcoded-secret", "minor"),
+    "ForbiddenComment": ("R-DK-004", "security/hardcoded-secret", "info"),
+    "MaxLineLength": ("R-DK-005", "perf/string-concat-in-loop", "info"),
+    "LongMethod": ("R-DK-006", "perf/hotpath-allocation", "minor"),
+    "NestedBlockDepth": ("R-DK-007", "stability/broken-dcl", "minor"),
+    "ThreadSafeValidator": ("R-DK-008", "stability/non-threadsafe-formatter", "major"),
+    "SuspendFunWithFlowReturnType": ("R-DK-009", "stability/rxjava-disposable-leak", "major"),
 }
 
-_DEFAULT_RULE = ("R-STB-000", "stability/general", "minor")
+_DEFAULT_RULE = ("R-DK-000", "stability/general", "minor")
 
 
 class DetektAdapter(EngineAdapter):
@@ -84,11 +83,8 @@ class DetektAdapter(EngineAdapter):
             result.notes.append({"engine": self.name, "note": "作用域内无 Kotlin 文件，跳过"})
             return result
 
-        # 确定输入目录（传给 detekt 的是目录列表）
-        input_paths = list({str(ctx.repo / f.split("/")[0]) for f in kt_files})
-        # 如果有多个模块目录，传全部；否则传仓库根
-        if not input_paths:
-            input_paths = [str(ctx.repo)]
+        # 直接传入 scope 内的 Kotlin 文件（绝对路径），避免扫描整个模块目录
+        input_paths = [str(ctx.repo / f) for f in kt_files]
 
         with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tf:
             report_xml = tf.name

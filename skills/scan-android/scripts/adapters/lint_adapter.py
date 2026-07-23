@@ -7,7 +7,6 @@ Android Lint 对 manifest / 资源 / API 使用有最精准的感知能力。
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -21,43 +20,43 @@ from .base import AdapterResult, EngineAdapter, ScanContext
 # Lint issue ID → (rule_id, category, severity)
 _LINT_RULE_MAP: dict[str, tuple[str, str, str]] = {
     # Security
-    "HardcodedDebugMode": ("R-SEC-014", "security/debuggable-enabled", "critical"),
-    "AllowBackup": ("R-SEC-015", "security/backup-allowed", "major"),
-    "ExportedReceiver": ("R-SEC-007", "security/exported-unprotected", "critical"),
-    "ExportedActivity": ("R-SEC-007", "security/exported-unprotected", "critical"),
-    "ExportedService": ("R-SEC-007", "security/exported-unprotected", "critical"),
-    "ExportedProvider": ("R-SEC-018", "security/exported-provider", "critical"),
-    "SetJavaScriptEnabled": ("R-SEC-004", "security/webview", "major"),
-    "AddJavascriptInterface": ("R-SEC-004", "security/webview", "major"),
-    "SQLiteString": ("R-SEC-011", "security/sql-injection", "critical"),
-    "HardcodedCredentials": ("R-SEC-001", "security/hardcoded-secret", "critical"),
-    "PlaintextPassword": ("R-SEC-001", "security/hardcoded-secret", "critical"),
-    "TrustAllX509TrustManager": ("R-SEC-003", "security/tls-trust-all", "critical"),
-    "BadHostnameVerifier": ("R-SEC-003", "security/tls-trust-all", "critical"),
-    "InsecureBaseConfiguration": ("R-SEC-005", "security/cleartext", "major"),
-    "CleartextSupported": ("R-SEC-005", "security/cleartext", "major"),
-    "WorldReadableFiles": ("R-SEC-008", "security/world-readable", "critical"),
-    "WorldWriteableFiles": ("R-SEC-008", "security/world-readable", "critical"),
-    "UnsafeIntentLaunch": ("R-SEC-016", "security/intent-redirection", "critical"),
-    "IntentFilterUniquePermission": ("R-SEC-017", "security/receiver-export-flag", "major"),
+    "HardcodedCredentials": ("R-LT-001", "security/hardcoded-secret", "critical"),
+    "PlaintextPassword": ("R-LT-001", "security/hardcoded-secret", "critical"),
+    "VisibleForTests": ("R-LT-001", "security/hardcoded-secret", "info"),
+    "OpenForTesting": ("R-LT-001", "security/hardcoded-secret", "info"),
+    "TrustAllX509TrustManager": ("R-LT-002", "security/tls-trust-all", "critical"),
+    "BadHostnameVerifier": ("R-LT-002", "security/tls-trust-all", "critical"),
+    "SetJavaScriptEnabled": ("R-LT-003", "security/webview", "major"),
+    "AddJavascriptInterface": ("R-LT-003", "security/webview", "major"),
+    "InsecureBaseConfiguration": ("R-LT-004", "security/cleartext", "major"),
+    "CleartextSupported": ("R-LT-004", "security/cleartext", "major"),
+    "ExportedReceiver": ("R-LT-005", "security/exported-unprotected", "critical"),
+    "ExportedActivity": ("R-LT-005", "security/exported-unprotected", "critical"),
+    "ExportedService": ("R-LT-005", "security/exported-unprotected", "critical"),
+    "WorldReadableFiles": ("R-LT-006", "security/world-readable", "critical"),
+    "WorldWriteableFiles": ("R-LT-006", "security/world-readable", "critical"),
+    "SQLiteString": ("R-LT-007", "security/sql-injection", "critical"),
+    "HardcodedDebugMode": ("R-LT-008", "security/debuggable-enabled", "critical"),
+    "AllowBackup": ("R-LT-009", "security/backup-allowed", "major"),
+    "UnsafeIntentLaunch": ("R-LT-010", "security/intent-redirection", "critical"),
+    "IntentFilterUniquePermission": ("R-LT-011", "security/receiver-export-flag", "major"),
+    "ExportedProvider": ("R-LT-012", "security/exported-provider", "critical"),
     # Stability
-    "Recycle": ("R-STB-001", "stability/resource-leak-cursor", "major"),
-    "Registered": ("R-STB-003", "stability/listener-leak", "major"),
-    "ViewHolder": ("R-PRF-005", "perf/rv-findviewbyid", "major"),
-    "ObsoleteSdkInt": ("R-STB-006", "stability/deprecated-asynctask", "info"),
-    "CommitTransaction": ("R-STB-011", "stability/fragment-state-loss", "major"),
-    "WrongThread": ("R-PRF-001", "perf/main-thread-io", "major"),
-    "DiscouragedApi": ("R-STB-006", "stability/deprecated-asynctask", "minor"),
-    "VisibleForTests": ("R-SEC-001", "security/hardcoded-secret", "info"),
+    "Recycle": ("R-LT-013", "stability/resource-leak-cursor", "major"),
+    "Registered": ("R-LT-014", "stability/listener-leak", "major"),
+    "ObsoleteSdkInt": ("R-LT-015", "stability/deprecated-asynctask", "info"),
+    "DiscouragedApi": ("R-LT-015", "stability/deprecated-asynctask", "minor"),
+    "CommitTransaction": ("R-LT-016", "stability/fragment-state-loss", "major"),
+    "StaticFieldLeak": ("R-LT-017", "stability/static-context-leak", "critical"),
     # Performance
-    "DrawAllocation": ("R-PRF-004", "perf/hotpath-allocation", "major"),
-    "UseBindingAdapter": ("R-PRF-005", "perf/rv-findviewbyid", "info"),
-    "UnusedResources": ("R-PRF-011", "perf/unbounded-cache", "info"),
-    "InefficientWeight": ("R-PRF-004", "perf/hotpath-allocation", "minor"),
-    "NestedWeights": ("R-PRF-004", "perf/hotpath-allocation", "minor"),
-    "DisableBaselineAlignment": ("R-PRF-004", "perf/hotpath-allocation", "info"),
-    "StaticFieldLeak": ("R-STB-004", "stability/static-context-leak", "critical"),
-    "OpenForTesting": ("R-SEC-001", "security/hardcoded-secret", "info"),
+    "WrongThread": ("R-LT-018", "perf/main-thread-io", "major"),
+    "ViewHolder": ("R-LT-019", "perf/rv-findviewbyid", "major"),
+    "UseBindingAdapter": ("R-LT-019", "perf/rv-findviewbyid", "info"),
+    "DrawAllocation": ("R-LT-020", "perf/hotpath-allocation", "major"),
+    "InefficientWeight": ("R-LT-020", "perf/hotpath-allocation", "minor"),
+    "NestedWeights": ("R-LT-020", "perf/hotpath-allocation", "minor"),
+    "DisableBaselineAlignment": ("R-LT-020", "perf/hotpath-allocation", "info"),
+    "UnusedResources": ("R-LT-021", "perf/unbounded-cache", "info"),
 }
 
 _LINT_SEV_MAP = {
@@ -94,7 +93,7 @@ class LintAdapter(EngineAdapter):
         for task in lint_tasks:
             cmd = [str(gradlew), task, "--no-daemon", "--continue"]
             try:
-                proc = subprocess.run(
+                subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
@@ -163,7 +162,7 @@ def _parse_lint_xml(
 
         rule_id, category, severity = _LINT_RULE_MAP.get(
             issue_id,
-            (f"R-LINT-{issue_id}", f"lint/{issue_id.lower()}", _LINT_SEV_MAP.get(issue.get("severity", "Warning"), "minor")),
+            (f"R-LT-{issue_id}", f"lint/{issue_id.lower()}", _LINT_SEV_MAP.get(issue.get("severity", "Warning"), "minor")),
         )
         if issue_id not in _LINT_RULE_MAP:
             # 未映射的 lint issue：只在 critical/error 级别记录

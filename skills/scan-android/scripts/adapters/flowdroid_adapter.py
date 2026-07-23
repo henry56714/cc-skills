@@ -8,9 +8,7 @@ FlowDroid 是学术级 Android 污点分析工具，能追踪 source→sink 跨�
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -82,7 +80,7 @@ class FlowDroidAdapter(EngineAdapter):
         ]
 
         try:
-            proc = subprocess.run(
+            subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,

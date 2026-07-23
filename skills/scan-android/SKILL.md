@@ -17,8 +17,8 @@ skill 不内置任何特定项目的模块名 / flavor / 路径——这些通�
 
 **一次扫描跑全部规则——不再按维度分，也没有 `--checks` 子集。** 两类来源：
 
-- **工具引擎（广度，规则来自社区库 / 引擎自带，随上游更新，本 skill 不维护单行规则）：** Semgrep（社区 registry 包 `p/security-audit·owasp·secrets·java·kotlin` + `queries/semgrep/` 本地补充）、Detekt（Kotlin）、PMD（errorprone / 多线程 / 性能）、Android Lint、Joern（跨文件 CPG）。
-- **AI 支线（深度，`rules/ai/hunting.md`）：** 鉴权绕过、跨文件越权数据流、并发竞态、生命周期错配、非幂等重试、缓存一致性、资源 / WakeLock 释放、主线程阻塞、算法劣化等规则编不出的逻辑缺陷。
+- **工具引擎（广度，规则来自社区库 / 引擎自带，随上游更新，本 skill 不维护单行规则）：** Semgrep（社区 registry 包 `p/security-audit·owasp·secrets·java·kotlin` + `queries/semgrep/` 本地补充，含 taint 模式）、Detekt（Kotlin）、PMD（errorprone / 多线程 / 性能）、Android Lint。
+- **AI 支线（深度，`rules/ai/hunting.md`）：** 鉴权绕过、跨文件越权数据流、并发竞态、生命周期错配、非幂等重试、缓存一致性、资源 / WakeLock 释放、主线程阻塞、算法劣化等规则编不出的逻辑缺陷。检测阶段 hunter 拿 **tree-sitter 产出的聚焦代码地图**（跨文件调用关系）顺藤摸瓜；验证阶段用 **`nav_tools.py`** 取证跨文件调用/类型关系——**默认 tree-sitter（AST 精确，Java+Kotlin 无盲区）**，source-nav（纯标准库）为兜底、tree-sitter 不可用时自动回退。
 
 > 仍会发现安全 / 稳定性 / 性能类问题，但这只是**覆盖范围的描述**，不再是可选择、可分批的扫描维度。
 
@@ -57,9 +57,9 @@ skill 不内置任何特定项目的模块名 / flavor / 路径——这些通�
 > - `preflight.py` **必须同步（前台）运行**，绝不使用 `run_in_background`。
 >   原因：预检负责安装依赖并输出 `ready` JSON——后台运行会使后续步骤在结果未知时擅自推进，与"预检通过才能扫描"的保证完全矛盾。
 > - 必须等到 preflight **stdout 输出完整 JSON**（含 `ready` 字段）后，才能进入第 1 步。
-> - 若预检因大型依赖下载（如 Joern ~2 GB）耗时过长导致超时，**不得绕过**，应告知用户
->   "当前正在下载 Joern，可能需要数十分钟；如需跳过，可在 `.scan/config.json` 中将
->   `joern` 加入 `excluded_engines` 后重新运行"，然后等待用户决定。
+> - 若预检因依赖下载耗时过长导致超时，**不得绕过**，应告知用户当前正在安装哪个引擎
+>   （如 Detekt JAR / PMD / tree-sitter via pip），等待其完成；如需跳过某引擎，可在
+>   `.scan/config.json` 的 `excluded_engines` 中加入该引擎名后重新运行，然后等待用户决定。
 
 ```
 python3 <SKILL_DIR>/scripts/preflight.py --repo-root .
@@ -72,15 +72,21 @@ python3 <SKILL_DIR>/scripts/preflight.py --repo-root .
 | 检查项 | 预检范围条件 | 可自动安装 | 未就绪时处理 |
 |---|---|---|---|
 | Python 3.8+ | 始终 | 否 | **阻塞** |
-| Java 11+ | Detekt/Joern/Lint 任一启用 | 否 | **阻塞**（依赖它的引擎需要；手动装 JDK） |
+| Java 11+ | Detekt/Lint 任一启用 | 否 | **阻塞**（依赖它的引擎需要；手动装 JDK） |
 | venv | semgrep 启用 | 是 | **阻塞**（semgrep 前提） |
 | semgrep | `semgrep` 未在 `excluded_engines` 中 | 是（pip） | **阻塞** |
 | Detekt JAR | `detekt` 未在 `excluded_engines` 中 | 是（~64 MB） | **阻塞** |
 | PMD | `pmd` 未在 `excluded_engines` 中 | 是（~40 MB） | **阻塞** |
-| Joern | `joern` 未在 `excluded_engines` 中 | 是（~2 GB） | **阻塞** |
-| CodeQL | `codeql` 在 `opt_in_engines` 中且未被排除 | 是（~2 GB） | **阻塞** |
-| gradlew | `lint` 未在 `excluded_engines` 中 | 否 | **阻塞**（Lint 依赖 gradlew；无 wrapper 的工程请关闭 lint） |
+| repomap | `nav_backend` 为 `auto`/`treesitter`（默认 auto） | 是（pip 装独立 venv） | **不阻塞**（tree-sitter 精确层，唯一精确层；缺失则地图降级、导航回退 source-nav） |
+| gradlew | `lint` 未在 `excluded_engines` 中 | 否 | **阻塞**（仅 Lint 依赖；无 wrapper 的工程请关闭 lint） |
 | git | 始终 | 否 | 警告（仅 --diff 不可用，不阻塞） |
+
+> **导航后端——默认 tree-sitter（唯一精确层），source-nav 为纯标准库兜底：** 验证阶段的跨文件取证 + hunter 的 RepoMap 都由 tree-sitter 引擎提供（`repo_map.py`）；导航门面 `nav_tools.py` 的后端由 `.scan/config.json` 的 `nav_backend`（或环境变量 `SCAN_ANDROID_NAV_BACKEND`）选择，默认 `auto`：
+>
+> - **tree-sitter（默认，唯一精确层）：** tree-sitter 解析 Java/Kotlin，**AST 精确**识别 def/ref（不误命中注释/字符串、enclosing scope 精确、**自备 kotlin-tags.scm 故 Kotlin 无盲区**）。**这是 source-nav 做不到的 RepoMap 能力的来源**（签名骨架 + PageRank + 跨文件关系，喂给 hunter）。同名重载/接收者类型**不消歧**——常见名（`init`/`d`）歧义仍由 verifier 逐跳 Read 复核（与 source-nav 一致；基准 `nav_benchmark.py` 实测导航精度与 source-nav 持平，采纳理由是 RepoMap，非导航精度）。装在独立 venv（`~/.scan-android/repomap-venv/`，比照 semgrep）。
+> - **source-nav（纯标准库兜底）：** 仅当 tree-sitter venv 装不出时回退。对源码做正则检索，**不需要任何编译**、召回完整、精确率被同名碰撞拖累。**保证裸机首启动/离线时导航仍能跑出调用链。**
+>
+> 任何精确后端缺失/不可用都**不影响扫描运行**——一律自动回退 source-nav（结果导向：能在真实工程上跑出导航结果，胜过精确但零产出）。**选后端用基准 `nav_benchmark.py` 跑数字，不凭口碑。**
 
 读取 stdout JSON（`{ready, checks, blockers, warnings}`，已无 `degraded`）：
 
@@ -141,10 +147,11 @@ python3 <SKILL_DIR>/scripts/run_engines.py --scope-files .scan/tmp/scope.txt
 | P1 Kotlin | `detekt` | 自动检测/安装（下载 JAR）；Kotlin 专项 |
 | P1 Java | `pmd` | 自动检测/安装（下载 ~40 MB）；errorprone / 多线程 / 性能 |
 | P1 Manifest | `lint` | 调用 `./gradlew lint`；Android 感知 |
-| P2 深度（骨干） | `joern` | 自动安装（~2 GB）；跨文件 CPG 污点追踪 |
-| P4 opt-in | `codeql` | 需 `SCAN_ANDROID_ENABLE_CODEQL=1` |
+| 验证导航（非候选引擎） | `nav_tools.py` | 跨文件调用方/定义/类型/trace-origin；**唯一精确层 = tree-sitter（AST 精确，Java+Kotlin 无盲区）**，source-nav 为纯标准库兜底（tree-sitter 不可用时回退并告警） |
 | P4 opt-in | `mobsf` | 需 `SCAN_ANDROID_ENABLE_MOBSF=1` |
 | P4 opt-in | `flowdroid` | 需 `SCAN_ANDROID_ENABLE_FLOWDROID=1` |
+
+> 深层污点/数据流（原 Joern/CodeQL 的角色）现由 **Semgrep taint 模式 + AI 狩猎**（`rules/ai/hunting.md`）覆盖；tree-sitter 只做精确的调用/类型导航，不做数据流。
 
 引擎自动检测并在首次使用时安装（除 opt-in 引擎需手动启用）。`--engines auto`（默认）运行所有可用引擎；`--engines semgrep,detekt` 可指定子集。
 
@@ -165,41 +172,38 @@ python3 <SKILL_DIR>/scripts/run_engines.py --scope-files .scan/tmp/scope.txt
 
 ### 第 5.5 步 — AI 检测支线（开放式狩猎）
 
-工具支线（第 5 步）给广度；AI 支线找规则编不出来的深层逻辑 bug（鉴权绕过、跨文件越权数据流、非幂等重试、缓存一致性、并发竞态…）。**可在 `.scan/config.json` 的 `excluded_engines` 加入 `"ai"` 跳过本支线（纯工具扫描）。**
+工具支线（第 5 步）给广度；AI 支线找规则编不出来的深层逻辑 bug（鉴权绕过、跨文件越权数据流、WebView URL 校验绕过、非幂等重试、缓存一致性、并发竞态…）。**可在 `.scan/config.json` 的 `excluded_engines` 加入 `"ai"` 跳过本支线（纯工具扫描）。**
 
-#### 5.5.1 降维出业务文件列表
+1. **降维出业务文件列表**：在第 2 步 `.scan/tmp/scope.txt` 基础上，排除生成码 / vendored / 第三方 / framework 包，把剩下的**业务代码**相对路径写入 `.scan/tmp/hunt_scope.txt`。
 
-在第 2 步 `.scan/tmp/scope.txt` 基础上，排除生成码 / vendored / 第三方 / framework 包，把剩下的**业务代码**相对路径写入 `.scan/tmp/hunt_scope.txt`。
+2. **确定性分批 + 覆盖率断言（脚本）**：
+   ```
+   python3 <SKILL_DIR>/scripts/build_hunt_batches.py --scope-files .scan/tmp/hunt_scope.txt --batch-size 15
+   ```
+   脚本把 hunt_scope.txt 按风险降序切成 `.scan/tmp/hunt_batch_{N}.json`，并写覆盖率清单 `.scan/tmp/hunt_coverage.json`。读 stdout JSON：
+   - **`coverage_ok=false`（退出码 1）** → 有文件未进任何批次（`uncovered` 列出）= **漏文件，必须排查后重跑，不得带病继续**。
+   - 每个 batch 含 `files`（风险降序，带 `risk_score`/`tech`）+ `tech_present`（技术存在标记，供 hunter 自门控视角）。
+   - 顶层 `tech_present` 是全作用域技术集合；`generated_excluded`/`missing` 记录被剔除/找不到的文件。
 
-#### 5.5.2 生成代码骨架（orchestrator 执行一次，hunter 不做）
+3. **为每批生成聚焦代码地图（脚本）**：对**每个** `hunt_batch_{N}.json`，用 tree-sitter 产出跨文件地图，写入 `.scan/tmp/repo_map_{N}.md`：
+   ```
+   python3 <SKILL_DIR>/scripts/repo_map.py --repo . --action map --batch-file .scan/tmp/hunt_batch_{N}.json --out .scan/tmp/repo_map_{N}.md --budget 12000
+   ```
+   地图含「本批文件签名骨架」+「跨文件关系」（本批方法被批外哪些代码调用，含调用方 file:line/所在方法/源码）——这是 hunter 形成跨文件假设的线索。**tree-sitter 不可用时脚本自动降级**（写降级说明，不阻塞）；地图降级/为空也不影响后续——hunter 被要求此时自行追调用关系（定位+精读命中处，有界），跨文件分析责任不降低（见 `agents/hunter.md`「地图为空/降级」提示）。
 
-在派发 hunter **之前**，生成一份紧凑的**代码结构骨架**存入 `.scan/tmp/code_skeleton.json`。骨架只含类名、字段声明、方法签名和调用度，不含方法体，供 hunter 在不大量读取原始文件的情况下定位可疑目标。
+4. **逐批派发 hunter 子代理（并发）**：对**每个** `hunt_batch_{N}.json`，用 `<SKILL_DIR>/agents/hunter.md` 作提示词模板，填充 `{PROJECT_CONTEXT}`、`{LANGUAGE}`、`{HUNTING_RULES}` = `<SKILL_DIR>/rules/ai/hunting.md` 的完整内容、`{BATCH_FILE}` = 该批次文件的绝对路径、`{REPO_MAP}` = `.scan/tmp/repo_map_{N}.md` 的绝对路径（第 3 步产出）。hunter 按批次 `tech_present` **自门控多视角**逐轮过本批（无 WebView 自动跳过 WebView 视角…），本批文件**必须全部读到**，并用聚焦地图「顺藤摸瓜」做跨文件分析。用配置的 **verify 档模型**跑（见 §模型分层）。
+   - hunter 现在返回 **JSON 对象** `{batch, perspectives_covered, candidates}`（不是裸数组）。对每个 hunter 回复，按「子代理输出提取约定」取出该对象，并**把回执持久化**到 `.scan/tmp/hunt_attest_{N}.json`（多次采样写 `hunt_attest_{N}_{S}.json`），内容至少含 `{batch, perspectives_covered}`——供第 5 步覆盖断言核对。`candidates` 取入候选池。
+   - **（可选）多次采样并集**：`.scan/config.json` 的 `hunt_samples`（默认 1）> 1 时，对每批跑该次数的 hunter，候选**并集**后再交验证——重复缺陷由第 6 步验证器去重（self-consistency，提召回）。`--full` 大作用域建议设 2。
 
-调用 `nav_tools.py --action skeleton`（Joern server 模式，CPG 构建完成后直接写 JSON 文件）：
+5. **多视角覆盖断言（脚本）**：所有 hunter 回执落盘后，核对每批是否真把该过的视角都过了：
+   ```
+   python3 <SKILL_DIR>/scripts/check_hunt_coverage.py --min-samples <hunt_samples>
+   ```
+   它把每批 `expected_perspectives`（build_hunt_batches 据 `tech_present` 算出）与回执的 `perspectives_covered`（多采样取并集）逐批比对。读 stdout JSON / 退出码：
+   - **退出码 1**（某批 `missing` 非空、无回执、或采样不足）= **有视角漏过 / hunter 未上报**，必须排查（补跑该批 / 该视角）后重跑，不得带病进入验证。
+   - 退出码 0 = 每批 expected ⊆ covered，视角覆盖完整。
 
-```bash
-python3 <SKILL_DIR>/scripts/nav_tools.py \
-  --repo "$(pwd)" \
-  --action skeleton \
-  --output-file "$(pwd)/.scan/tmp/code_skeleton.json"
-```
-
-Joern server 首次启动 + CPG 构建约需 2–5 分钟（workspace 有缓存时更快）。若命令以非零退出码退出，**中止 AI 支线并向用户报错**——骨架是 hunter 的前提，无骨架不得派发 hunter。用户可在 `.scan/config.json` 的 `excluded_engines` 加入 `"ai"` 跳过整条 AI 支线。
-
-#### 5.5.3 派发 hunter 子代理
-
-用 `<SKILL_DIR>/agents/hunter.md` 作提示词模板，填充：
-- `{PROJECT_CONTEXT}`
-- `{LANGUAGE}`
-- `{HUNTING_RULES}` = `<SKILL_DIR>/rules/ai/hunting.md` 的完整内容
-- `{SCOPE_FILES_PATH}` = `.scan/tmp/hunt_scope.txt`
-- `{SKELETON_FILE}` = `.scan/tmp/code_skeleton.json` 的**绝对路径**（骨架文件不存在时传字面量 `null`）
-
-用配置的 **verify 档模型**跑狩猎（见 §模型分层）。大作用域可并发多个 hunter，每个 hunter 独立读取完整骨架后自行决定深读哪些文件，无需再按文件分批——hunter 的 Read 调用上限（≤ 20 次）自然控制了每个 agent 的开销。
-
-#### 5.5.4 合并候选
-
-hunter 返回的 JSON 数组（`rule_id` 以 `R-AI-` 开头，带缺陷假设 + 可选 `dataflow_path`）**并入第 5 步的工具候选池**，一同进入第 6 步验证。按下方「子代理输出提取约定」从 hunter 回复中稳健取出 JSON。
+6. **合并候选**：所有批次（及多次采样）的 `candidates`（`rule_id` 以 `R-AI-` 开头，带缺陷假设 + 可选 `dataflow_path`）**并入第 5 步的工具候选池**，一同进入第 6 步验证。扫描结束（第 8 步完成）后清理：`rm -f .scan/tmp/hunt_batch_*.json .scan/tmp/hunt_attest_*.json .scan/tmp/repo_map_*.md`。
 
 > **AI 支线只产候选、不下结论。** 它的发现和工具候选一样，必须过第 6 步的**独立验证闸**取证才会上报——发现者不给自己盖章。
 
@@ -211,8 +215,9 @@ hunter 返回的 JSON 数组（`rule_id` 以 `R-AI-` 开头，带缺陷假设 + 
 2. 核实候选描述的缺陷（工具看 `message`，AI 看 `why` 假设）是否在真实代码路径上成立；参照 `rules/ai/hunting.md` 的验证要点/FP 提示压假阳性。
 3. 交叉检查缓解手段（`try-finally`、null 保护、生命周期、`@WorkerThread`、`BuildConfig.DEBUG` 门控…）。
 4. **独立验证闸**：confirmed 必须附**客观证据**（`evidence` 引真实源码、`why` 引具体代码、跨文件须给验证过的 `dataflow_path`）；不因候选"看着像 bug"就盖章。
-5. **有界自愈**：判不准时最多再追 2~3 次定向 Read 后再判；仍不清 → 丢弃，不输出 `unclear`。
-6. 只有 `confirmed` 成为正式 finding。
+5. **条件触发型规则必须先用 `nav_tools.py` 把关键值逐跳回溯到源头**（静态 Context 泄漏、主线程阻塞、越权调用路径、导出组件无校验等——缺陷只有上游源头成立才发生）：经 `nav_tools.py --action trace-origin`（默认 tree-sitter AST 精确；source-nav 纯标准库兜底）**沿整条调用链回溯**关键值（Context/输入/调用线程）到终端源头（如 Context 落到 `Application` 即多为 FP，落到 `Activity/Service/View` 才是真泄漏），**每跳用 Read 交叉复核 snippet**（tree-sitter/source-nav 都不消歧同名重载，尤其要剔除同名误命中）；`evidence`/`dataflow_path` 须含回溯出的「源头点」。**一跳不够——透传形参会把「透传」误当「源头」**。bounded 追溯后仍确定不了源头 → 按 FP 纪律**丢弃**该候选（不得仅一跳当结论）。数据流/污点（各后端都不做）改由 Semgrep taint 候选 + Read 人工追源佐证（详见 `verifier.md`）。
+6. **有界自愈**：判不准时最多再追 2~3 次定向 Read 后再判；仍不清 → 丢弃，不输出 `unclear`。
+7. 只有 `confirmed` 成为正式 finding。
 
 每条 `confirmed` 输出 `merge_findings.py` 要求的 10 个字段：
 `file, line, rule_id, category, severity, title, evidence, why, repro, suggestion`（`end_line`、`dataflow_path` 可选）。`category`/`severity` 默认沿用候选自带值（工具来自引擎/adapter，AI 来自 hunter），验证器取证后可微调。
@@ -248,7 +253,11 @@ EOF
   3. 并发等待所有子代理完成，按下方「子代理输出提取约定」从各自回复中取出 JSON 数组后合并
   4. 扫描结束（第 8 步完成）后清理：`rm -f .scan/tmp/candidates_batch_*.json`
 
-> **子代理输出提取约定（重要）：** hunter / verifier 子代理被要求"只输出 JSON 数组"，但实际回复**可能夹带前导分析文字、说明或 ` ```json ` 代码围栏**（实测会发生）。收集时**不要**对整段回复直接 `json.loads`——而是**提取最后一个完整的 JSON 数组**：定位回复中最后一个 `]`、向前匹配到配对的 `[` 再解析（或先剥离 ` ``` ` 围栏）。某个子代理解析失败时，将其视为"本批 0 确认 / 0 候选"并记一条 note，**不要因此中断整次扫描**。
+> **子代理输出提取约定（重要）：** 子代理被要求"只输出 JSON"，但实际回复**可能夹带前导分析文字、说明或 ` ```json ` 代码围栏**（实测会发生）。收集时**不要**对整段回复直接 `json.loads`，先剥离 ` ``` ` 围栏，再按子代理类型取末尾完整 JSON：
+> - **verifier**：返回**裸数组**——提取最后一个完整 JSON 数组（定位最后一个 `]`、向前匹配配对的 `[`）。
+> - **hunter**：返回 **JSON 对象** `{batch, perspectives_covered, candidates}`——提取最后一个完整 JSON 对象（定位最后一个 `}`、向前匹配配对的 `{`）；取 `candidates` 入池、把 `{batch, perspectives_covered}` 写入 `hunt_attest_{N}.json`。若只解析出裸数组（旧式/不合规回复），按 `candidates` 处理且 `perspectives_covered=[]`（→ 第 5.5 步覆盖断言会判该批漏视角，promptly 暴露不合规）。
+>
+> 某个子代理解析失败时，将其视为"本批 0 确认 / 0 候选"并记一条 note，**不要因此中断整次扫描**（但缺回执会被第 5.5 步覆盖断言捕获）。
 
 ### 第 7 步 — 写 findings（脚本，无状态）
 把所有 `confirmed` finding 放进一个 JSON 数组，管道给：
@@ -300,10 +309,9 @@ cp <SKILL_DIR>/config.example.json <项目根>/.scan/config.json
 常见场景示例：
 
 ```jsonc
-// 场景 A：有 GitHub Advanced Security 许可，用 CodeQL 替换 Joern
+// 场景 A：离线/受限环境，强制用纯标准库 source-nav（跳过 tree-sitter venv 安装）
 {
-  "opt_in_engines": ["codeql"],
-  "excluded_engines": ["joern"]
+  "nav_backend": "source"
 }
 
 // 场景 B：CI 环境，额外启用 MobSF（已有 APK）
@@ -341,6 +349,6 @@ cp <SKILL_DIR>/config.example.json <项目根>/.scan/config.json
 
 - 加广度规则：**优先调引擎包**——加 Semgrep registry 包（`semgrep_registry_packs`）或在 `queries/semgrep/` 写少量 Android/项目特定规则；Detekt/PMD/Lint 的规则由其自带。本 skill 不再维护单行检测规则。
 - 加深度/逻辑狩猎线索：在 `rules/ai/hunting.md` 追加条目（自然语言，`R-AI-*` id）——这是 AI 支线的扩容方式，可随时增删。
-- 加 Joern 跨文件查询：在 `queries/joern/` 写 CPGQL。
+- 调用/类型导航：用 `scripts/nav_tools.py` 查 `callers`/`definition`/`hierarchy`/`trace-origin`，**后端自动选择**：默认 `repo_map.py`（tree-sitter AST 精确、读最新源码、Java+Kotlin 无盲区），tree-sitter 不可用时回退纯标准库 `source_nav.py`。hunter 的 RepoMap（`repo_map.py --action map`）也由同一 tree-sitter 引擎产出。tree-sitter 不可用时 nav_tools 回退纯标准库 `source_nav.py` 并打印 [WARN] nav-degraded 告警。
 - 规则调优：若某类持续假阳性，更新对应来源（`queries/` 或 `rules/ai/`）的模式/验证要点——不要静默禁用。
 - 脚本位于 `<SKILL_DIR>/scripts/`，仅用 Python 标准库；改动时保持 `--help` 文档与本 SKILL.md 的用法同步。

@@ -9,8 +9,8 @@ scan-android v2 引擎自动检测与安装。
 目录布局:
   ~/.scan-android/
     venv/           Python 虚拟环境（semgrep 等 pip 包，隔离于系统/conda）
-    tools/          JVM 工具二进制（Detekt / Joern / CodeQL / FlowDroid）
-    tools/joern/.download-failed   Joern 下载失败标记（1 小时内不重试）
+    repomap-venv/   tree-sitter 精确层 venv（tree-sitter + tree-sitter-language-pack，隔离）
+    tools/          JVM 工具二进制（Detekt / PMD / FlowDroid）
 
 可通过环境变量覆盖路径:
   SCAN_ANDROID_VENV_DIR   虚拟环境根（默认 ~/.scan-android/venv）
@@ -26,7 +26,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
 import time
 import urllib.request
 import zipfile
@@ -46,12 +45,17 @@ VENV_DIR = Path(os.environ.get(
     Path.home() / ".scan-android" / "venv",
 ))
 
+# tree-sitter 精确层专属 venv（与 semgrep venv 隔离，避免依赖冲突）
+REPOMAP_VENV_DIR = Path(os.environ.get(
+    "SCAN_ANDROID_REPOMAP_VENV",
+    Path.home() / ".scan-android" / "repomap-venv",
+))
+
 # skill 根目录（requirements.txt 所在位置）
 _SKILL_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # 固定版本（定期更新以获取安全补丁）
 _DETEKT_VERSION = "1.23.7"
-_JOERN_VERSION_FALLBACK = "4.0.404"
 _FLOWDROID_VERSION = "2.14.1"
 _PMD_VERSION = "7.10.0"
 
@@ -155,6 +159,42 @@ def _install_semgrep_to_venv() -> None:
     )
 
 
+def _repomap_venv_python() -> str:
+    if platform.system() == "Windows":
+        return str(REPOMAP_VENV_DIR / "Scripts" / "python.exe")
+    return str(REPOMAP_VENV_DIR / "bin" / "python")
+
+
+def ensure_repomap_venv() -> Path:
+    """确保 tree-sitter 精确层的独立 venv 就绪（含 tree-sitter + tree-sitter-language-pack）。
+
+    与 semgrep venv 隔离，避免依赖冲突。**调用方须把失败视为非阻塞**——缺失时
+    repo_map.py 会降级、nav_tools.py 会回退纯标准库 source-nav。返回 venv 根路径。
+    """
+    py = _repomap_venv_python()
+    if not Path(py).exists():
+        _print(f"[installer] 创建 tree-sitter venv: {REPOMAP_VENV_DIR}")
+        import venv as _venv
+        REPOMAP_VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
+        _venv.create(str(REPOMAP_VENV_DIR), with_pip=True, clear=True)
+        subprocess.check_call(
+            [py, "-m", "pip", "install", "--upgrade", "pip",
+             "--quiet", "--disable-pip-version-check"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    # 校验/补装包
+    check = subprocess.run([py, "-c", "import tree_sitter, tree_sitter_language_pack"],
+                           capture_output=True)
+    if check.returncode != 0:
+        _print("[installer] 安装 tree-sitter + tree-sitter-language-pack（pip）...")
+        subprocess.check_call(
+            [py, "-m", "pip", "install", "tree-sitter", "tree-sitter-language-pack",
+             "--quiet", "--disable-pip-version-check"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+    return REPOMAP_VENV_DIR
+
+
 # ---------------------------------------------------------------------------
 # JVM 工具（JAR / 二进制）
 # ---------------------------------------------------------------------------
@@ -172,48 +212,6 @@ def ensure_detekt() -> tuple[str, bool]:
     jar.parent.mkdir(parents=True, exist_ok=True)
     _download(url, jar)
     return str(jar), True
-
-
-def ensure_joern() -> tuple[str, bool]:
-    # 先查 PATH
-    existing = shutil.which("joern")
-    if existing:
-        return existing, False
-    # 再查本地缓存
-    local_bin = TOOLS_DIR / "joern" / "joern-cli" / "joern"
-    if local_bin.exists():
-        if not os.access(local_bin, os.X_OK):
-            local_bin.chmod(local_bin.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        return str(local_bin), False
-    # 检查失败标记（避免因网络问题每次都重试 ~2 GB 下载）
-    fail_marker = TOOLS_DIR / "joern" / ".download-failed"
-    if fail_marker.exists():
-        age = time.time() - fail_marker.stat().st_mtime
-        if age < 3600:  # 1 小时内不重试
-            raise RuntimeError(f"Joern 上次下载失败，将在 {int((3600 - age) / 60)} 分钟后重试")
-    # 自动下载（v4+ 资产名为 joern-cli.zip，约 2 GB）
-    version = _fetch_latest_github_version("joernio", "joern") or _JOERN_VERSION_FALLBACK
-    _print(f"[installer] 下载 Joern {version} (~2 GB，请耐心等待)...")
-    url = f"https://github.com/joernio/joern/releases/download/v{version}/joern-cli.zip"
-    dest_zip = TOOLS_DIR / "joern" / f"joern-cli-{version}.zip"
-    dest_zip.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        _download(url, dest_zip)
-    except Exception as e:
-        fail_marker.parent.mkdir(parents=True, exist_ok=True)
-        fail_marker.write_text(str(e))
-        raise
-    fail_marker.unlink(missing_ok=True)
-    _print("[installer] 解压 Joern...")
-    with zipfile.ZipFile(dest_zip) as zf:
-        zf.extractall(TOOLS_DIR / "joern")
-    cli_dir = TOOLS_DIR / "joern" / "joern-cli"
-    if cli_dir.exists():
-        for f in cli_dir.rglob("*"):
-            if f.is_file() and f.suffix not in {".bat", ".jar", ".conf", ".properties", ".xml"}:
-                f.chmod(f.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    dest_zip.unlink(missing_ok=True)
-    return str(local_bin), True
 
 
 def find_pmd() -> str | None:
@@ -253,52 +251,6 @@ def ensure_pmd() -> tuple[str, bool]:
         raise RuntimeError("PMD 解压后未找到 bin/pmd")
     binp.chmod(binp.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return str(binp), True
-
-
-def ensure_codeql() -> tuple[str, bool]:
-    existing = shutil.which("codeql")
-    if existing:
-        return existing, False
-    local_bin = TOOLS_DIR / "codeql" / "codeql"
-    if local_bin.exists():
-        return str(local_bin), False
-    system = platform.system().lower()
-    if system == "darwin":
-        bundle = "codeql-bundle-osx64.tar.gz"
-    elif system == "linux":
-        bundle = "codeql-bundle-linux64.tar.gz"
-    else:
-        bundle = "codeql-bundle-win64.tar.gz"
-    tar_path = TOOLS_DIR / "_dl" / bundle
-    tar_path.parent.mkdir(parents=True, exist_ok=True)
-    # 仅在 tar 包不存在时才下载（跳过已完整下载的包，避免重复下载）
-    if not tar_path.exists():
-        _print(f"[installer] 下载 CodeQL bundle ({bundle}, ~773 MB，请耐心等待)...")
-        url = f"https://github.com/github/codeql-action/releases/latest/download/{bundle}"
-        _download(url, tar_path)
-    else:
-        _print(f"[installer] 使用已缓存的 CodeQL bundle: {tar_path}")
-    _print("[installer] 解压 CodeQL...")
-    extract_dir = TOOLS_DIR / "_codeql_extracted"
-    # 清理上次不完整解压遗留的目录，避免权限受限文件导致 Permission denied
-    if extract_dir.exists():
-        _print("[installer] 清理旧解压目录...")
-        _chmod_recursive(extract_dir)
-        shutil.rmtree(extract_dir)
-    with tarfile.open(tar_path) as tf:
-        tf.extractall(extract_dir)
-    for candidate in extract_dir.rglob("codeql"):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            codeql_dir = candidate.parent
-            if (TOOLS_DIR / "codeql").exists():
-                _chmod_recursive(TOOLS_DIR / "codeql")
-                shutil.rmtree(TOOLS_DIR / "codeql")
-            shutil.move(str(codeql_dir), str(TOOLS_DIR / "codeql"))
-            break
-    tar_path.unlink(missing_ok=True)
-    _chmod_recursive(extract_dir)
-    shutil.rmtree(extract_dir, ignore_errors=True)
-    return str(local_bin), True
 
 
 def _chmod_recursive(path: Path) -> None:
@@ -348,7 +300,7 @@ def ensure_adb() -> tuple[str, bool]:
 
 
 def check_java() -> tuple[bool, str]:
-    """检查 Java 是否可用（Detekt / Joern / FlowDroid 需要 Java 11+）。"""
+    """检查 Java 是否可用（Detekt / Lint / FlowDroid 需要 Java 11+）。"""
     java = shutil.which("java")
     if not java:
         return False, "java 未找到，请安装 Java 11+（brew install openjdk@21）"
@@ -479,10 +431,9 @@ def _cli_main() -> int:
   semgrep     semgrep（安装到 venv）
   detekt      Detekt Kotlin 分析器 JAR
   pmd         PMD Java 分析器（~40 MB）
-  joern       Joern CPG 分析器（~2 GB）
-  codeql      CodeQL bundle（~2 GB，opt-in）
+  repomap     tree-sitter 精确导航层（tree-sitter + language-pack 到独立 venv）
   flowdroid   FlowDroid JAR（opt-in）
-  all         上述全部（codeql/flowdroid 除外）
+  all         上述全部（flowdroid 除外）
 """,
     )
     ap.add_argument("--install", metavar="TOOL",
@@ -501,12 +452,11 @@ def _cli_main() -> int:
         "semgrep": ensure_semgrep,
         "detekt": ensure_detekt,
         "pmd": ensure_pmd,
-        "joern": ensure_joern,
-        "codeql": ensure_codeql,
+        "repomap": lambda: (str(ensure_repomap_venv()), False),
         "flowdroid": ensure_flowdroid,
     }
     if tool == "all":
-        for name in ["venv", "semgrep", "detekt", "pmd", "joern"]:
+        for name in ["venv", "semgrep", "detekt", "pmd", "repomap"]:
             _run_install(name, installers[name])
     elif tool in installers:
         _run_install(tool, installers[tool])
@@ -534,8 +484,8 @@ def _print_status() -> None:
         ("detekt", str(TOOLS_DIR / "detekt" / f"detekt-cli-{_DETEKT_VERSION}-all.jar"),
          (TOOLS_DIR / "detekt" / f"detekt-cli-{_DETEKT_VERSION}-all.jar").exists()),
         ("pmd", find_pmd() or str(TOOLS_DIR / "pmd"), bool(find_pmd())),
-        ("joern", str(TOOLS_DIR / "joern" / "joern-cli" / "joern"),
-         (TOOLS_DIR / "joern" / "joern-cli" / "joern").exists()),
+        ("repomap (tree-sitter venv)", str(REPOMAP_VENV_DIR),
+         (REPOMAP_VENV_DIR / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")).exists()),
         ("java", shutil.which("java") or "", bool(shutil.which("java"))),
         ("adb", shutil.which("adb") or "", bool(shutil.which("adb"))),
     ]

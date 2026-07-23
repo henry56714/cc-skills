@@ -22,13 +22,11 @@ P5 动态 PoC 验证 —— 通过 ADB 在真机/模拟器上验证安全发现�
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -163,7 +161,7 @@ def poc_allow_backup(adb, device, package, finding, repo, dry_run, **kw) -> dict
         Path(backup_file).unlink(missing_ok=True)
         return {"status": "dry-run", "summary": f"[dry-run] 会执行: {summary_str}", "command": summary_str}
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        subprocess.run(cmd, capture_output=True, timeout=30)
         size = Path(backup_file).stat().st_size if Path(backup_file).exists() else 0
         Path(backup_file).unlink(missing_ok=True)
         if size > 100:
@@ -187,7 +185,6 @@ def poc_exported_component(adb, device, package, finding, repo, dry_run, **kw) -
     """验证导出组件可被任意 app 调用。"""
     # 从 finding 的 why/evidence 中提取组件名
     evidence = finding.get("evidence", "")
-    comp_match = None
     import re
     m = re.search(r'android:name\s*=\s*"([^"]+)"', evidence)
     if m:

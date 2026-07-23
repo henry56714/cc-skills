@@ -207,11 +207,11 @@ def severity_rank(sev: str) -> int:
 class Candidate:
     """所有引擎 adapter 的统一输出格式。
 
-    无论候选来自正则 / Semgrep / Joern / CodeQL / Lint，后续的 LLM 验证、去重、
+    无论候选来自 Semgrep / Detekt / PMD / Lint，后续的 LLM 验证、去重、
     报告都只消费本契约，不关心来源引擎。详见 docs/architecture-v2.md §4。
     """
 
-    engine: str            # 产出引擎: regex|semgrep|joern|codeql|lint|detekt
+    engine: str            # 产出引擎: semgrep|detekt|pmd|lint|mobsf|flowdroid
     rule_id: str           # 我们的统一 id（经 taxonomy 映射），如 R-SEC-001
     file: str              # 相对仓库根，正斜杠
     line: int              # 1-based 主要违规行
