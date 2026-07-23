@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -228,7 +227,13 @@ def _parse_result(item: dict, repo: Path, scope_set: set[str]) -> Candidate | No
     category = metadata.get("category", "") or extra.get("metadata", {}).get("category", "")
     severity = metadata.get("severity", "") or _SEV_MAP.get(sev_raw, "info")
 
-    snippet = extra.get("lines", "").strip()[:300]
+    snippet = extra.get("lines", "").strip()
+
+    # semgrep 免费版的 lines 字段会返回 "requires login"，此时从源文件读取
+    if snippet == "requires login" or not snippet:
+        snippet = _read_snippet_from_file(repo, rel, line, end_line)
+
+    snippet = snippet[:300]
 
     return Candidate(
         engine="semgrep",
@@ -244,10 +249,30 @@ def _parse_result(item: dict, repo: Path, scope_set: set[str]) -> Candidate | No
     )
 
 
+def _read_snippet_from_file(repo: Path, rel_path: str, start_line: int, end_line: int) -> str:
+    """从源文件读取代码片段（当 semgrep 免费版返回 'requires login' 时使用）。"""
+    try:
+        file_path = repo / rel_path
+        if not file_path.exists():
+            return ""
+
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+
+        # 读取指定行范围（line 从 1 开始）
+        start_idx = max(0, start_line - 1)
+        end_idx = min(len(lines), end_line)
+
+        snippet_lines = lines[start_idx:end_idx]
+        return ''.join(snippet_lines).strip()
+    except Exception:
+        return ""
+
+
 def _infer_rule_id(check_id: str) -> str:
-    """从 semgrep check_id 推断我们的规范 rule_id（如 scan-android-r-sec-001-... → R-SEC-001）。"""
+    """从 semgrep check_id 推断我们的规范 rule_id（如 scan-android-r-sg-001-... → R-SG-001）。"""
     import re
-    m = re.search(r"r-(sec|stb|prf)-(\d+)", check_id, re.IGNORECASE)
+    m = re.search(r"r-(sg|dk|lt|jn|ai)-(\d+)", check_id, re.IGNORECASE)
     if m:
         prefix = m.group(1).upper()
         num = m.group(2)
