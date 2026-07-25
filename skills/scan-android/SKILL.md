@@ -77,7 +77,7 @@ python3 <SKILL_DIR>/scripts/preflight.py --repo-root .
 | semgrep | `semgrep` 未在 `excluded_engines` 中 | 是（pip） | **阻塞** |
 | Detekt JAR | `detekt` 未在 `excluded_engines` 中 | 是（~64 MB） | **阻塞** |
 | PMD | `pmd` 未在 `excluded_engines` 中 | 是（~40 MB） | **阻塞** |
-| repomap | `nav_backend` 为 `auto`/`treesitter`（默认 auto） | 是（pip 装独立 venv） | **不阻塞**（tree-sitter 精确层，唯一精确层；缺失则地图降级、导航回退 source-nav） |
+| repomap (tree-sitter) | `nav_backend` 为 `auto`/`treesitter`（默认 auto） | 是（pip 装独立 venv `~/.scan-android/repomap-venv/`，依赖：`tree-sitter` + `tree-sitter-java` + `tree-sitter-kotlin`） | **不阻塞**（唯一精确层；缺失时自动回退 source-nav，并打印 `[WARN] nav-degraded` 告警） |
 | gradlew | `lint` 未在 `excluded_engines` 中 | 否 | **阻塞**（仅 Lint 依赖；无 wrapper 的工程请关闭 lint） |
 | git | 始终 | 否 | 警告（仅 --diff 不可用，不阻塞） |
 
@@ -86,7 +86,13 @@ python3 <SKILL_DIR>/scripts/preflight.py --repo-root .
 > - **tree-sitter（默认，唯一精确层）：** tree-sitter 解析 Java/Kotlin，**AST 精确**识别 def/ref（不误命中注释/字符串、enclosing scope 精确、**自备 kotlin-tags.scm 故 Kotlin 无盲区**）。**这是 source-nav 做不到的 RepoMap 能力的来源**（签名骨架 + PageRank + 跨文件关系，喂给 hunter）。同名重载/接收者类型**不消歧**——常见名（`init`/`d`）歧义仍由 verifier 逐跳 Read 复核（与 source-nav 一致；基准 `nav_benchmark.py` 实测导航精度与 source-nav 持平，采纳理由是 RepoMap，非导航精度）。装在独立 venv（`~/.scan-android/repomap-venv/`，比照 semgrep）。
 > - **source-nav（纯标准库兜底）：** 仅当 tree-sitter venv 装不出时回退。对源码做正则检索，**不需要任何编译**、召回完整、精确率被同名碰撞拖累。**保证裸机首启动/离线时导航仍能跑出调用链。**
 >
-> 任何精确后端缺失/不可用都**不影响扫描运行**——一律自动回退 source-nav（结果导向：能在真实工程上跑出导航结果，胜过精确但零产出）。**选后端用基准 `nav_benchmark.py` 跑数字，不凭口碑。**
+> **tree-sitter 用于两处：**
+> 1. **AI 狩猎（第 5.5 步）**：生成聚焦代码地图（RepoMap）喂给 hunter，含签名骨架、跨文件调用关系、技术标记
+> 2. **验证阶段（第 6 步）**：条件触发型规则的跨文件调用链回溯（`nav_tools.py --action trace-origin`）
+>
+> **依赖：** `tree-sitter` + `tree-sitter-java` + `tree-sitter-kotlin`（pip 安装在独立 venv，首次自动安装）
+>
+> **回退机制：** tree-sitter venv 安装失败时，自动回退 `source-nav.py`（纯标准库正则导航），不阻塞扫描。任何精确后端缺失/不可用都**不影响扫描运行**——一律自动回退 source-nav（结果导向：能在真实工程上跑出导航结果，胜过精确但零产出）。**选后端用基准 `nav_benchmark.py` 跑数字，不凭口碑。**
 
 读取 stdout JSON（`{ready, checks, blockers, warnings}`，已无 `degraded`）：
 
@@ -172,7 +178,19 @@ python3 <SKILL_DIR>/scripts/run_engines.py --scope-files .scan/tmp/scope.txt
 
 ### 第 5.5 步 — AI 检测支线（开放式狩猎）
 
-工具支线（第 5 步）给广度；AI 支线找规则编不出来的深层逻辑 bug（鉴权绕过、跨文件越权数据流、WebView URL 校验绕过、非幂等重试、缓存一致性、并发竞态…）。**可在 `.scan/config.json` 的 `excluded_engines` 加入 `"ai"` 跳过本支线（纯工具扫描）。**
+工具支线（第 5 步）给广度；AI 支线找规则编不出来的深层逻辑 bug（鉴权绕过、跨文件越权数据流、WebView URL 校验绕过、非幂等重试、缓存一致性、并发竞态…）。
+
+**触发条件（同时满足才执行本支线）：**
+1. 作用域 > 50 个业务文件（`.scan/tmp/hunt_scope.txt` 行数 > 50）
+2. `.scan/config.json` 的 `excluded_engines` 未包含 `"ai"`
+3. 模型配置中有 `verify` 档模型
+
+**不满足条件时：**
+- 跳过本支线，直接进入第 6 步验证
+- 在第 9 步总结中说明："作用域较小（{N} 个业务文件），已跳过 AI 狩猎支线"
+- 理由：小作用域下工具引擎已覆盖充分，AI 狩猎边际收益低
+
+---
 
 1. **降维出业务文件列表**：在第 2 步 `.scan/tmp/scope.txt` 基础上，排除生成码 / vendored / 第三方 / framework 包，把剩下的**业务代码**相对路径写入 `.scan/tmp/hunt_scope.txt`。
 
@@ -189,11 +207,84 @@ python3 <SKILL_DIR>/scripts/run_engines.py --scope-files .scan/tmp/scope.txt
    ```
    python3 <SKILL_DIR>/scripts/repo_map.py --repo . --action map --batch-file .scan/tmp/hunt_batch_{N}.json --out .scan/tmp/repo_map_{N}.md --budget 12000
    ```
-   地图含「本批文件签名骨架」+「跨文件关系」（本批方法被批外哪些代码调用，含调用方 file:line/所在方法/源码）——这是 hunter 形成跨文件假设的线索。**tree-sitter 不可用时脚本自动降级**（写降级说明，不阻塞）；地图降级/为空也不影响后续——hunter 被要求此时自行追调用关系（定位+精读命中处，有界），跨文件分析责任不降低（见 `agents/hunter.md`「地图为空/降级」提示）。
+   
+   **地图含三部分内容**（示例见 `.scan/tmp/repo_map_0.md`）：
+   
+   1. **签名骨架**：本批每个类的方法签名（参数类型 + 返回类型），按 PageRank 排序（高频调用的方法在前）
+   2. **跨文件关系**：本批方法被**批外**哪些代码调用，每个调用方含：
+      - 调用点文件:行号
+      - 调用所在方法（enclosing_symbol）
+      - 调用点源码 snippet（1-2 行）
+   3. **技术标记**：本批涉及的技术（WebView / 数据库 / AIDL 等），供 hunter 自门控视角
+   
+   **hunter 使用方式：**
+   - 读签名骨架 → 识别高风险方法（如 `loadUrl(String)` / `execute(String)` 等）
+   - 读跨文件关系 → 顺藤摸瓜找调用链（如 `loadUrl` 被 `Intent.getData()` 调用 → 疑似深链劫持）
+   - 技术标记 → 跳过不相关视角（无 WebView 时不过 WebView 组规则）
+   
+   **降级处理：**
+   - tree-sitter 不可用时，`repo_map.py` 写降级说明（"地图降级，请 hunter 自行追调用关系"）
+   - hunter 收到空地图/降级说明时，改用**手动追踪流程**：
+   
+   **RepoMap 降级时 hunter 的手动追踪流程：**
+   
+   > **为什么使用 Grep + Read 而不是 source-nav？**
+   > 
+   > - hunter 是 LLM 子代理，只能使用 Claude 的通用工具（Read、Grep、Bash）
+   > - source-nav 是 Python 脚本（`source_nav.py`），不是 Claude 工具
+   > - RepoMap 是 hunter 的**输入**（喂给 hunter 的地图），不是工具
+   > - nav_tools.py（内部可选 source-nav）是**验证阶段**用的，不是 hunter 用的
+   > - 验证阶段的 verifier 会调用 nav_tools.py，该工具内部自动选择后端（tree-sitter 或 source-nav）
+   
+   1. **Grep 定位命中处：**
+      - 对每条候选假设（如"loadUrl 可能被外部 Intent 调用"），用 Grep 工具搜索关键方法在本批文件中的出现
+      - 搜索模式：`loadUrl\(` 或方法名的正则
+      - 记录所有命中位置 `{file, line}`
+   
+   2. **Read 精读上下文（窗口 ±30 行）：**
+      - 对每个命中位置：`Read {file}:{line-30}:{line+30}`
+      - 判断是否在风险路径上（方法名含 `onNewIntent` / `handleDeepLink` / `onReceive` 等）
+      - 识别调用模式（直接调用 / 回调 / 反射）
+   
+   3. **有界追调用方（Grep + Read，最多 3 跳）：**
+      - 如果命中处在疑似风险方法中，Grep 搜索该方法在整个仓库的调用：`methodName\(`
+      - Read 前 3 个调用方的上下文（±20 行）
+      - 判断调用链是否连通到外部入口（exported Activity / BroadcastReceiver / ContentProvider）
+      - 超过 3 跳或无明确结论 → 标记为"需人工复核"，仍产出候选但降低置信度
+   
+   4. **产出候选时附带追踪记录：**
+      ```json
+      {
+        "rule_id": "R-AI-DEEPLINK-HIJACK",
+        "file": "app/MainActivity.java",
+        "line": 156,
+        "why": "loadUrl 被 onNewIntent 调用，Intent 来源外部",
+        "trace": [
+          "loadUrl@MainActivity:156",
+          "onNewIntent@MainActivity:89 (调用 loadUrl)",
+          "外部 Intent → onNewIntent (Activity exported=true)"
+        ],
+        "trace_method": "manual-grep-read"
+      }
+      ```
 
 4. **逐批派发 hunter 子代理（并发）**：对**每个** `hunt_batch_{N}.json`，用 `<SKILL_DIR>/agents/hunter.md` 作提示词模板，填充 `{PROJECT_CONTEXT}`、`{LANGUAGE}`、`{HUNTING_RULES}` = `<SKILL_DIR>/rules/ai/hunting.md` 的完整内容、`{BATCH_FILE}` = 该批次文件的绝对路径、`{REPO_MAP}` = `.scan/tmp/repo_map_{N}.md` 的绝对路径（第 3 步产出）。hunter 按批次 `tech_present` **自门控多视角**逐轮过本批（无 WebView 自动跳过 WebView 视角…），本批文件**必须全部读到**，并用聚焦地图「顺藤摸瓜」做跨文件分析。用配置的 **verify 档模型**跑（见 §模型分层）。
    - hunter 现在返回 **JSON 对象** `{batch, perspectives_covered, candidates}`（不是裸数组）。对每个 hunter 回复，按「子代理输出提取约定」取出该对象，并**把回执持久化**到 `.scan/tmp/hunt_attest_{N}.json`（多次采样写 `hunt_attest_{N}_{S}.json`），内容至少含 `{batch, perspectives_covered}`——供第 5 步覆盖断言核对。`candidates` 取入候选池。
    - **（可选）多次采样并集**：`.scan/config.json` 的 `hunt_samples`（默认 1）> 1 时，对每批跑该次数的 hunter，候选**并集**后再交验证——重复缺陷由第 6 步验证器去重（self-consistency，提召回）。`--full` 大作用域建议设 2。
+   
+   **多次采样的候选去重逻辑：**
+   - **hunter 阶段（本步骤）：** 不去重，保留所有采样的候选
+     ```python
+     all_candidates = []
+     for sample in range(hunt_samples):
+         hunter_result = run_hunter(batch_N, sample)
+         all_candidates.extend(hunter_result["candidates"])
+     # 不去重，全部交给验证器
+     ```
+   - **验证器阶段（第 6 步）：** 按 `file+line+category` 去重
+     - 同一批次中，如果多个候选的 `file + line + category` 相同，合并为一条
+     - 取最高 `severity`，合并 `evidence`（多个引擎的证据），`rule_id` 取第一个
+     - 详见 `verifier.md` 中的"合并同一缺陷"规则
 
 5. **多视角覆盖断言（脚本）**：所有 hunter 回执落盘后，核对每批是否真把该过的视角都过了：
    ```
@@ -215,9 +306,105 @@ python3 <SKILL_DIR>/scripts/run_engines.py --scope-files .scan/tmp/scope.txt
 2. 核实候选描述的缺陷（工具看 `message`，AI 看 `why` 假设）是否在真实代码路径上成立；参照 `rules/ai/hunting.md` 的验证要点/FP 提示压假阳性。
 3. 交叉检查缓解手段（`try-finally`、null 保护、生命周期、`@WorkerThread`、`BuildConfig.DEBUG` 门控…）。
 4. **独立验证闸**：confirmed 必须附**客观证据**（`evidence` 引真实源码、`why` 引具体代码、跨文件须给验证过的 `dataflow_path`）；不因候选"看着像 bug"就盖章。
-5. **条件触发型规则必须先用 `nav_tools.py` 把关键值逐跳回溯到源头**（静态 Context 泄漏、主线程阻塞、越权调用路径、导出组件无校验等——缺陷只有上游源头成立才发生）：经 `nav_tools.py --action trace-origin`（默认 tree-sitter AST 精确；source-nav 纯标准库兜底）**沿整条调用链回溯**关键值（Context/输入/调用线程）到终端源头（如 Context 落到 `Application` 即多为 FP，落到 `Activity/Service/View` 才是真泄漏），**每跳用 Read 交叉复核 snippet**（tree-sitter/source-nav 都不消歧同名重载，尤其要剔除同名误命中）；`evidence`/`dataflow_path` 须含回溯出的「源头点」。**一跳不够——透传形参会把「透传」误当「源头」**。bounded 追溯后仍确定不了源头 → 按 FP 纪律**丢弃**该候选（不得仅一跳当结论）。数据流/污点（各后端都不做）改由 Semgrep taint 候选 + Read 人工追源佐证（详见 `verifier.md`）。
+5. **条件触发型规则必须先用 `nav_tools.py` 把关键值逐跳回溯到源头**（详见下文"条件触发型规则清单"）。
 6. **有界自愈**：判不准时最多再追 2~3 次定向 Read 后再判；仍不清 → 丢弃，不输出 `unclear`。
 7. 只有 `confirmed` 成为正式 finding。
+
+#### 条件触发型规则清单（需 trace-origin 回溯）
+
+以下 `rule_id` 前缀的候选，**必须**先用 `nav_tools.py --action trace-origin` 回溯关键值到源头：
+
+| rule_id 前缀 | 需回溯的关键值 | 判据 | 示例 |
+|-------------|--------------|------|------|
+| `context-leak` / `static-context` / `activity-reference` | Context 来源 | Application = FP，Activity/Service/View = 真泄漏 | 静态变量持有 Activity |
+| `main-thread-block` / `network-on-main` / `disk-on-main` | 调用线程 | 主线程 = 真阻塞，工作线程 = FP | 网络请求在 onClick 中 |
+| `unauthorized-access` / `permission-bypass` | 调用方权限 | 有权限 = FP，无权限 = 真越权 | 越权读取其他 app 数据 |
+| `exported-no-check` / `intent-injection` | Intent 数据来源 | 外部 = 真风险，内部 = FP | 导出组件无校验 |
+| 候选带 `dataflow_path` 字段 | 污点数据流 | 验证每跳真实存在 | Semgrep taint 产出 |
+
+**非条件触发型规则（无需 trace-origin）：**
+- 其他所有规则（空 catch 块、资源未关闭、硬编码敏感信息、SQL 注入单点等）
+- 这些缺陷在命中点本地可验证，Read 所在函数即可
+
+#### 跨文件导航工具（nav_tools.py）
+
+条件触发型规则的跨文件取证统一走 `nav_tools.py`，它按 `nav_backend` 选后端：
+
+**调用示例：**
+
+```bash
+# 查找调用方（谁调用了 init 方法）
+python3 <SKILL_DIR>/scripts/nav_tools.py --repo . --action callers --symbol "init"
+
+# 查找定义（init 方法定义在哪）
+python3 <SKILL_DIR>/scripts/nav_tools.py --repo . --action definition --symbol "DbManager#init"
+
+# 回溯调用链到入口（条件触发型规则必用）
+python3 <SKILL_DIR>/scripts/nav_tools.py --repo . --action trace-origin --symbol "DbManager#init" --depth 6
+
+# 查找继承关系
+python3 <SKILL_DIR>/scripts/nav_tools.py --repo . --action hierarchy --symbol "BaseActivity"
+```
+
+**输出格式：**
+
+- `callers`: `[{file, line, snippet, enclosing_symbol}]`
+- `definition`: `[{symbol, file, line}]`
+- `trace-origin`: `{target, chains: [{symbol, definition, callers: [...]}], backend: "treesitter"|"source-nav"}`
+- `hierarchy`: `{definitions: [...], references: [...]}`
+
+**后端判断：**
+
+- stderr 输出 `导航后端: treesitter` → tree-sitter 正常工作
+- stderr 输出 `[WARN] nav-degraded` → 已回退 source-nav（名义级精度，需更严格 Read 复核）
+- JSON 输出的 `backend` 字段标明实际后端
+
+**精度说明：**
+
+- tree-sitter 和 source-nav **都不消歧同名重载**（如多个 `init(...)` 重载）
+- 必须对每跳结果用 Read 交叉复核 snippet，剔除同名误命中
+- tree-sitter 优势：不误命中注释/字符串、enclosing scope 精确、Kotlin 无盲区
+- source-nav 优势：零依赖、离线可用、永远可用（兜底保证）
+
+#### trace-origin 输出的解析与使用
+
+**1. 读取 JSON 输出：**
+```python
+result = json.loads(nav_tools_stdout)
+backend = result["backend"]  # "treesitter" 或 "source-nav"
+chains = result["chains"]    # 每个定义点一条链
+```
+
+**2. 提取源头点（递归遍历到 entry_point）：**
+```python
+def extract_entry_points(callers_list):
+    entries = []
+    for c in callers_list:
+        if c.get("entry_point"):
+            # 到达入口点 = 源头
+            entries.append(c)
+        elif "callers" in c:
+            # 继续递归
+            entries.extend(extract_entry_points(c["callers"]))
+    return entries
+
+all_entries = []
+for chain in chains:
+    all_entries.extend(extract_entry_points(chain["callers"]))
+```
+
+**3. 逐跳 Read 复核（必须）：**
+- 对每个 entry_point：`Read {file}:{line-10}:{line+10}`
+- 确认 snippet 确实在该位置
+- 确认 enclosing_symbol 匹配（剔除同名误命中）
+- 判断源头类型（Application / Activity / 外部 Intent 等）
+
+**4. 写入 evidence：**
+```python
+evidence = f"回溯调用链 ({backend})：{target} ← ... ← 源头 {entry_type} @ {entry_file}:{entry_line}"
+```
+
+---
 
 每条 `confirmed` 输出 `merge_findings.py` 要求的 10 个字段：
 `file, line, rule_id, category, severity, title, evidence, why, repro, suggestion`（`end_line`、`dataflow_path` 可选）。`category`/`severity` 默认沿用候选自带值（工具来自引擎/adapter，AI 来自 hunter），验证器取证后可微调。
@@ -352,3 +539,54 @@ cp <SKILL_DIR>/config.example.json <项目根>/.scan/config.json
 - 调用/类型导航：用 `scripts/nav_tools.py` 查 `callers`/`definition`/`hierarchy`/`trace-origin`，**后端自动选择**：默认 `repo_map.py`（tree-sitter AST 精确、读最新源码、Java+Kotlin 无盲区），tree-sitter 不可用时回退纯标准库 `source_nav.py`。hunter 的 RepoMap（`repo_map.py --action map`）也由同一 tree-sitter 引擎产出。tree-sitter 不可用时 nav_tools 回退纯标准库 `source_nav.py` 并打印 [WARN] nav-degraded 告警。
 - 规则调优：若某类持续假阳性，更新对应来源（`queries/` 或 `rules/ai/`）的模式/验证要点——不要静默禁用。
 - 脚本位于 `<SKILL_DIR>/scripts/`，仅用 Python 标准库；改动时保持 `--help` 文档与本 SKILL.md 的用法同步。
+
+---
+
+## 附录：导航后端对比（tree-sitter vs source-nav）
+
+| 维度 | tree-sitter | source-nav |
+|------|-------------|-----------|
+| **依赖** | 需要 venv + language-pack（`tree-sitter` + `tree-sitter-java` + `tree-sitter-kotlin`） | 纯 Python 标准库（`os.walk` + `re`） |
+| **AST 精度** | ✅ AST 解析，不误命中注释/字符串 | ⚠️ 正则匹配，可能误命中 |
+| **enclosing scope** | ✅ 精确识别调用所在方法 | ⚠️ 向上扫描最近方法声明 |
+| **同名消歧** | ❌ 不解析重载/类型（需 Read 复核） | ❌ 同样不消歧 |
+| **Kotlin 支持** | ✅ 完整支持（自写 kotlin-tags.scm） | ⚠️ 基础支持（fun/override） |
+| **离线可用** | ⚠️ 首次需联网安装 venv | ✅ 完全离线 |
+| **RepoMap** | ✅ 产生签名骨架+PageRank 地图 | ❌ 不产生（hunter 被要求自行追） |
+| **召回完整性** | ✅ 可靠 | ✅ 可靠（宁可误召，不漏真实） |
+| **输出格式** | 与 source-nav 同形 | 与 tree-sitter 同形 |
+| **性能** | ✅ 快（索引+查询） | ⚠️ 慢（~2s/1000文件，全文件遍历） |
+| **触发方式** | 自动（`nav_backend=auto` 默认） | 自动（tree-sitter 不可用时回退） |
+
+### 选择逻辑
+
+`nav_tools.py` 按 `nav_backend`（`.scan/config.json` 或 `SCAN_ANDROID_NAV_BACKEND` 环境变量）选后端：
+
+- **`auto`（默认）**：优先 tree-sitter，不可用时回退 source-nav
+- **`treesitter`**：强制 tree-sitter，不可用时报错
+- **`source`**：强制 source-nav（离线/受限环境测试用）
+
+### 何时回退 source-nav
+
+- tree-sitter venv 安装失败（离线/网络受限/权限不足）
+- `~/.scan-android/repomap-venv/` 已损坏
+- 用户显式设置 `nav_backend=source`
+
+### 回退时的影响
+
+1. **RepoMap（AI 狩猎）**：`repo_map.py` 写降级说明，hunter 被要求自行追调用关系
+2. **跨文件导航（验证）**：`nav_tools.py` 输出 `[WARN] nav-degraded`，verifier 需更严格 Read 复核
+3. **精度下降**：可能误命中注释/字符串，同名歧义更多（但召回不减少）
+
+### 共同限制
+
+- 两者**都不消歧同名重载**（verifier 必须逐跳 Read 复核）
+- 两者**都不做数据流分析**（污点追踪改由 Semgrep taint + 人工追源）
+- 两者**都依赖 Read 工具复核每跳 snippet**（剔除同名误命中）
+
+### 使用建议
+
+- **默认场景**：使用 `nav_backend=auto`（默认），让系统自动选择最佳后端
+- **离线环境**：显式设置 `nav_backend=source`，跳过 tree-sitter 安装
+- **CI 环境**：首次运行允许联网安装 tree-sitter，后续离线使用缓存的 venv
+- **开发调试**：可通过 stderr 输出的 `导航后端: treesitter` 或 `[WARN] nav-degraded` 判断实际使用的后端
