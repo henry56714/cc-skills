@@ -22,6 +22,8 @@ from .base import AdapterResult, EngineAdapter, ScanContext
 # 按 check 类别选择 PMD 内置规则集（随 PMD 发行版自带，无需自写）。
 # PMD 内置规则集（随发行版自带）。每次扫描全部挂上，不再按维度分。
 _RULESETS = [
+    "category/java/security.xml",
+    "category/java/bestpractices.xml",
     "category/java/errorprone.xml",
     "category/java/multithreading.xml",
     "category/java/performance.xml",
@@ -44,10 +46,20 @@ _RULE_MAP: dict[str, tuple[str, str, str]] = {
     "UnsynchronizedStaticFormatter": ("R-STB-030", "stability/non-threadsafe-formatter", "major"),
     "AvoidUsingHardCodedIP": ("R-SEC-001", "security/hardcoded-secret", "minor"),
     "HardCodedCryptoKey": ("R-SEC-001", "security/hardcoded-secret", "critical"),
+    "AvoidFileStream": ("R-PRF-001", "perf/unbuffered-file-stream", "minor"),
 }
 
-# PMD priority(1 最高 .. 5 最低) → severity
-_PRIORITY_SEV = {1: "critical", 2: "major", 3: "minor", 4: "info", 5: "info"}
+# 默认只把具备直接缺陷语义的规则送入漏洞 verifier。其余 PMD 命中仍会计入
+# rules_run/suppressed/suppression_summary；配置 pmd_include_advisories=true 可全部送入。
+_HIGH_SIGNAL_RULES = {
+    "CloseResource",
+    "UnsynchronizedStaticFormatter",
+    "HardCodedCryptoKey",
+}
+
+# PMD priority 表示规则优先级，不等同安全严重性。未知规则最高只映射到 major；
+# critical 仅由上方经过人工校准的安全规则显式给出。
+_PRIORITY_SEV = {1: "major", 2: "major", 3: "minor", 4: "info", 5: "info"}
 
 
 class PMDAdapter(EngineAdapter):
@@ -78,48 +90,58 @@ class PMDAdapter(EngineAdapter):
 
         java_files = [f for f in ctx.scope_files if f.endswith(".java")]
         if not java_files:
+            result.status = "not_applicable"
             result.notes.append({"engine": self.name, "note": "作用域内无 Java 文件，跳过"})
             return result
 
         rulesets = _RULESETS
 
-        # 把作用域内 java 文件写入 file-list，精确限定 PMD 扫描范围
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as flf:
-            flf.write("\n".join(str(ctx.repo / f) for f in java_files))
-            file_list = flf.name
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
-            report_json = rf.name
+        with tempfile.TemporaryDirectory(prefix="scan-android-pmd-") as tmp:
+            file_list = Path(tmp) / "files.txt"
+            file_list.write_text("\n".join(str(ctx.repo / f) for f in java_files), encoding="utf-8")
+            report_json = Path(tmp) / "pmd.json"
+            cmd = [
+                pmd, "check",
+                "--file-list", str(file_list),
+                "-R", ",".join(rulesets),
+                "-f", "json",
+                "-r", str(report_json),
+                "--no-cache",
+                "--no-progress",
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=str(ctx.repo))
+            except subprocess.TimeoutExpired:
+                result.status = "partial"
+                result.notes.append({"engine": self.name, "note": "PMD 超时（600s）"})
+                return result
+            except Exception as e:
+                result.available = False
+                result.status = "failed"
+                result.unavailable_reason = f"PMD 运行失败: {e}"
+                return result
+            # PMD 退出码：0=无违规，4=有违规，其他=错误。若报告仍存在则保留部分结果。
+            if proc.returncode not in (0, 4):
+                result.status = "partial"
+                result.notes.append({"engine": self.name, "note": f"PMD 退出码 {proc.returncode}: {proc.stderr[:300]}"})
 
-        cmd = [
-            pmd, "check",
-            "--file-list", file_list,
-            "-R", ",".join(rulesets),
-            "-f", "json",
-            "-r", report_json,
-            "--no-cache",
-            "--no-progress",
-        ]
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=str(ctx.repo))
-        except subprocess.TimeoutExpired:
-            result.notes.append({"engine": self.name, "note": "PMD 超时（600s）"})
-            return result
-        except Exception as e:
-            result.available = False
-            result.unavailable_reason = f"PMD 运行失败: {e}"
-            return result
-        # PMD 退出码：0=无违规，4=有违规，其他=错误。两者都正常解析报告。
+            try:
+                data = json.loads(report_json.read_text(encoding="utf-8"))
+            except Exception as e:
+                result.status = "failed"
+                result.notes.append({"engine": self.name, "note": f"PMD JSON 解析失败: {e}"})
+                return result
 
-        try:
-            with open(report_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            result.notes.append({"engine": self.name, "note": f"PMD JSON 解析失败: {e}"})
-            return result
+        for error_key in ("processingErrors", "configurationErrors"):
+            if data.get(error_key):
+                result.status = "partial"
+                result.notes.append({"engine": self.name, "note": f"PMD {error_key}: {str(data[error_key])[:300]}"})
 
         scope_set = set(ctx.scope_files)
         rule_hit: dict[str, int] = {}
         rules_seen: set[str] = set()
+        include_advisories = ctx.detect_info.get("config", {}).get("pmd_include_advisories") is True
+        suppressed_by_rule: dict[str, int] = {}
 
         for file_obj in data.get("files", []):
             path_str = file_obj.get("filename", "")
@@ -134,8 +156,14 @@ class PMDAdapter(EngineAdapter):
                 if cand is None:
                     continue
                 rules_seen.add(cand.native_rule_id)
+                if not _should_emit(cand.native_rule_id, include_advisories):
+                    result.suppressed += 1
+                    suppressed_by_rule[cand.native_rule_id] = suppressed_by_rule.get(cand.native_rule_id, 0) + 1
+                    continue
                 rule_hit[cand.rule_id] = rule_hit.get(cand.rule_id, 0) + 1
-                if rule_hit[cand.rule_id] > ctx.max_per_rule:
+                if ctx.max_per_rule > 0 and rule_hit[cand.rule_id] > ctx.max_per_rule:
+                    result.truncated += 1
+                    result.status = "partial"
                     if rule_hit[cand.rule_id] == ctx.max_per_rule + 1:
                         result.notes.append({
                             "rule_id": cand.rule_id,
@@ -146,6 +174,16 @@ class PMDAdapter(EngineAdapter):
 
         result.rules_run = len(rules_seen)
         result.rules_total = len(rules_seen)
+        result.suppression_summary = dict(sorted(suppressed_by_rule.items()))
+        if result.suppressed:
+            result.notes.append({
+                "engine": self.name,
+                "note": (
+                    f"PMD 高信号 profile：{result.suppressed} 条 advisory/style 命中未进入漏洞 verifier；"
+                    "设置 pmd_include_advisories=true 可显式纳入"
+                ),
+                "suppressed_by_rule": result.suppression_summary,
+            })
         return result
 
 
@@ -176,3 +214,7 @@ def _parse_violation(v: dict, rel: str) -> Candidate | None:
         severity=severity,
         message=message,
     )
+
+
+def _should_emit(rule: str, include_advisories: bool = False) -> bool:
+    return include_advisories or rule in _HIGH_SIGNAL_RULES

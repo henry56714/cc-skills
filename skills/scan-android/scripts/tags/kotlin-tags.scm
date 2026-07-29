@@ -1,5 +1,5 @@
 ; kotlin-tags.scm — tree-sitter tags 查询（def/ref 抽取）。
-; 自写（Aider 无 kotlin-tags.scm；照搬 Aider 会让 Android 的 Kotlin 成为盲区，重演 Joern .kt 盲区）。
+; Android Kotlin 专用 tags，避免只覆盖 Java 而漏掉 Kotlin 声明与调用。
 ; 节点名对应 fwcd/tree-sitter-kotlin 语法（class_declaration / function_declaration /
 ; object_declaration / property_declaration / call_expression / constructor_invocation）。
 ; @name 捕获符号名；@definition.* / @reference.* 标注角色。与 java-tags.scm 同形，供 repo_map 统一处理。

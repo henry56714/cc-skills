@@ -16,8 +16,8 @@ import lib_scan  # noqa: E402  (after sys.path tweak)
 
 class FindingId(unittest.TestCase):
     def test_matches_sha1_of_canonical_string(self):
-        fid = lib_scan.finding_id("app/Foo.java", 42, "security/hardcoded-secret")
-        expected = hashlib.sha1(b"app/Foo.java:42:security/hardcoded-secret").hexdigest()
+        fid = lib_scan.finding_id("app/Foo.java", 42, "security/hardcoded-secret", "R-1")
+        expected = hashlib.sha1(b"app/Foo.java:42:security/hardcoded-secret:R-1").hexdigest()
         self.assertEqual(fid, expected)
 
     def test_deterministic(self):
@@ -30,6 +30,18 @@ class FindingId(unittest.TestCase):
         self.assertNotEqual(base, lib_scan.finding_id("b", 1, "c"))
         self.assertNotEqual(base, lib_scan.finding_id("a", 2, "c"))
         self.assertNotEqual(base, lib_scan.finding_id("a", 1, "d"))
+
+    def test_rule_id_prevents_same_line_rule_collapse(self):
+        self.assertNotEqual(
+            lib_scan.finding_id("a", 1, "c", "R-1"),
+            lib_scan.finding_id("a", 1, "c", "R-2"),
+        )
+
+    def test_root_cause_id_is_case_and_separator_stable(self):
+        self.assertEqual(
+            lib_scan.root_cause_id("app\\Foo.kt", "Foo.Report ", "Cleartext_Report"),
+            lib_scan.root_cause_id("APP/Foo.kt", "foo.report", "cleartext-report"),
+        )
 
 
 class SeverityRank(unittest.TestCase):

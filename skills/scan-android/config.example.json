@@ -1,45 +1,51 @@
 {
-  "_usage": "将本文件拷贝到被扫描项目根目录的 .scan/config.json，删除所有 _ 开头的注释键，按需修改。",
+  "_usage": "复制到目标源码仓库 .scan/config.json；删除 _ 开头说明字段后按需修改。仅支持 source 扫描。",
 
-  "_opt_in_engines_note": "P4 引擎默认关闭。可选值：mobsf / flowdroid（需对应 APK / 环境）。",
-  "opt_in_engines": [],
-
-  "_excluded_engines_note": "关闭指定引擎，对所有引擎生效（semgrep / detekt / pmd / lint / mobsf / flowdroid），优先级高于 opt_in_engines。被关闭的引擎其对应工具不计入 preflight strict 的中断判定——例如无 Gradle wrapper 的库工程可加入 'lint' 关闭它。",
+  "_excluded_engines_note": "可选：semgrep / detekt / pmd / lint / ai。排除会降低覆盖率，并在报告中显示 skipped。",
   "excluded_engines": [],
 
-  "_nav_backend_note": "跨文件调用/类型导航后端 + hunter 的 RepoMap。唯一精确层是 tree-sitter（AST 精确，Java+Kotlin 无盲区，装在独立 venv ~/.scan-android/repomap-venv/，比照 semgrep 隔离），preflight 自动安装、非阻塞。tree-sitter 不可用时自动回退纯标准库 source-nav，并打印 [WARN] nav-degraded 告警（精度下降，请修复 repomap venv）。",
-  "_nav_backend_select_note": "导航后端选择：auto（默认=treesitter→source）/ treesitter（强制 tree-sitter 精确层，唯一精确层）/ source（强制纯标准库兜底）。tree-sitter 用 AST 精确识别 def/ref、Kotlin 无盲区，并产出 source-nav 做不到的 RepoMap（签名骨架 + PageRank + 跨文件关系）；同名重载不消歧，由 verifier 逐跳 Read 复核（基准实测导航精度与 source-nav 持平，采纳理由是 RepoMap 能力）。",
+  "_build_execution_note": "Lint 会执行目标仓库 Gradle 代码。默认 false；仅在信任仓库并明确授权后开启。",
+  "allow_gradle_execution": false,
+
+  "_semgrep_registry_note": "默认只跑版本库内固定规则。true 会联网加载 registry 规则，覆盖更广但规则内容会随上游变化。",
+  "semgrep_use_registry": false,
+  "semgrep_registry_packs": [
+    "p/security-audit",
+    "p/owasp-top-ten",
+    "p/secrets",
+    "p/java",
+    "p/kotlin"
+  ],
+
+  "_pmd_note": "默认只把高信号 PMD 缺陷送入 verifier；style/advisory 仍在 engine_stats.suppressed 中计数。true 会显著增加候选与成本。",
+  "pmd_include_advisories": false,
+
+  "_documentation_note": "默认不扫描 docs 中的示例代码。true 仅将 docs 加入工具 scope，AI hunter 仍跳过。",
+  "include_documentation": false,
+
+  "_nav_backend_note": "auto=优先 tree-sitter，失败回退 source-nav；两者均为名义级导航，需读源码消歧。可选 auto / treesitter / source。",
   "nav_backend": "auto",
 
-  "_semgrep_registry_note": "Semgrep 社区 registry 规则包开关与覆盖。semgrep_use_registry=false 可在离线环境关闭在线规则包（只跑本地 queries/semgrep/）；semgrep_registry_packs 显式覆盖默认包清单（如 ['p/java','p/security-audit']），留空用按 check 类别的默认映射。",
-  "semgrep_use_registry": true,
-  "semgrep_registry_packs": [],
+  "_scope_note": "diff 影响切片默认深度。CLI --impact-depth 可覆盖。",
+  "impact_depth": 2,
 
-  "_models_note": "模型分层（v3，按任务难度控成本）。triage=机械结构化/初筛/跨源去重；verify=AI狩猎+验证（主力）；escalate=可选，对 critical 候选二次复核（留空=关）。可换任意模型 id。",
-  "models": {
-    "triage": "claude-haiku-4-5",
-    "verify": "claude-sonnet-4-6",
-    "escalate": ""
-  },
-
-  "_hunt_samples_note": "AI 狩猎支线每批的采样次数（self-consistency 提召回）。默认 1；>1 时对每批跑多次 hunter，候选并集后交第 6 步验证去重。--full 大作用域可设 2：召回更高但 hunter 成本翻倍。",
-  "hunt_samples": 1,
-
-  "_hunt_batch_size_note": "build_hunt_batches.py 每批文件数上限（默认 15）。hunter 逐文件通读，过大易超上下文/漏读，过小则子代理数量多。",
+  "_hunt_note": "AI 对每批的独立采样次数、文件上限和估算 token 上限。",
+  "hunt_samples": 2,
   "hunt_batch_size": 15,
+  "hunt_token_budget": 36000,
 
-  "_modules_note": "强制指定模块列表，覆盖 detect_project.py 的自动探测。留空则自动探测。",
+  "_modules_note": "可覆盖 settings.gradle 自动探测；留空自动探测。",
   "modules": [],
 
-  "_extra_excludes_note": "额外的排除 glob，叠加到默认排除集之上。",
+  "_extra_excludes_note": "额外排除 glob，叠加默认 build/generated/test 等目录。",
   "extra_excludes": [],
 
-  "_lint_tasks_note": "覆盖推断的 Gradle lint 任务列表，按序尝试取第一个成功的。",
+  "_lint_tasks_note": "授权 Lint 后按顺序尝试，采用第一个产生有效报告的任务。",
   "lint_tasks": [],
 
-  "_apk_path_note": "显式指定 APK 路径，供 mobsf / flowdroid 使用。留空则自动在 build/outputs/apk/ 下搜索。",
-  "apk_path": "",
+  "_language_note": "zh / en；留空按 locale 推断。",
+  "language": "",
 
-  "_language_note": "报告语言，覆盖 detect_project.py 的推断。可选值：zh / en。留空则自动推断。",
-  "language": ""
+  "_project_context_note": "给 hunter/verifier 的真实业务约束，例如受信调用方或数据敏感度；不得写未经验证的假设。",
+  "project_context": ""
 }

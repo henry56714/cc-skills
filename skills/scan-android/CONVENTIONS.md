@@ -1,219 +1,141 @@
-# scan-android 规范
+# scan-android 约定
 
-扫描系统的参考文档。当需要了解 schema、去重、报告细节时由 `scan-android` 加载。不要把这些细节内联到 `SKILL.md`——它们独立演进。
+## 产品边界
 
-## 目录结构
+只扫描 Android 源码仓库。不接受 APK/AAB，不反编译，也没有 hybrid 模式。目标源码只读；扫描产物只写到目标仓库 `.scan/`。
 
-两个**互相独立**的根：`<SKILL_DIR>`（skill 安装目录，可在任意路径）与被扫描仓库根（cwd）。
+## 目录
 
-```
-<SKILL_DIR>/            # skill 安装目录——可在任意路径，不必是 .claude/skills/
-  SKILL.md             # 入口
-  CONVENTIONS.md       # 本文件
-  requirements.txt     # Python 依赖（由 installer 写入 venv）
-  rules/
-    ai/hunting.md      # AI 支线狩猎启发集（自然语言，R-AI-* id）
-  queries/
-    semgrep/           # 本地补充 Semgrep 规则（全部加载；社区 registry 包另由 adapter 挂载）
-    detekt/            # Detekt 配置（detekt.yml）
-    flowdroid/         # FlowDroid SourcesAndSinks（opt-in）
-  agents/
-    hunter.md          # AI 狩猎子代理提示词模板
-    verifier.md        # 独立验证子代理提示词模板
-  docs/
-    install-engines.md # 引擎安装指南（venv / JVM 工具 / opt-in）
-  scripts/
-    detect_project.py  # 探测模块 / flavor / lint 任务 / 语言 / 读取项目配置
-    run_engines.py     # 引擎编排器：注册并运行各引擎 adapter，输出归一化候选
-    build_hunt_batches.py # AI 支线确定性分批 + 覆盖率断言 + 风险排序 + 技术存在标记 + 每批期望视角
-    check_hunt_coverage.py # AI 支线「多视角覆盖」事后断言：每批 expected ⊆ hunter 回执 covered
-    adapters/          # 引擎 adapter（base.py / semgrep / detekt / pmd / lint / mobsf / flowdroid）
-    tools/
-      installer.py     # 依赖管理：ensure_venv() + ensure_semgrep() + ensure_detekt() + ensure_repomap_venv() + ...
-    lib_scan.py        # 共享库：Candidate 契约、id 计算、JSON I/O
-    dynamic_poc.py     # P5 动态 PoC 验证（ADB）
-    nav_tools.py       # LLM 导航工具（后端按 nav_backend 选择：treesitter(唯一精确层)→source-nav 兜底，回退时告警）
-    repo_map.py        # tree-sitter 代码地图 + AST 精确导航（默认精确层）；hunter RepoMap + verifier 导航
-    tags/              # tree-sitter tags 查询（java-tags.scm + 自写 kotlin-tags.scm）
-    source_nav.py      # 纯标准库源码级导航（tree-sitter 不可用时的兜底后端；调用方/定义/继承/trace-origin）
-    nav_benchmark.py   # 导航后端 ground-truth 基准评测器（非扫描流程；选后端用数字而非口碑）
-    ...
-~/.scan-android/        # 工具缓存目录（与 skill 解耦，跨工程共享）
-  venv/                # Python 虚拟环境（semgrep 等；SCAN_ANDROID_VENV_DIR 可覆盖）
-  repomap-venv/        # tree-sitter 精确层专属 venv（tree-sitter + language-pack；SCAN_ANDROID_REPOMAP_VENV 可覆盖）
-  tools/               # JVM 工具二进制（SCAN_ANDROID_TOOLS_DIR 可覆盖）
-    detekt/            # Detekt JAR
-    flowdroid/         # FlowDroid JAR（opt-in）
-<被扫描仓库根>/         # = 运行命令时的 cwd
-  .scan/               # 全部产物都落在这里，与 skill 解耦
-    config.json        # 可选：项目级配置（额外排除、项目背景等）
-    findings.json      # 本次扫描确认的 finding（每次覆盖，无历史）
-    cache/             # CPG / DB 缓存（重型引擎用，按 commit 键控）
-    tmp/               # 中间产物：scope.txt、hunt_scope.txt、候选批次、
-                       #   hunt_batch_{N}.json + hunt_coverage.json（AI 支线分批/文件覆盖率）、
-                       #   repo_map_{N}.md（每批 tree-sitter 聚焦代码地图，喂 hunter）、
-                       #   hunt_attest_*.json（hunter 视角回执）+ hunt_perspective_coverage.json（视角覆盖断言）
-    reports/
-      findings.md      # 生成的人类可读报告
+```text
+.scan/
+  config.json                 可选项目配置
+  findings.json               confirmed
+  needs-review.json           证据不足但值得继续查
+  reports/findings.md
+  reports/needs-review.md
+  tmp/run_manifest.json       当前运行的可复现性事实；不跨扫描累计
+  tmp/                        可重建的作用域、候选、批次、地图与覆盖率文件
 ```
 
-- **`<SKILL_DIR>`** 可装在任意路径（含被多个仓库共享 / 符号链接）。脚本通过 `Path(__file__)` 自定位其同级资源（`rules/`、`lib_scan.py`），因此不依赖任何固定安装位置或 cwd。文档/工作流中凡引用 skill 内文件，一律写 `<SKILL_DIR>/...` 并由调用方替换为实际安装路径——**不要**硬编码 `.claude/skills/...`。
-- **`.scan/*`** 产物与可选的 `.scan/config.json` 始终位于**被扫描仓库**的根目录（cwd），与 skill 本身解耦。
+## 配置
 
-## 作用域语义
+以 `config.example.json` 为准。支持：
 
-一次扫描只由 **作用域（scope）** 参数化——决定检查**哪些文件**。规则不再分维度/子集：每次都跑全部规则（v3 去掉了 `--checks`）。
+- `excluded_engines`: `semgrep`, `detekt`, `pmd`, `lint`, `ai`
+- `allow_gradle_execution`: 默认 false
+- `semgrep_use_registry`: 默认 false
+- `semgrep_registry_packs`
+- `pmd_include_advisories`: 默认 false；低信号命中仍在 stats 中显式记账
+- `include_documentation`: 默认 false；仅影响工具 scope，AI 不审查 docs 示例
+- `nav_backend`: `auto|treesitter|source`
+- `impact_depth`, `hunt_samples`, `hunt_batch_size`, `hunt_token_budget`
+- `modules`, `extra_excludes`, `lint_tasks`, `language`, `project_context`
 
-| 作用域参数 | 解析方式 |
-|---|---|
-| `--diff REF` | `git diff --name-only REF` 与源文件扩展名求交集 |
-| `--full` | 所有模块根目录下的源文件 |
-| `--module=X` | `X/**` |
-| `--files=GLOB` | 按 glob 匹配（相对仓库根） |
+未知字段忽略。配置解析失败不得猜测；使用安全默认并在 notes/warnings 中显示。
 
-除非显式覆盖，始终应用以下**通用默认排除**（见 `detect_project.py` 的 `default_excludes`）：`**/build/**`、`**/generated/**`、`**/test/**`、`**/androidTest/**`、`**/.gradle/**`、`**/.idea/**`。
+## 工具候选契约
 
-项目专属的额外排除（例如 vendored 的 `vendor/`、`third_party/`、`prebuilt/` 等）**不**硬编码，而是通过 `.scan/config.json` 的 `extra_excludes` 提供；`detect_project.py` 会把它与默认排除合并。
-
-源文件扩展名：`.java`、`.kt`、`.xml`、`.aidl`、`.gradle`、`.properties`（后两者仅当规则显式指定时纳入）。
-
-## 项目配置（.scan/config.json，可选）
-
-skill 默认对任意 Android 工程零配置工作（模块 / flavor / lint 任务全部由 `detect_project.py` 自动探测）。当某个仓库需要微调时，在其根目录放一份 `.scan/config.json`——所有字段均可选，`detect_project.py` 会读取并合并：
+所有 adapter 输出统一 Candidate：
 
 ```json
 {
-  "modules": ["app", "core", "feature/login"],
-  "extra_excludes": ["vendor/**", "third_party/**", "prebuilt/**"],
-  "lint_tasks": ["lintPaidDebug", "lint"],
-  "language": "zh",
-  "opt_in_engines": ["mobsf"],
-  "project_context": "（可选）一句话项目背景，帮助验证器消歧。例如：长期运行的后台服务，进程级单例常驻属预期；或：纯前台 App，无后台常驻组件。"
+  "engine": "semgrep",
+  "native_rule_id": "scan-android-r-sec-056-intent-to-webview-taint",
+  "rule_id": "R-SG-056",
+  "file": "app/src/main/java/example/Web.kt",
+  "line": 42,
+  "end_line": 43,
+  "category": "security/webview-untrusted-data-flow",
+  "severity": "critical",
+  "snippet": "web.loadUrl(intent.getStringExtra(\"url\"))",
+  "message": "外部数据流入 WebView",
+  "dataflow_path": []
 }
 ```
 
-| 字段 | 作用 |
-|---|---|
-| `modules` | 覆盖自动探测的模块列表（探测不准或需收窄时用） |
-| `extra_excludes` | 追加到默认排除之外的项目级排除 glob |
-| `lint_tasks` | 覆盖 L0 lint 任务建议（按顺序尝试，取首个成功） |
-| `language` | 生成文本字段（`title`/`why`/`repro`/`suggestion`）使用的语言：`"zh"` 或 `"en"`。未设置时自动检测系统 locale（`$LANG`），检测不到则默认 `"zh"` |
-| `opt_in_engines` | 为本仓库持久化启用 opt-in 引擎，可选值 `"mobsf"`、`"flowdroid"`。等效于对应的环境变量（`SCAN_ANDROID_ENABLE_MOBSF` 等），两者取并集 |
-| `project_context` | 注入 verifier 子代理 `{PROJECT_CONTEXT}` 占位符的项目背景；帮助 LLM 区分「单例故意常驻」「后台线程可接受同步 I/O」等项目语境 |
+`file` 是仓库相对 POSIX 路径；`line` 为 1-based。`dataflow_path` 可选，元素为 `{file,line,message}`。
 
-config **不**引入新规则——它只调参（排除、lint、模块、引擎开关、模型、验证背景）。广度规则来自引擎自带 / 社区库（Semgrep registry + Detekt + PMD + Lint），深层逻辑缺陷由 AI 支线 `rules/ai/hunting.md` 覆盖，按技术存在与否自动适用。
+Adapter 必须返回 `complete|partial|failed`，并记录 `truncated`。缺失/超时/解析失败不得伪装为 complete。
 
-## findings.json schema
+## verifier 输出
+
+严格对象（含批次完整性回执）：
+
+```json
+{"batch": 0, "candidates_input": 12, "candidates_adjudicated": 12, "false_positive_count": 11, "duplicates_merged_count": 1, "confirmed": [], "needs_review": []}
+```
+
+`confirmed + needs_review + false_positive_count + duplicates_merged_count` 必须等于输入候选数；glob 合并模式会对照原始 verifier 批次拒绝计数不一致。每个输出记录的 `source_candidate_ids` 必须来自本批输入，不能在多个 finding 中重复，并满足 `source_candidate_ids 总数 = confirmed + needs_review + duplicates_merged_count`。
+
+confirmed 必需字段：
+
+`file,line,rule_id,category,severity,title,evidence,why,repro,suggestion,root_cause,source_candidate_ids,provenance`
+
+needs-review 至少再有 `review_reason`，建议提供 `missing_evidence`。条件触发问题的 confirmed 必须含非空 `dataflow_path` 或 `origin_trace`；否则 merge 自动转为 needs-review。
+
+`root_cause` 为 `{primary_file,symbol,failure_mode}`：一次修复可消除的多个命中使用同一三元组；同一位置的不同失效模式使用不同三元组。
+
+## findings.json schema v4
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "findings": [
     {
-      "id": "sha1(file:line:category), hex",
-      "file": "app/src/main/java/.../Foo.java",
+      "id": "sha1(root_cause.primary_file + symbol + failure_mode)",
+      "file": "app/src/main/java/example/Foo.kt",
       "line": 42,
-      "end_line": 48,
-      "rule_id": "R-SEC-001",
-      "category": "security/hardcoded-secret",
+      "end_line": 45,
+      "rule_id": "R-AI-002",
+      "category": "security/path-traversal-data-flow",
       "severity": "critical",
-      "title": "FooClient 中硬编码的 API key",
-      "evidence": "private static final String KEY = \"abc...\";",
-      "why": "该 key 会随 release APK 一起分发，并拥有后端写权限。",
-      "repro": "在生成的 apk 里 grep 该字面量。",
-      "suggestion": "改为通过 BuildConfig 从构建时的密钥源注入。",
+      "title": "外部路径逃逸缓存目录",
+      "evidence": "...",
+      "why": "...",
+      "repro": "...",
+      "suggestion": "...",
       "status": "open",
-      "dataflow_path": [ { "file": "...", "line": 0, "message": "..." } ]
+      "dedup_scope": "root_cause",
+      "root_cause": {
+        "primary_file": "app/src/main/java/example/Foo.kt",
+        "symbol": "Foo.importFile",
+        "failure_mode": "unvalidated-path-containment"
+      },
+      "source_candidate_ids": ["..."],
+      "provenance": [{"source_kind": "ai_hunter", "hunter_batch": 2, "hunter_sample": 0}],
+      "related_locations": [],
+      "dataflow_path": []
     }
   ]
 }
 ```
 
-### 字段规则
-- `id` — 确定性计算（`sha1(file:line:category)`）；由脚本生成
-- `file` — 相对仓库根，使用正斜杠
-- `line` — 从 1 开始，指向主要违规行
-- `severity` ∈ `critical | major | minor | info`（见下）
-- `status` — v3 无状态：恒为 `"open"`（不再跟踪 fixed/wontfix/历史）
-- `dataflow_path` / `poc_result` — 可选；若验证候选带有则原样透传
-- **v3 起不再有** `first_seen_*` / `last_seen_*` 等跨扫描字段
+needs-review schema v2 的数组键为 `needs_review`，条目 `status=needs_review`，使用同一 root-cause/provenance 契约。
 
-### 写入
-**每次扫描覆盖写**：`merge_findings.py` 不读旧文件，仅按本次确认候选去重后原子写 `findings.json`。
+## 本次内去重
 
-> **v3：无 ledger、无跨扫描状态机、无降级可见性。** 每次扫描独立，只反映本次确认的问题；运行元信息（引擎层级）仅写入报告头，不持久化。
+1. Build-verify 给候选加入 ID/provenance，并尽量把同规则/同定位放在同批。
+2. Verifier 为一次修复对应的所有表现分配相同结构化 root cause，并聚合 source IDs。
+3. Merge 以 root cause 跨文件、跨规则合并；保留证据更完整的主记录、最高受支持严重度及所有 related locations/provenance。
+4. 缺 root cause 的旧输入只做精确位置去重，并标记 `dedup_scope=exact_location`。
+5. Confirmed 与 needs-review 的同根因冲突由 confirmed 胜出并计数。
+6. 不跨扫描记忆，不维护 fixed/wontfix/first_seen。
 
-## 严重度定义
+## 严重度
 
-严格按照下述含义使用——不要模糊其边界。
+- `critical`: 可直接造成越权、敏感数据泄露/篡改、RCE、关键业务损失或高确定性严重崩溃。
+- `major`: 真实用户可触发的稳定性、隐私、性能或安全问题，影响显著但条件/范围受限。
+- `minor`: 局部影响、恢复容易或低频边界问题。
+- `info`: 有价值的工程风险，当前不构成直接缺陷。
 
-| 级别 | 含义 |
-|---|---|
-| **critical** | 崩溃、数据丢失、安全事件或在真实代码路径上触发 ANR。阻止发布。 |
-| **major** | 资源泄漏、线程错误 I/O、竞态、缺少对合理输入的 null 保护——压力下必然在现场触发故障。需在发布前修复。 |
-| **minor** | 潜在正确性风险、代码质量缺陷。顺手修复即可。 |
-| **info** | 值得记录但并非错误（例如："此处继续使用已弃用 API，但无实际影响"）。 |
+不要仅因规则默认值升级；升降级必须在 `why` 写出项目中的具体触发条件。
 
-在两个级别之间犹豫时，**选较低的**那个——严重度通胀会摧毁优先级信号。
+## 完整性语义
 
-## 去重算法（仅本次内）
+- `complete`: 所选作用域、全部选择能力、AI 文件/视角与 verifier 批次全部完成且无截断/跳过。
+- `complete_with_skips`: 执行成功，但存在显式排除或未授权 Lint 等覆盖缺口；`scan_complete=false`。
+- `incomplete`: 任一启用引擎 partial/failed、文件不可读、覆盖率不通过、verifier 批缺失或输出不可解析。
+- `not_applicable`: 作用域无该引擎支持的语言；不是覆盖缺口。
+- `skipped`: 明确配置排除，或 Lint 因未授权构建执行而安全跳过；进入 complete_with_skips。
 
-v3 无状态：去重只发生在**本次确认候选**之间，不与历史比对、不跨扫描合并。
-
-```
-id = sha1(file + ":" + line + ":" + category)
-# 本次内首个命中保留；后续相同 id 计为 duplicate 丢弃
-```
-
-`merge_findings.py` 据此对本次候选去重后**覆盖写** `findings.json`。不读旧文件，不做 open/fixed/reopen/close-missing 等状态迁移。
-
-## 报告渲染（findings.md）
-
-每次运行都从 `findings.json` 生成 `.scan/reports/findings.md`。
-
-结构：
-
-```markdown
-# 扫描结果
-
-> **引擎层级:** **semgrep** ✓ · **detekt** ✓ · **pmd** ✓ · **lint** ✓
-
-**本次发现：** 3 critical · 12 major · 45 minor · 8 info（合计 68）
-
-## Critical
-
-### R-SEC-001 · security/hardcoded-secret
-**FooClient 中硬编码的 API key** — app/src/main/java/.../Foo.java:42
-
-Why: 该 key 会随 release APK 一起分发，并拥有后端写权限。
-
-```java
-private static final String KEY = "abc...";
-```
-
-Repro: 在生成的 apk 里 grep 该字面量。
-Suggestion: 改为通过 BuildConfig 从构建时的密钥源注入。
-
----
-
-## Major
-...
-
-## Minor
-...
-
-## Info
-...
-```
-
-报告头记录本次实际用的引擎（`--engines-used`）。**不含 commit/时间**（v3 去 ledger）。同一严重度内的排序：按 `category` 升序，再按 `file` 升序，再按 `line` 升序。
-
-## 运行生命周期
-
-每次运行是原子的：若中途崩溃，`findings.json` 不会半写（原子写）。v3 无 ledger、无跨扫描状态——重跑即得本次最新结果，可安全重跑。
-
-## 人工维护
-
-v3 无状态：`findings.json` 每次覆盖，手动编辑**不会**跨扫描保留——不要依赖编辑它来标记 `wontfix`。
-
-若某条规则持续产生假阳性，更新 `rules/*.md`（或 `queries/semgrep/`、`rules/ai/`）中对应条目——优化模式或验证清单。**不要**直接禁用规则。
+“0 confirmed”不等于安全。报告用“本次已完成的作用域和引擎中未确认问题”。

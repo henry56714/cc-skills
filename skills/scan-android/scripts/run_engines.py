@@ -15,9 +15,8 @@
     auto（默认）= 运行所有"可用"的已注册引擎
     CSV         = 仅运行指定引擎（如 regex,semgrep），不可用的会被跳过并记录原因
 
-就绪前提（v3 strict）：
-    引擎就绪由 preflight.py 在扫描前强制保证（缺则自动安装，装不上即中断）。
-    因此本编排器不再有"降级"概念——所有必需引擎都应已就绪。
+引擎缺失、超时或执行失败会记录为 incomplete，不丢弃其他引擎已经产出的候选。
+Lint 会执行目标仓库的 Gradle 逻辑，默认禁用，只有显式授权后才运行。
 
 输出 JSON 到 stdout：
     {
@@ -37,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -47,22 +45,19 @@ from adapters.semgrep_adapter import SemgrepAdapter
 from adapters.detekt_adapter import DetektAdapter
 from adapters.pmd_adapter import PMDAdapter
 from adapters.lint_adapter import LintAdapter
-from adapters.mobsf_adapter import MobSFAdapter
-from adapters.flowdroid_adapter import FlowDroidAdapter
+from detect_project import detect_project
 
 # 已注册引擎，按"广度→深度"优先级排列。规则全部来自社区库/引擎自带。
 # - P1: semgrep（社区 registry + 本地补充，含 taint 模式）、detekt（Kotlin）、pmd（Java）、lint（Android）
-# - P4: mobsf / flowdroid（opt-in）
-# 注：跨文件**调用/类型**导航由 tree-sitter（repo_map.py，唯一精确层）提供，见 nav_tools.py，
+# 本 skill 只扫描源码工程，不注册 APK/AAB 引擎。
+# 注：跨文件**调用/类型**导航由 tree-sitter 语法索引提供，见 nav_tools.py，
 #     供 verifier 取证调用链——它不是候选生成引擎，故不在本注册表内。
-#     深层污点/数据流（原 Joern/CodeQL 角色）现由 Semgrep taint + AI 狩猎（rules/ai/）覆盖。
+#     深层污点/数据流由 Semgrep taint + AI 狩猎（rules/ai/）覆盖。
 _REGISTRY: list[EngineAdapter] = [
     SemgrepAdapter(),   # P1: 广度（含社区 registry 包 + taint 模式）
     DetektAdapter(),    # P1: Kotlin 专项
     PMDAdapter(),       # P1: Java 专项（errorprone / 多线程 / 性能）
     LintAdapter(),      # P1: Android Lint
-    MobSFAdapter(),     # P4: opt-in（需 SCAN_ANDROID_ENABLE_MOBSF=1）
-    FlowDroidAdapter(), # P4: opt-in（需 SCAN_ANDROID_ENABLE_FLOWDROID=1）
 ]
 
 # 规则目录相对**本脚本自身**定位（scripts/ 的同级 rules/），与安装位置、cwd 无关。
@@ -73,24 +68,53 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scope-files", required=True)
     ap.add_argument("--rules-dir", default=_DEFAULT_RULES_DIR)
-    ap.add_argument("--max-per-rule", type=int, default=100)
+    ap.add_argument("--max-per-rule", type=int, default=0,
+                    help="单规则候选上限；0=不截断（默认）")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--engines", default="auto", help='auto 或 CSV，如 semgrep,pmd')
+    ap.add_argument(
+        "--allow-build-execution", action="store_true",
+        help="允许执行仓库的 Gradle/Lint 构建逻辑；仅对可信仓库使用",
+    )
     args = ap.parse_args()
 
     repo = Path(args.repo_root).resolve()
-    scope_files = _read_scope(args.scope_files)
+    try:
+        scope_files = _read_scope(args.scope_files, repo)
+    except (OSError, ValueError) as exc:
+        json.dump({"status": "incomplete", "scan_complete": False, "error": str(exc)}, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 2
 
-    opt_in, excluded = _load_engine_config(repo)
+    excluded, config = _load_engine_config(repo)
+    detect_info = detect_project(repo)
     ctx = ScanContext(
         repo=repo,
         scope_files=scope_files,
         rules_dir=Path(args.rules_dir),
         max_per_rule=args.max_per_rule,
-        opt_in_engines=opt_in,
+        detect_info=detect_info,
         excluded_engines=excluded,
+        allow_build_execution=args.allow_build_execution or config.get("allow_gradle_execution", False) is True,
     )
 
+    requested = [s.strip() for s in args.engines.split(",") if s.strip()]
+    known = {a.name for a in _REGISTRY}
+    if args.engines.strip().lower() != "auto" and not requested:
+        json.dump({
+            "status": "incomplete", "scan_complete": False,
+            "error": "--engines 不能为空", "available_engines": sorted(known),
+        }, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 2
+    unknown = [] if args.engines.strip().lower() == "auto" else [n for n in requested if n not in known]
+    if unknown:
+        json.dump({
+            "status": "incomplete", "scan_complete": False,
+            "error": f"未知引擎: {', '.join(unknown)}", "available_engines": sorted(known),
+        }, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 2
     selected = _select_engines(args.engines)
 
     engines_used: list[str] = []
@@ -98,59 +122,116 @@ def main() -> int:
     engine_stats: list[dict] = []
     all_candidates: list[dict] = []
     all_notes: list[dict] = []
+    if config.get("__config_error__"):
+        all_notes.append({
+            "engine": "config",
+            "note": f"配置无效，已使用安全默认值: {config['__config_error__']}",
+        })
     rules_run = 0
     rules_total = 0
 
     for adapter in selected:
         if adapter.name in ctx.excluded_engines:
             engines_skipped.append({"engine": adapter.name, "reason": "excluded_engines 配置排除"})
+            engine_stats.append({"engine": adapter.name, "status": "skipped", "rules_run": 0,
+                                 "candidates": 0, "truncated": 0,
+                                 "reason": "excluded_engines 配置排除"})
+            continue
+        if adapter.name == "lint" and not ctx.allow_build_execution:
+            reason = "安全默认：未获授权，不执行目标仓库 Gradle/Lint 逻辑"
+            engines_skipped.append({"engine": adapter.name, "reason": reason})
+            engine_stats.append({"engine": adapter.name, "status": "skipped", "rules_run": 0,
+                                 "candidates": 0, "truncated": 0, "reason": reason})
             continue
         try:
             available, reason = adapter.is_available(ctx)
         except InstallationError as e:
-            # 引擎已配置为必需，但安装失败 → 中止整次扫描
-            msg = (
-                f"\n{'='*60}\n"
-                f"[scan-android] 必需引擎安装失败，扫描中止\n"
-                f"{'='*60}\n"
-                f"{e}\n"
-                f"{'='*60}\n"
-            )
-            print(msg, file=sys.stderr, flush=True)
-            # 输出带错误标记的 JSON，让调用方可以解析
-            err_out = {
-                "engines_used": engines_used,
-                "engines_skipped": engines_skipped,
-                "rules_run": 0,
-                "rules_total": 0,
-                "candidates": [],
-                "fatal_error": {
-                    "engine": adapter.name,
-                    "message": str(e),
-                },
-            }
-            json.dump(err_out, sys.stdout, ensure_ascii=False, indent=2)
-            sys.stdout.write("\n")
-            sys.exit(1)
+            reason = f"安装失败: {e}"
+            engines_skipped.append({"engine": adapter.name, "reason": reason})
+            engine_stats.append({"engine": adapter.name, "status": "failed", "rules_run": 0,
+                                 "candidates": 0, "truncated": 0, "reason": reason})
+            all_notes.append({"engine": adapter.name, "note": reason})
+            continue
+        except Exception as e:
+            reason = f"可用性检查异常: {type(e).__name__}: {e}"
+            engines_skipped.append({"engine": adapter.name, "reason": reason})
+            engine_stats.append({"engine": adapter.name, "status": "failed", "rules_run": 0,
+                                 "candidates": 0, "truncated": 0, "reason": reason})
+            all_notes.append({"engine": adapter.name, "note": reason})
+            continue
         if not available:
             engines_skipped.append({"engine": adapter.name, "reason": reason})
+            engine_stats.append({"engine": adapter.name, "status": "failed", "rules_run": 0,
+                                 "candidates": 0, "truncated": 0, "reason": reason})
             continue
-        res = adapter.run(ctx)
+        try:
+            res = adapter.run(ctx)
+        except Exception as e:
+            reason = f"引擎执行异常: {type(e).__name__}: {e}"
+            engines_skipped.append({"engine": adapter.name, "reason": reason})
+            engine_stats.append({"engine": adapter.name, "status": "failed", "rules_run": 0,
+                                 "candidates": 0, "truncated": 0, "reason": reason})
+            all_notes.append({"engine": adapter.name, "note": reason})
+            continue
+        raw_candidate_count = len(res.candidates)
+        res.candidates = _dedupe_candidates(res.candidates)
+        if len(res.candidates) != raw_candidate_count:
+            res.notes.append({
+                "engine": adapter.name,
+                "note": f"合并 {raw_candidate_count - len(res.candidates)} 条同引擎同规则同位置的重叠候选",
+            })
         if not res.available:
             engines_skipped.append({"engine": adapter.name, "reason": res.unavailable_reason})
+            engine_stats.append({"engine": adapter.name, "status": "failed", "rules_run": res.rules_run,
+                                 "candidates": len(res.candidates), "truncated": res.truncated,
+                                 "reason": res.unavailable_reason})
+            all_candidates.extend(c.to_dict() for c in res.candidates)
+            all_notes.extend(res.notes)
             continue
-        engines_used.append(adapter.name)
-        engine_stats.append({
+        if res.status in ("complete", "partial"):
+            engines_used.append(adapter.name)
+        stat = {
             "engine": adapter.name,
-            "rules_run": res.rules_run,      # 本次命中的规则种类数
+            "status": res.status,
+            "rules_run": res.rules_run,      # 兼容字段：本次触发的规则种类数
+            "rules_triggered": res.rules_run,
             "candidates": len(res.candidates),
-        })
+            "truncated": res.truncated,
+            "suppressed": res.suppressed,
+        }
+        if res.suppression_summary:
+            stat["suppression_summary"] = res.suppression_summary
+        if res.status in ("partial", "failed"):
+            reason_parts = [
+                str(note.get("note", "")).strip()
+                for note in res.notes if isinstance(note, dict) and note.get("note")
+            ]
+            reason = res.unavailable_reason or "; ".join(reason_parts[-3:])
+            if reason:
+                stat["reason"] = reason[:1000]
+        engine_stats.append(stat)
         all_candidates.extend(c.to_dict() for c in res.candidates)
         all_notes.extend(res.notes)
         rules_run += res.rules_run
-        rules_total = max(rules_total, res.rules_total)
+        # 各引擎规则命名空间彼此独立，汇总应求和；取最大值会低报覆盖量。
+        rules_total += res.rules_total
 
+    incomplete = sorted(
+        str(s.get("engine")) for s in engine_stats
+        if s.get("status") in ("partial", "failed")
+    )
+    coverage_gaps = [
+        {"engine": s.get("engine"), "reason": s.get("reason", "skipped")}
+        for s in engine_stats if s.get("status") == "skipped"
+    ]
+    overall_status = _overall_status(engine_stats)
     out = {
+        "status": overall_status,
+        "scan_complete": overall_status == "complete",
+        "configured_complete": not incomplete,
+        "coverage_complete": not incomplete and not coverage_gaps,
+        "incomplete_engines": incomplete,
+        "coverage_gaps": coverage_gaps,
         "engines_used": engines_used,
         "engine_stats": engine_stats,
         "engines_skipped": engines_skipped,
@@ -173,34 +254,89 @@ def _select_engines(spec: str) -> list[EngineAdapter]:
     return [by_name[n] for n in wanted if n in by_name]
 
 
-def _read_scope(path: str) -> list[str]:
-    with open(path, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip()]
+def _overall_status(engine_stats: list[dict]) -> str:
+    statuses = {str(stat.get("status", "complete")) for stat in engine_stats}
+    if statuses & {"partial", "failed"}:
+        return "incomplete"
+    if "skipped" in statuses:
+        return "complete_with_skips"
+    return "complete"
 
 
-def _load_engine_config(repo: Path) -> tuple[list[str], list[str]]:
-    """从 .scan/config.json 读取 opt_in_engines / excluded_engines，与环境变量取并集。
+def _dedupe_candidates(candidates: list) -> list:
+    """合并同引擎、同规则、同位置的重叠匹配，保留证据更丰富者。
 
-    返回 (opt_in_engines, excluded_engines)。
-    excluded_engines 优先级高于 opt_in_engines：同时出现时引擎被排除。
+    rule_id 是 key 的一部分，因此同一行的不同根因不会被误删。
     """
+    best: dict[tuple, object] = {}
+
+    def score(candidate) -> int:
+        obj = candidate.to_dict()
+        return (
+            len(str(obj.get("snippet", "")))
+            + len(str(obj.get("message", "")))
+            + 4 * len(json.dumps(obj.get("dataflow_path", []), ensure_ascii=False))
+            + int(obj.get("end_line", obj.get("line", 0)))
+        )
+
+    for candidate in candidates:
+        key = (
+            candidate.engine,
+            candidate.rule_id,
+            candidate.file,
+            int(candidate.line),
+            candidate.category,
+        )
+        if key not in best or score(candidate) > score(best[key]):
+            best[key] = candidate
+    return list(best.values())
+
+
+def _read_scope(path: str, repo: Path) -> list[str]:
+    repo = repo.resolve()
+    seen: set[str] = set()
+    result: list[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            rel = raw.strip().replace("\\", "/")
+            if not rel or rel.startswith("#"):
+                continue
+            candidate = Path(rel)
+            if candidate.is_absolute():
+                raise ValueError(f"作用域路径必须是仓库相对路径: {rel}")
+            resolved = (repo / candidate).resolve()
+            try:
+                normalized = resolved.relative_to(repo).as_posix()
+            except ValueError as exc:
+                raise ValueError(f"作用域路径越出仓库: {rel}") from exc
+            if not resolved.is_file():
+                raise ValueError(f"作用域文件不存在或不可读: {rel}")
+            if normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+    return result
+
+
+def _load_engine_config(repo: Path) -> tuple[list[str], dict]:
+    """从 .scan/config.json 读取 excluded_engines 与其余配置。"""
     cfg: dict = {}
     config_path = repo / ".scan" / "config.json"
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            pass
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                cfg = loaded
+            else:
+                cfg = {"__config_error__": "top-level JSON must be an object"}
+        except Exception as exc:
+            cfg = {"__config_error__": str(exc)}
 
-    from_config_opt_in = [e.strip() for e in cfg.get("opt_in_engines", []) if e.strip()]
-    from_config_excluded = [e.strip() for e in cfg.get("excluded_engines", []) if e.strip()]
-
-    env_map = {
-        "SCAN_ANDROID_ENABLE_MOBSF": "mobsf",
-        "SCAN_ANDROID_ENABLE_FLOWDROID": "flowdroid",
-    }
-    from_env_opt_in = [name for var, name in env_map.items() if os.environ.get(var)]
+    raw_excluded = cfg.get("excluded_engines", [])
+    from_config_excluded = (
+        [str(e).strip() for e in raw_excluded if str(e).strip()]
+        if isinstance(raw_excluded, list) else []
+    )
 
     def _dedup(items: list[str]) -> list[str]:
         seen: set[str] = set()
@@ -211,7 +347,7 @@ def _load_engine_config(repo: Path) -> tuple[list[str], list[str]]:
                 result.append(e)
         return result
 
-    return _dedup(from_config_opt_in + from_env_opt_in), _dedup(from_config_excluded)
+    return _dedup(from_config_excluded), cfg
 
 
 if __name__ == "__main__":

@@ -72,11 +72,14 @@ class LintAdapter(EngineAdapter):
     name = "lint"
 
     def is_available(self, ctx: ScanContext) -> tuple[bool, str]:
+        if not ctx.allow_build_execution:
+            return False, (
+                "Lint 需要执行仓库 Gradle 构建逻辑；默认禁用。确认仓库可信后传 "
+                "--allow-build-execution 或配置 allow_gradle_execution=true"
+            )
         gradlew = ctx.repo / "gradlew"
         if not gradlew.exists():
             return False, f"gradlew 未找到（{gradlew}），Android Lint 不可用"
-        if not os.access(gradlew, os.X_OK):
-            gradlew.chmod(gradlew.stat().st_mode | 0o111)
         return True, ""
 
     def run(self, ctx: ScanContext) -> AdapterResult:
@@ -89,39 +92,61 @@ class LintAdapter(EngineAdapter):
 
         lint_tasks = ctx.detect_info.get("suggested_lint_tasks", ["lintDebug", "lint"])
         ran_task = None
+        xml_reports: list[Path] = []
+        task_succeeded_without_report = False
 
         for task in lint_tasks:
-            cmd = [str(gradlew), task, "--no-daemon", "--continue"]
+            launcher = [str(gradlew)] if os.access(gradlew, os.X_OK) else ["bash", str(gradlew)]
+            cmd = launcher + [task, "--no-daemon", "--continue"]
+            before = {
+                p.resolve(): p.stat().st_mtime_ns
+                for p in ctx.repo.rglob("lint-results*.xml")
+            }
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
                     timeout=600,
                     cwd=str(ctx.repo),
                 )
-                # Gradle 失败码非 0 但可能仍写出了报告
-                ran_task = task
-                break
+                reports = list(ctx.repo.rglob("lint-results*.xml"))
+                fresh = [
+                    p for p in reports
+                    if p.resolve() not in before or p.stat().st_mtime_ns > before[p.resolve()]
+                ]
+                # Lint 发现问题时可能非零退出，但会写出报告；无新报告的失败 task 继续尝试。
+                if fresh:
+                    ran_task = task
+                    xml_reports = fresh
+                    break
+                if proc.returncode == 0:
+                    task_succeeded_without_report = True
+                    result.notes.append({
+                        "engine": self.name,
+                        "note": f"lint 任务 {task} 成功但未产生新的 XML 报告，继续尝试",
+                    })
+                    continue
+                result.notes.append({
+                    "engine": self.name,
+                    "note": f"lint 任务 {task} 失败且未产生报告: {(proc.stderr or proc.stdout)[-300:]}",
+                })
             except subprocess.TimeoutExpired:
+                result.status = "partial"
                 result.notes.append({"engine": self.name, "note": f"lint 任务 {task} 超时（600s）"})
                 continue
             except Exception as e:
+                result.status = "partial"
                 result.notes.append({"engine": self.name, "note": f"lint 任务 {task} 失败: {e}"})
                 continue
 
         if ran_task is None:
             result.available = False
-            result.unavailable_reason = "所有 lint Gradle 任务均失败"
-            return result
-
-        # 寻找 lint 报告文件
-        xml_reports = list(ctx.repo.rglob("lint-results*.xml"))
-        if not xml_reports:
-            # 有些版本的 lint 输出到不同路径
-            xml_reports = list(ctx.repo.glob("**/reports/lint/lint-results*.xml"))
-        if not xml_reports:
-            result.notes.append({"engine": self.name, "note": "未找到 lint XML 报告"})
+            result.status = "failed"
+            result.unavailable_reason = (
+                "Lint 任务完成但未产生新的 XML 报告"
+                if task_succeeded_without_report else "所有 lint Gradle 任务均失败"
+            )
             return result
 
         scope_set = set(ctx.scope_files)
@@ -134,6 +159,7 @@ class LintAdapter(EngineAdapter):
                 all_candidates.extend(candidates)
                 rules_seen.update(issues)
             except Exception as e:
+                result.status = "partial"
                 result.notes.append({
                     "engine": self.name,
                     "note": f"lint 报告 {report_path.name} 解析失败: {e}",
@@ -151,6 +177,7 @@ def _parse_lint_xml(
     repo: Path,
     scope_set: set[str],
 ) -> tuple[list[Candidate], set[str]]:
+    repo = repo.resolve()
     tree = ET.parse(report_path)
     root = tree.getroot()
     candidates: list[Candidate] = []
@@ -165,9 +192,9 @@ def _parse_lint_xml(
             (f"R-LT-{issue_id}", f"lint/{issue_id.lower()}", _LINT_SEV_MAP.get(issue.get("severity", "Warning"), "minor")),
         )
         if issue_id not in _LINT_RULE_MAP:
-            # 未映射的 lint issue：只在 critical/error 级别记录
+            # 未映射的 Warning 也必须进入候选池；映射缺失不能变成静默漏报。
             lint_sev = issue.get("severity", "Warning")
-            if lint_sev not in ("Fatal", "Error"):
+            if lint_sev == "Ignore":
                 continue
             severity = _LINT_SEV_MAP.get(lint_sev, "minor")
 

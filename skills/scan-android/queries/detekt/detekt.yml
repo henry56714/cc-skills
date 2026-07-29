@@ -10,7 +10,7 @@ build:
     style: 1
 
 config:
-  validation: false
+  validation: true
   warningsAsErrors: false
   excludes: ""
 
@@ -57,8 +57,6 @@ exceptions:
     allowedExceptionNameRegex: "_|(ignore|expected).*"
   TooGenericExceptionThrown:
     active: false
-  InstanceOfChain:
-    active: false
 
 # ============================================================
 # R-DK-003: Kotlin !! / 不安全操作
@@ -82,17 +80,11 @@ potential-bugs:
     active: true
   UnreachableCode:
     active: true
-  RedundantElseInWhen:
-    active: true
-  MissingWhenCase:
-    active: true
   ElseCaseInsteadOfExhaustiveWhen:
     active: false
   CastToNullableType:
     active: true
   DontDowncastCollectionTypes:
-    active: false
-  AvoidReferenceToMutableProperty:
     active: false
   ImplicitDefaultLocale:
     active: false
@@ -134,8 +126,6 @@ style:
   active: true
   ForbiddenComment:
     active: false
-  HardCodedStringLiteral:
-    active: false
   MagicNumber:
     active: false
   MaxLineLength:
@@ -149,8 +139,6 @@ style:
   ReturnCount:
     active: false
   ThrowsCount:
-    active: false
-  TooManyFunctions:
     active: false
   UnusedImports:
     active: false
@@ -181,8 +169,6 @@ style:
   FunctionOnlyReturningConstant:
     active: false
   LoopWithTooManyJumpStatements:
-    active: false
-  MandatoryBracesIfStatements:
     active: false
   MandatoryBracesLoops:
     active: false
@@ -250,10 +236,6 @@ style:
     active: false
   VarCouldBeVal:
     active: false
-  VarCouldBeValProperty:
-    active: false
-  WhenWithOnlyElse:
-    active: false
 
 # 关闭 complexity 规则（噪音大）
 complexity:
@@ -267,10 +249,10 @@ naming:
 performance:
   active: false
 
-# 关闭 empty-blocks 规则（用我们的 exceptions.SwallowedException 代替）
+# 空 catch 是高价值稳定性问题；只启用该项。
 empty-blocks:
-  active: false
-
-# 关闭格式化规则
-formatting:
-  active: false
+  active: true
+  EmptyCatchBlock:
+    active: true
+    excludes: ["**/test/**", "**/androidTest/**"]
+    allowedExceptionNameRegex: "_|(ignore|expected).*"

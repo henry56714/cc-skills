@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-自动探测一个 Android 仓库的结构，输出 scan-android 工作流所需的元信息。
-让 skill 不再硬编码任何特定项目的模块名 / flavor / lint 任务，从而能扫描任意 APK 工程。
+自动探测一个 Android 源码仓库的结构，输出 scan-android 工作流所需的元信息。
+让 skill 不再硬编码任何特定项目的模块名 / flavor / lint 任务。
 
 用法:
     detect_project.py [--repo-root DIR] [--config PATH]
@@ -23,7 +23,7 @@
       "suggested_lint_tasks": ["lintDebug", "lint"],
       "default_excludes": [...],            # 通用排除
       "extra_excludes": [...],              # 来自 config 的项目级额外排除
-      "source_extensions": [".java", ".kt", ".xml", ".aidl"],
+      "source_extensions": [".java", ".kt", ".kts", ".xml", ...],
       "project_context": "",               # 注入 verifier 的项目背景（来自 config，可空）
       "language": "zh",                    # 生成文本字段的语言："zh" 或 "en"
       "config_path": ".scan/config.json",  # 若存在
@@ -46,13 +46,33 @@ from pathlib import Path
 DEFAULT_EXCLUDES = [
     "**/build/**",
     "**/generated/**",
+    "**/.cxx/**",
+    "**/.externalNativeBuild/**",
+    "**/CMakeFiles/**",
     "**/test/**",
     "**/androidTest/**",
     "**/.gradle/**",
     "**/.idea/**",
+    "**/.vscode/**",
+    "**/.scan/**",
+    "**/.claude/**",
+    "**/.codex/**",
+    "local.properties",
+    "**/local.properties",
+    "docs/**",
+    "**/docs/**",
 ]
 
-SOURCE_EXTENSIONS = [".java", ".kt", ".xml", ".aidl"]
+DOCUMENTATION_EXCLUDES = {"docs/**", "**/docs/**"}
+
+# 不只收 Java/Kotlin：Android 漏洞经常横跨构建脚本、资源配置、Web 资源和 JNI。
+# 各引擎仍可自行挑选支持的语言；作用域层不能先把这些文件丢掉。
+SOURCE_EXTENSIONS = [
+    ".java", ".kt", ".kts", ".xml", ".aidl",
+    ".gradle", ".properties", ".toml", ".pro", ".cfg",
+    ".json", ".js", ".ts", ".dart",
+    ".c", ".cc", ".cpp", ".h", ".hpp",
+]
 
 # settings.gradle(.kts) 里的 include 声明，覆盖 Groovy / Kotlin DSL 两种写法：
 #   include ':app'
@@ -72,43 +92,71 @@ def main() -> int:
     args = ap.parse_args()
 
     repo = Path(args.repo_root).resolve()
-    notes: list[str] = []
+    out = detect_project(repo, args.config)
+    json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    return 0
 
+
+def detect_project(repo: Path, config_path: str = ".scan/config.json") -> dict:
+    """返回工程探测结果，供 CLI、scope 和 engine 编排共同复用。"""
+    repo = repo.resolve()
+    notes: list[str] = []
     modules = _detect_modules(repo, notes)
     flavors = _detect_flavors(repo, modules)
     suggested = _suggest_lint_tasks(flavors)
 
-    config = _load_config(repo / args.config)
-    if config:
-        notes.append(f"loaded project config: {args.config}")
+    config_file = repo / config_path
+    config, config_error = _load_config_checked(config_file)
+    if config_error:
+        notes.append(f"invalid project config {config_path}: {config_error}; using safe defaults")
+    elif config_file.exists():
+        notes.append(f"loaded project config: {config_path}")
+    configured_modules = _string_list(config.get("modules"))
+    configured_lint_tasks = _string_list(config.get("lint_tasks"))
+    if configured_modules:
+        modules = configured_modules
+    elif config.get("modules") not in (None, []):
+        notes.append("ignored invalid config.modules (expected array of strings)")
+    if configured_lint_tasks:
+        suggested = configured_lint_tasks
+    elif config.get("lint_tasks") not in (None, []):
+        notes.append("ignored invalid config.lint_tasks (expected array of strings)")
 
-    # config 覆盖 / 补充
-    if config.get("modules"):
-        modules = list(config["modules"])
-    extra_excludes = list(config.get("extra_excludes", []))
-    project_context = config.get("project_context", "")
-    if config.get("lint_tasks"):
-        suggested = list(config["lint_tasks"])
-    language = _detect_language(config)
+    default_excludes = list(DEFAULT_EXCLUDES)
+    if config.get("include_documentation") is True:
+        default_excludes = [p for p in default_excludes if p not in DOCUMENTATION_EXCLUDES]
+        notes.append("documentation source explicitly included by config")
 
-    out = {
+    return {
         "repo_root": str(repo),
-        "is_git": (repo / ".git").exists(),
+        # 支持普通 clone、git worktree（.git 是文件）以及从子目录指定的仓库根。
+        "is_git": _is_git_repo(repo),
         "modules": modules,
         "has_flavors": bool(flavors),
         "flavors": flavors,
         "suggested_lint_tasks": suggested,
-        "default_excludes": DEFAULT_EXCLUDES,
-        "extra_excludes": extra_excludes,
+        "default_excludes": default_excludes,
+        "extra_excludes": _string_list(config.get("extra_excludes")),
         "source_extensions": SOURCE_EXTENSIONS,
-        "project_context": project_context,
-        "language": language,
-        "config_path": args.config if config else None,
+        "project_context": str(config.get("project_context", "")),
+        "language": _detect_language(config),
+        "config_path": config_path if config_file.exists() else None,
+        "config": config,
         "notes": notes,
     }
-    json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
-    return 0
+
+
+def _is_git_repo(repo: Path) -> bool:
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return proc.returncode == 0 and proc.stdout.strip() == "true"
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _detect_modules(repo: Path, notes: list[str]) -> list[str]:
@@ -212,7 +260,7 @@ def _detect_language(config: dict) -> str:
     4. 默认 "zh"
     """
     cfg_lang = config.get("language", "")
-    if cfg_lang:
+    if isinstance(cfg_lang, str) and cfg_lang:
         return "zh" if cfg_lang.lower().startswith("zh") else "en"
 
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
@@ -236,14 +284,26 @@ def _detect_language(config: dict) -> str:
 
 
 def _load_config(path: Path) -> dict:
+    return _load_config_checked(path)[0]
+
+
+def _load_config_checked(path: Path) -> tuple[dict, str]:
     if not path.exists():
-        return {}
+        return {}, ""
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+        if not isinstance(data, dict):
+            return {}, "top-level JSON must be an object"
+        return data, ""
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, str(exc)
+
+
+def _string_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 if __name__ == "__main__":

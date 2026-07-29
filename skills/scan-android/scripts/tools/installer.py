@@ -9,8 +9,8 @@ scan-android v2 引擎自动检测与安装。
 目录布局:
   ~/.scan-android/
     venv/           Python 虚拟环境（semgrep 等 pip 包，隔离于系统/conda）
-    repomap-venv/   tree-sitter 精确层 venv（tree-sitter + tree-sitter-language-pack，隔离）
-    tools/          JVM 工具二进制（Detekt / PMD / FlowDroid）
+    repomap-venv/   tree-sitter 语法索引 venv（tree-sitter + tree-sitter-language-pack，隔离）
+    tools/          JVM 工具二进制（Detekt / PMD）
 
 可通过环境变量覆盖路径:
   SCAN_ANDROID_VENV_DIR   虚拟环境根（默认 ~/.scan-android/venv）
@@ -45,7 +45,7 @@ VENV_DIR = Path(os.environ.get(
     Path.home() / ".scan-android" / "venv",
 ))
 
-# tree-sitter 精确层专属 venv（与 semgrep venv 隔离，避免依赖冲突）
+# tree-sitter 语法索引专属 venv（与 semgrep venv 隔离，避免依赖冲突）
 REPOMAP_VENV_DIR = Path(os.environ.get(
     "SCAN_ANDROID_REPOMAP_VENV",
     Path.home() / ".scan-android" / "repomap-venv",
@@ -56,8 +56,10 @@ _SKILL_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # 固定版本（定期更新以获取安全补丁）
 _DETEKT_VERSION = "1.23.7"
-_FLOWDROID_VERSION = "2.14.1"
 _PMD_VERSION = "7.10.0"
+_SEMGREP_VERSION = "1.165.0"
+_TREE_SITTER_VERSION = "0.26.0"
+_TREE_SITTER_LANGUAGE_PACK_VERSION = "1.13.3"
 
 
 # ---------------------------------------------------------------------------
@@ -72,13 +74,17 @@ def ensure_venv() -> Path:
     venv 只用于 pip 包（目前仅 semgrep）；JVM 工具走 tools/ 目录。
     """
     python_bin = _venv_python()
-    if Path(python_bin).exists():
+    if Path(python_bin).exists() and _python_version_ok(python_bin, (3, 10)):
         return VENV_DIR
     _print(f"[installer] 创建虚拟环境: {VENV_DIR}")
-    import venv as _venv
+    bootstrap = _find_python((3, 10))
+    if not bootstrap:
+        raise RuntimeError("Semgrep 需要 Python 3.10+；未找到可用于创建隔离 venv 的解释器")
     VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-    # clear=False：若目录已存在但不完整，重建
-    _venv.create(str(VENV_DIR), with_pip=True, clear=True)
+    subprocess.check_call(
+        [bootstrap, "-m", "venv", "--clear", str(VENV_DIR)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
     # 升级 pip 本身
     subprocess.check_call(
         [python_bin, "-m", "pip", "install", "--upgrade", "pip",
@@ -119,6 +125,30 @@ def _venv_python() -> str:
     return str(VENV_DIR / "bin" / "python")
 
 
+def _python_version_ok(executable: str, minimum: tuple[int, int]) -> bool:
+    try:
+        proc = subprocess.run(
+            [executable, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+            capture_output=True, text=True, timeout=10,
+        )
+        major, minor = (int(x) for x in proc.stdout.strip().split(".", 1))
+        return proc.returncode == 0 and (major, minor) >= minimum
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _find_python(minimum: tuple[int, int]) -> str | None:
+    candidates = [sys.executable]
+    candidates.extend(
+        p for name in ("python3.13", "python3.12", "python3.11", "python3.10", "python3")
+        for p in [shutil.which(name)] if p
+    )
+    for executable in dict.fromkeys(candidates):
+        if executable and _python_version_ok(executable, minimum):
+            return executable
+    return None
+
+
 # ---------------------------------------------------------------------------
 # pip 包
 # ---------------------------------------------------------------------------
@@ -127,22 +157,12 @@ def _venv_python() -> str:
 def ensure_semgrep() -> tuple[str, bool]:
     """确保 semgrep 在 venv 中可用，返回 (executable_path, was_just_installed)。
 
-    查找顺序:
-      1. ~/.scan-android/venv/bin/semgrep  （管理的 venv，优先）
-      2. shutil.which("semgrep")           （系统/conda 已有安装，兼容使用）
+    只使用 skill 管理且版本固定的 venv，避免 PATH 中同名工具造成结果漂移。
     首次安装时通过 pip 写入 venv，不污染系统环境。
     """
-    # 1. venv 内已安装
     venv_semgrep = venv_bin("semgrep")
-    if Path(venv_semgrep).exists():
+    if Path(venv_semgrep).exists() and _venv_package_version("semgrep") == _SEMGREP_VERSION:
         return venv_semgrep, False
-    # 2. 系统 PATH 已有（使用但不移动；后续会在 venv 内补装）
-    system_semgrep = shutil.which("semgrep")
-    if system_semgrep:
-        # 在 venv 内也安装一份以备 venv 优先路径生效
-        _install_semgrep_to_venv()
-        return venv_bin("semgrep") if Path(venv_bin("semgrep")).exists() else system_semgrep, False
-    # 3. 都没有：创建 venv 并安装
     _install_semgrep_to_venv()
     path = venv_bin("semgrep")
     return path, True
@@ -152,11 +172,27 @@ def _install_semgrep_to_venv() -> None:
     ensure_venv()
     _print("[installer] 在虚拟环境中安装 semgrep（pip）...")
     subprocess.check_call(
-        [_venv_python(), "-m", "pip", "install", "semgrep",
+        [_venv_python(), "-m", "pip", "install", f"semgrep=={_SEMGREP_VERSION}",
          "--quiet", "--disable-pip-version-check"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
+    if (
+        not Path(venv_bin("semgrep")).exists()
+        or _venv_package_version("semgrep") != _SEMGREP_VERSION
+    ):
+        raise RuntimeError(f"Semgrep 安装后版本校验失败（需要 {_SEMGREP_VERSION}）")
+
+
+def _venv_package_version(package: str) -> str:
+    try:
+        proc = subprocess.run(
+            [_venv_python(), "-c", f"import importlib.metadata as m; print(m.version({package!r}))"],
+            capture_output=True, text=True, timeout=20,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def _repomap_venv_python() -> str:
@@ -166,32 +202,46 @@ def _repomap_venv_python() -> str:
 
 
 def ensure_repomap_venv() -> Path:
-    """确保 tree-sitter 精确层的独立 venv 就绪（含 tree-sitter + tree-sitter-language-pack）。
+    """确保 tree-sitter 语法索引的独立 venv 就绪（含 tree-sitter + tree-sitter-language-pack）。
 
     与 semgrep venv 隔离，避免依赖冲突。**调用方须把失败视为非阻塞**——缺失时
     repo_map.py 会降级、nav_tools.py 会回退纯标准库 source-nav。返回 venv 根路径。
     """
     py = _repomap_venv_python()
-    if not Path(py).exists():
+    if not Path(py).exists() or not _python_version_ok(py, (3, 10)):
         _print(f"[installer] 创建 tree-sitter venv: {REPOMAP_VENV_DIR}")
-        import venv as _venv
+        bootstrap = _find_python((3, 10))
+        if not bootstrap:
+            raise RuntimeError("tree-sitter 隔离环境需要 Python 3.10+，但未找到可用解释器")
         REPOMAP_VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-        _venv.create(str(REPOMAP_VENV_DIR), with_pip=True, clear=True)
+        subprocess.check_call(
+            [bootstrap, "-m", "venv", "--clear", str(REPOMAP_VENV_DIR)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
         subprocess.check_call(
             [py, "-m", "pip", "install", "--upgrade", "pip",
              "--quiet", "--disable-pip-version-check"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     # 校验/补装包
-    check = subprocess.run([py, "-c", "import tree_sitter, tree_sitter_language_pack"],
-                           capture_output=True)
+    version_check = (
+        "import importlib.metadata as m, tree_sitter, tree_sitter_language_pack; "
+        f"assert m.version('tree-sitter') == {_TREE_SITTER_VERSION!r}; "
+        f"assert m.version('tree-sitter-language-pack') == {_TREE_SITTER_LANGUAGE_PACK_VERSION!r}"
+    )
+    check = subprocess.run([py, "-c", version_check], capture_output=True)
     if check.returncode != 0:
         _print("[installer] 安装 tree-sitter + tree-sitter-language-pack（pip）...")
         subprocess.check_call(
-            [py, "-m", "pip", "install", "tree-sitter", "tree-sitter-language-pack",
+            [py, "-m", "pip", "install",
+             f"tree-sitter=={_TREE_SITTER_VERSION}",
+             f"tree-sitter-language-pack=={_TREE_SITTER_LANGUAGE_PACK_VERSION}",
              "--quiet", "--disable-pip-version-check"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
+        check = subprocess.run([py, "-c", version_check], capture_output=True)
+        if check.returncode != 0:
+            raise RuntimeError("tree-sitter 隔离环境安装后版本校验失败")
     return REPOMAP_VENV_DIR
 
 
@@ -202,8 +252,10 @@ def ensure_repomap_venv() -> Path:
 
 def ensure_detekt() -> tuple[str, bool]:
     jar = TOOLS_DIR / "detekt" / f"detekt-cli-{_DETEKT_VERSION}-all.jar"
-    if jar.exists():
+    if jar.exists() and zipfile.is_zipfile(jar):
         return str(jar), False
+    if jar.exists():
+        jar.unlink()
     _print(f"[installer] 下载 Detekt {_DETEKT_VERSION} (~64 MB)...")
     url = (
         f"https://github.com/detekt/detekt/releases/download/v{_DETEKT_VERSION}/"
@@ -211,17 +263,16 @@ def ensure_detekt() -> tuple[str, bool]:
     )
     jar.parent.mkdir(parents=True, exist_ok=True)
     _download(url, jar)
+    if not zipfile.is_zipfile(jar):
+        jar.unlink(missing_ok=True)
+        raise RuntimeError("Detekt 下载内容不是有效 JAR")
     return str(jar), True
 
 
 def find_pmd() -> str | None:
-    """返回可用的 pmd 可执行路径（PATH 或本地缓存），找不到返回 None。"""
-    existing = shutil.which("pmd")
-    if existing:
-        return existing
-    pmd_root = TOOLS_DIR / "pmd"
-    cached = sorted(pmd_root.glob("pmd-bin-*/bin/pmd")) if pmd_root.exists() else []
-    return str(cached[-1]) if cached else None
+    """返回 skill 管理的固定版本 PMD；不接受 PATH 或其他缓存版本。"""
+    expected = TOOLS_DIR / "pmd" / f"pmd-bin-{_PMD_VERSION}" / "bin" / "pmd"
+    return str(expected) if expected.exists() else None
 
 
 def ensure_pmd() -> tuple[str, bool]:
@@ -244,7 +295,7 @@ def ensure_pmd() -> tuple[str, bool]:
     _download(url, dest_zip)
     _print("[installer] 解压 PMD...")
     with zipfile.ZipFile(dest_zip) as zf:
-        zf.extractall(pmd_root)
+        _safe_extract_zip(zf, pmd_root)
     dest_zip.unlink(missing_ok=True)
     binp = pmd_root / f"pmd-bin-{version}" / "bin" / "pmd"
     if not binp.exists():
@@ -253,54 +304,8 @@ def ensure_pmd() -> tuple[str, bool]:
     return str(binp), True
 
 
-def _chmod_recursive(path: Path) -> None:
-    """递归赋予目录及其内容用户读写执行权限，用于删除前解除权限锁定。"""
-    try:
-        for p in path.rglob("*"):
-            try:
-                p.chmod(p.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-            except OSError:
-                pass
-        path.chmod(path.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-    except OSError:
-        pass
-
-
-def ensure_flowdroid() -> tuple[str, bool]:
-    jar = TOOLS_DIR / "flowdroid" / f"flowdroid-{_FLOWDROID_VERSION}.jar"
-    if jar.exists():
-        return str(jar), False
-    _print(f"[installer] 下载 FlowDroid {_FLOWDROID_VERSION}...")
-    group_path = "de/fraunhofer/sit/sse/flowdroid/soot-infoflow-cmd"
-    artifact = "soot-infoflow-cmd"
-    url = (
-        f"https://repo1.maven.org/maven2/{group_path}/{_FLOWDROID_VERSION}/"
-        f"{artifact}-{_FLOWDROID_VERSION}-jar-with-dependencies.jar"
-    )
-    jar.parent.mkdir(parents=True, exist_ok=True)
-    _download(url, jar)
-    return str(jar), True
-
-
-def ensure_adb() -> tuple[str, bool]:
-    """检查 ADB 可用性。从不自动安装（属于 Android SDK，需用户管理）。"""
-    existing = shutil.which("adb")
-    if existing:
-        return existing, False
-    candidates = [
-        Path.home() / "Library" / "Android" / "sdk" / "platform-tools" / "adb",
-        Path("/usr/local/bin/adb"),
-        Path(os.environ.get("ANDROID_HOME", "")) / "platform-tools" / "adb",
-        Path(os.environ.get("ANDROID_SDK_ROOT", "")) / "platform-tools" / "adb",
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c), False
-    return "", False
-
-
 def check_java() -> tuple[bool, str]:
-    """检查 Java 是否可用（Detekt / Lint / FlowDroid 需要 Java 11+）。"""
+    """检查 Java 是否可用（Detekt / PMD / Lint 需要 Java 11+）。"""
     java = shutil.which("java")
     if not java:
         return False, "java 未找到，请安装 Java 11+（brew install openjdk@21）"
@@ -311,6 +316,18 @@ def check_java() -> tuple[bool, str]:
         return True, out.strip().split("\n")[0]
     except Exception as e:
         return False, str(e)
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, destination: Path) -> None:
+    """Reject absolute and traversal entries before extracting downloaded tools."""
+    root = destination.resolve()
+    for member in zf.infolist():
+        target = (root / member.filename).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(f"ZIP 含越界路径，拒绝解压: {member.filename}") from exc
+    zf.extractall(root)
 
 
 # ---------------------------------------------------------------------------
@@ -431,9 +448,8 @@ def _cli_main() -> int:
   semgrep     semgrep（安装到 venv）
   detekt      Detekt Kotlin 分析器 JAR
   pmd         PMD Java 分析器（~40 MB）
-  repomap     tree-sitter 精确导航层（tree-sitter + language-pack 到独立 venv）
-  flowdroid   FlowDroid JAR（opt-in）
-  all         上述全部（flowdroid 除外）
+  repomap     tree-sitter 语法导航层（tree-sitter + language-pack 到独立 venv）
+  all         上述全部
 """,
     )
     ap.add_argument("--install", metavar="TOOL",
@@ -453,7 +469,6 @@ def _cli_main() -> int:
         "detekt": ensure_detekt,
         "pmd": ensure_pmd,
         "repomap": lambda: (str(ensure_repomap_venv()), False),
-        "flowdroid": ensure_flowdroid,
     }
     if tool == "all":
         for name in ["venv", "semgrep", "detekt", "pmd", "repomap"]:
@@ -487,7 +502,6 @@ def _print_status() -> None:
         ("repomap (tree-sitter venv)", str(REPOMAP_VENV_DIR),
          (REPOMAP_VENV_DIR / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")).exists()),
         ("java", shutil.which("java") or "", bool(shutil.which("java"))),
-        ("adb", shutil.which("adb") or "", bool(shutil.which("adb"))),
     ]
     for name, path, ok in items:
         icon = "✅" if ok else "❌"

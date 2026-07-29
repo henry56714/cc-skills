@@ -29,7 +29,7 @@
 | `R-AI-012` | **导出 Binder / AIDL / ContentProvider 缺调用方校验**：`.Stub` 实现的**每个对外方法**是否 `Binder.getCallingUid()/getCallingPid()` 校验权限/签名/白名单？即使平台签名，导出 Binder 仍可被任意 app 调用——盲信调用方=漏洞。 |
 | `R-AI-013` | **Intent 重定向**：从收到的 Intent 里取出嵌套 Intent（`getParcelableExtra`）直接 `startActivity`/转发，未校验目标组件——可被诱导访问内部组件。 |
 
-## WebView / 混合应用（仅当工程用到 WebView 时过这一组）
+## WebView（仅当源码用到 WebView 时过这一组）
 
 > **门控：** 本组仅对含 WebView 的文件适用（`build_hunt_batches.py` 的 `tech_present` 含 `webview` 才过）。
 > **分工：** 浅层单行配置（`setJavaScriptEnabled` / `setAllowFileAccess*` / `addJavascriptInterface` 的**存在性**）已由 semgrep `R-SG-004` 覆盖——这里**只收 semgrep 编不出的跨文件 + 逻辑**：URL 来源是否可控、校验是否可绕、跨 Intent/组件的数据流。
@@ -44,8 +44,35 @@
 | `R-AI-023` | **JS 注入**：`evaluateJavascript(...)` 或 `loadUrl("javascript:" + x)` 的脚本串**用外部数据字符串拼接**（未转义/未走 `addJavascriptInterface` 参数序列化）→ 注入到页面上下文。 |
 | `R-AI-024` | **`onShowFileChooser` 回调 URI 不校验**：`WebChromeClient.onShowFileChooser` → `ValueCallback.onReceiveValue(new Uri[]{ data.getData() })` 用隐式 Intent 取文件且**不校验返回 URI 来源** → 攻击者拦截 Intent、回传受保护文件 URI 被 WebView 读取。 |
 | `R-AI-025` | **旧 API 的 Uri 校验绕过**：域名校验在低 `minSdkVersion` 下失效——`\\@` 反斜杠绕过（API<25，`https://attacker.com\@trusted.com`）、HierarchicalUri 反射使 `getHost()` 与实际加载不一致（API<28）。**结合 `minSdkVersion` 判断校验是否在目标版本可被绕**。 |
+| `R-AI-048` | **WebMessage/桥接边界错误**：`WebMessagePort`、`postWebMessage`、`addWebMessageListener` 或 JS bridge 的 origin allowlist 过宽/可绕，或受信页面能被重定向到不受信 origin 后仍保留高权限桥。 |
 
 > **WebView 组 FP 提示：** ① `loadUrl` 实参是**硬编码常量/`BuildConfig` 注入**（来源不可控）= FP；② 校验同时核对了 `scheme` 白名单（仅 `https`）+ host = 已防护；③ `setJavaScriptEnabled(false)` 或根本未开 JS 时，多数 XSS 类不成立；④ `WebViewAssetLoader`/`androidx.webkit` 受控加载本地资源 = 合理。**条件触发：URL/baseUrl/scheme 的可控性必须用 `nav_tools.py --action trace-origin` 追到源头**（Intent/网络=真，常量=FP），同 §通用 FP 提示。
+
+## Android 平台、IPC 与版本语义
+
+| id | 狩猎线索 |
+|---|---|
+| `R-AI-026` | **构建变体/SDK 语义错位**：检查 source manifest、flavor/buildType overlay、`minSdk/targetSdk/compileSdk` 条件和 `BuildConfig` 分支是否在 release 变体形成更宽暴露面。无法取得 merged manifest 时只能报待复核线索。 |
+| `R-AI-027` | **权限与 URI grant 组合漏洞**：Provider/FileProvider 的 path 配置过宽；`grantUriPermissions`、`FLAG_GRANT_*_URI_PERMISSION`、ClipData 或 `takePersistableUriPermission` 使非预期调用方长期读取/写入敏感内容。 |
+| `R-AI-028` | **深链/App Link 鉴权缺口**：`VIEW`/自定义 scheme/app link 进入支付、账户、调试等敏感流程；只校验 host 不校验 scheme/path；`autoVerify` 失败仍接受未验证链接；登录后重放旧 deep link 绕过状态机。 |
+| `R-AI-029` | **PendingIntent 身份/可变性误用**：mutable PendingIntent 包含隐式 Intent、未限定 package/component，或 requestCode/flags 复用导致攻击者填充 extra、替换目标或触发错误用户/账户动作。 |
+| `R-AI-030` | **动态 Receiver 暴露**：运行时注册 receiver 未按 API 33+ 指定正确的 exported flag，或注册为 exported 后处理敏感 action 而无 sender permission/UID 校验。 |
+| `R-AI-044` | **Binder 事务/死亡语义**：oneway 调用假定同步结果；未处理 `DeadObjectException`/`linkToDeath`；清空 calling identity 后未在 finally 恢复；大事务导致 `TransactionTooLargeException` 后状态部分提交。 |
+| `R-AI-047` | **任务栈/界面劫持**：异常 `taskAffinity`/launchMode、overlay/tapjacking、敏感页面未防遮挡，或登录/支付页面允许截图、最近任务缩略图泄露敏感信息。 |
+| `R-AI-049` | **通知动作越权**：通知 action/content/delete PendingIntent 可变或复用错误，锁屏上泄露敏感内容，点击 action 未重新校验用户/账户/会话状态。 |
+
+## 存储、隐私、网络与密码学
+
+| id | 狩猎线索 |
+|---|---|
+| `R-AI-031` | **敏感数据旁路泄露**：token、定位、账号、诊断包进入 log、崩溃上报、剪贴板、截图/最近任务、通知或共享外部存储；release/debug 门控是否真实有效。 |
+| `R-AI-032` | **备份/存储域错误**：`allowBackup`/data extraction rules 允许备份凭证；Direct Boot 前把敏感状态放 device-protected storage；credential/device protected 数据迁移后权限或清理不完整。 |
+| `R-AI-033` | **密码学状态机错误**：GCM/CTR nonce 或 IV 重用；随机数可预测；解密前忽略认证失败；密钥版本轮换后旧数据不可恢复或继续用撤销密钥。 |
+| `R-AI-034` | **网络信任配置错配**：debug CA 泄漏到 release、cleartext/domain-config 继承错误、pinning 只覆盖部分 client/host、HostnameVerifier 与重定向/代理组合绕过。 |
+| `R-AI-035` | **归档/下载路径穿越**：ZIP/TAR entry、Content-Disposition、ContentProvider display name 或下载 URL 文件名未做 canonical containment、符号链接和覆盖检查就写入受信目录。 |
+| `R-AI-036` | **解析/反序列化边界**：不可信 XML 开启外部实体；Java/Kotlin 序列化、JSON polymorphic type、Parcelable/Bundle classloader、Intent extras 触发任意类加载或资源耗尽。 |
+| `R-AI-046` | **隐私权限状态机**：运行时权限、AppOps、照片选择器、后台定位、通知权限或 partial media access 的拒绝/撤销/“仅本次”路径未处理，导致越权使用、崩溃或保留超出目的的数据。 |
+| `R-AI-050` | **Keystore/Biometric 认证错配**：密钥未绑定用户认证或认证有效期过长；生物识别成功与实际 CryptoObject/密钥操作脱节；设备凭据降级后仍执行高风险动作。 |
 
 ## 并发、生命周期与错误恢复
 
@@ -59,6 +86,12 @@
 | `R-AI-015` | **WakeLock / 异步释放顺序**：`acquire` 后是否在所有路径 `release`？同步 `release` 早于异步工作完成 = 没保住电量保护或提前释放。 |
 | `R-AI-016` | **重连退避 / 状态恢复**：长连接重连是否有退避（否则风暴）？重连后订阅/会话状态是否恢复（否则静默失效）？ |
 | `R-AI-017` | **Fragment 作 LiveData owner**：Fragment 里 `observe` 是否误用 `this` 而非 `viewLifecycleOwner`（视图生命周期更短，导致泄漏/重复观察）。**FP：** 所在类是 Activity（`this` 合法）；已用 `viewLifecycleOwner`；观察的数据生命周期确为整个 Fragment。 |
+| `R-AI-039` | **协程取消/线程语义**：捕获 `CancellationException` 后吞掉；在主线程 `runBlocking`；I/O 未切 dispatcher；非结构化 `GlobalScope` 越过生命周期；callback 转 coroutine 时重复 resume。 |
+| `R-AI-040` | **Flow 生命周期/背压**：UI 直接 `collect` 未用 repeatOnLifecycle；多次 collect 造成重复副作用；`shareIn/stateIn` scope 过长；热流缓冲/丢弃策略使关键状态永久丢失。 |
+| `R-AI-041` | **WorkManager 幂等性/约束**：重试非幂等副作用、unique work policy 选错、约束变化后仍提交、进程死亡恢复时重复记账，或把即时强一致任务错误委托为延迟后台作业。 |
+| `R-AI-042` | **Room 事务/迁移**：多表不变量未放同一事务；迁移漏列/索引/默认值；destructive migration 在生产丢数据；Flow 查询和写入之间存在 TOCTOU。 |
+| `R-AI-043` | **后台执行限制**：Android 新版本下后台启动前台服务、通知时限、exact alarm 权限、后台 activity launch 或 receiver 执行时限处理错误，导致 release 设备崩溃/任务静默丢失。 |
+| `R-AI-045` | **Compose 状态/副作用**：在组合阶段执行 I/O/导航；不稳定 key 导致状态串项；remember 缓存 Activity/旧参数；LaunchedEffect/DisposableEffect key 错误造成重复任务或未释放 observer。 |
 
 ## 性能与资源
 
@@ -67,6 +100,8 @@
 | `R-AI-009` | **主线程阻塞**：UI 线程上的同步 I/O / 网络 / 大 JSON 解析 / DB 查询（跨文件确认该方法是否在主线程被调用）。 |
 | `R-AI-010` | **算法/数据结构劣化**：热路径里 O(n²)（循环内 `list.contains` / 循环内查 DB / N+1 查询）；可缓存的重复计算每帧重算。 |
 | `R-AI-011` | **资源未及时释放**：Cursor/Stream/Bitmap 在某些分支未关闭（跨文件追所有 return 路径）；大对象在不需要后仍被强引用。 |
+| `R-AI-037` | **JNI/动态代码边界**：native 方法接收长度/路径/ByteBuffer 未验证；JNI 引用或线程 attach 泄漏；动态加载 dex/so 的来源、签名、路径权限可被替换。 |
+| `R-AI-038` | **依赖与构建逻辑风险**：动态版本、非可信仓库、未固定插件/依赖校验、release 错用 debug implementation、manifest placeholder/资源覆盖使安全配置漂移。仅凭版本号猜 CVE 不确认，需可核实的锁定版本/调用面。 |
 
 ## 通用 FP 提示（压假阳性，对所有条目适用）
 

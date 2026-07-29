@@ -31,22 +31,22 @@ stdout JSON:
       "warnings": []
     }
 
-模式: 只有 strict（v3 决定，无降级）。任何必需引擎未就绪即 ready=false、中断扫描。
+模式: Python 运行时是唯一硬前提。扫描引擎缺失会自动安装；仍不可用时记录为 warning，
+后续保留其他引擎的部分结果并把整次扫描标记为 incomplete。
 
 status 值语义:
     ok      — 已就绪，无需操作
     fixed   — 本次运行自动安装/修复后就绪
-    missing — 软依赖缺失（仅 git；不影响 strict 就绪判定，仅警告）
-    failed  — 必需项未就绪，阻塞扫描（strict 下必中断）
+    missing — 软依赖缺失；后续扫描会标记 incomplete
+    failed  — Python 等硬前提未就绪，阻塞扫描
     skip    — 不需要此引擎（在 excluded_engines 中关闭，或依赖它的引擎都关了），跳过
 
 引擎预检范围规则（excluded_engines 中的引擎 → 工具 skip，不参与中断判定）:
-    • venv / semgrep / detekt / pmd — 默认必需 + 自动安装（装不上即阻塞）
-    • lint                       — 默认必需；依赖 gradlew，缺失即阻塞（gradlew 属工程无法自动安装）
-    • repomap                    — tree-sitter 精确层（唯一精确层）：独立 venv 装 tree-sitter，
-                                    自动安装但**非阻塞**——缺失则 hunter 地图降级、导航回退纯标准库 source-nav
-    • gradle_wrapper             — Lint 启用即必需（需 `./gradlew`）；缺失即阻塞
-    • java                       — 仅检测；Detekt/Lint 依赖它，缺失即阻塞（需手动装 JDK）
+    • venv / semgrep / detekt / pmd — 自动安装；失败为 warning
+    • lint                       — 仅在明确允许 Gradle 执行时启用
+    • repomap                    — tree-sitter 语法索引；失败回退 source-nav
+    • gradle_wrapper             — 仅在 Lint 已授权时检查
+    • java                       — Detekt/PMD/Lint 依赖；缺失为 warning
     • git                        — 仅检测，软依赖（仅影响 --diff，不阻塞）
 """
 
@@ -58,6 +58,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -71,6 +72,12 @@ from tools.installer import (  # noqa: E402  (依赖上方 sys.path.insert)
     TOOLS_DIR,
     VENV_DIR,
     _DETEKT_VERSION,
+    _PMD_VERSION,
+    _SEMGREP_VERSION,
+    _TREE_SITTER_LANGUAGE_PACK_VERSION,
+    _TREE_SITTER_VERSION,
+    _python_version_ok,
+    _venv_package_version,
     _venv_python,
     venv_bin,
     check_java,
@@ -134,17 +141,12 @@ def _read_scan_config(repo_root: Path) -> dict:
     if not config_path.exists():
         return {}
     try:
-        return json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _env_opt_in_engines() -> list[str]:
-    env_map = {
-        "SCAN_ANDROID_ENABLE_MOBSF": "mobsf",
-        "SCAN_ANDROID_ENABLE_FLOWDROID": "flowdroid",
-    }
-    return [name for var, name in env_map.items() if os.environ.get(var)]
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"__config_error__": "top-level JSON must be an object"}
+        return data
+    except Exception as exc:
+        return {"__config_error__": str(exc)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -153,10 +155,10 @@ def _env_opt_in_engines() -> list[str]:
 
 def _detect_python() -> CheckResult:
     vi = sys.version_info
-    if vi < (3, 8):
+    if vi < (3, 9):
         return CheckResult(
             "python3", "failed",
-            f"需要 Python 3.8+，当前 {vi.major}.{vi.minor}.{vi.micro}",
+            f"编排脚本需要 Python 3.9+，当前 {vi.major}.{vi.minor}.{vi.micro}",
             is_hard_required=True,
         )
     return CheckResult("python3", "ok", f"{vi.major}.{vi.minor}.{vi.micro}")
@@ -168,23 +170,21 @@ def _detect_java(java_needed: bool) -> CheckResult:
     ok, detail = check_java()
     if ok:
         return CheckResult("java", "ok", detail)
-    # strict：Detekt / Lint 依赖 Java，Java 缺失即阻塞（Java 不自动安装，需手动）
     return CheckResult(
         "java", "missing",
-        detail + "  → Detekt / Lint 依赖 Java；strict 模式无法继续，请安装 JDK 17+。",
-        is_hard_required=True,
+        detail + "  → Detekt / PMD / Lint 将不可用；其他引擎仍会运行。",
+        is_hard_required=False,
     )
 
 
 def _detect_venv(venv_needed: bool) -> CheckResult:
     if not venv_needed:
         return CheckResult("venv", "skip", "semgrep 已在配置中关闭，无需 venv")
-    if Path(_venv_python()).exists():
+    if Path(_venv_python()).exists() and _python_version_ok(_venv_python(), (3, 10)):
         return CheckResult("venv", "ok", str(VENV_DIR))
-    # venv 创建是 semgrep 的前提，安装失败构成阻塞
     return CheckResult(
-        "venv", "missing", f"尚未创建: {VENV_DIR}",
-        can_auto_install=True, is_hard_required=True,
+        "venv", "missing", f"尚未创建或 Python 低于 3.10: {VENV_DIR}",
+        can_auto_install=True, is_hard_required=False,
     )
 
 
@@ -192,14 +192,15 @@ def _detect_semgrep(semgrep_needed: bool) -> CheckResult:
     if not semgrep_needed:
         return CheckResult("semgrep", "skip", "已在 excluded_engines 中关闭")
     venv_sg = venv_bin("semgrep")
-    if Path(venv_sg).exists():
-        return CheckResult("semgrep", "ok", venv_sg)
-    sys_sg = shutil.which("semgrep")
-    if sys_sg:
-        return CheckResult("semgrep", "ok", f"{sys_sg} (系统路径)")
+    installed = _venv_package_version("semgrep")
+    if Path(venv_sg).exists() and installed == _SEMGREP_VERSION:
+        return CheckResult("semgrep", "ok", f"{venv_sg} ({installed})")
+    detail = "未安装"
+    if installed:
+        detail = f"版本不匹配: {installed}，需要 {_SEMGREP_VERSION}"
     return CheckResult(
-        "semgrep", "missing", "未安装",
-        can_auto_install=True, is_hard_required=True,
+        "semgrep", "missing", detail,
+        can_auto_install=True, is_hard_required=False,
     )
 
 
@@ -207,32 +208,33 @@ def _detect_detekt(detekt_needed: bool) -> CheckResult:
     if not detekt_needed:
         return CheckResult("detekt", "skip", "已在 excluded_engines 中关闭")
     jar = TOOLS_DIR / "detekt" / f"detekt-cli-{_DETEKT_VERSION}-all.jar"
-    if jar.exists():
+    if jar.exists() and zipfile.is_zipfile(jar):
         return CheckResult("detekt", "ok", str(jar))
     # Java 缺失时由 _detect_java 阻塞；此处仍标为必需，安装失败即阻塞
     return CheckResult(
         "detekt", "missing", "JAR 未下载 (~64 MB)",
-        can_auto_install=True, is_hard_required=True,
+        can_auto_install=True, is_hard_required=False,
     )
 
 
 def _detect_pmd(pmd_needed: bool) -> CheckResult:
     if not pmd_needed:
         return CheckResult("pmd", "skip", "已在 excluded_engines 中关闭")
-    if find_pmd():
-        return CheckResult("pmd", "ok", find_pmd())  # type: ignore[arg-type]
+    pmd = find_pmd()
+    if pmd:
+        return CheckResult("pmd", "ok", f"{pmd} ({_PMD_VERSION})")
     return CheckResult(
         "pmd", "missing", "未安装 (~40 MB)",
-        can_auto_install=True, is_hard_required=True,
+        can_auto_install=True, is_hard_required=False,
     )
 
 
 def _detect_repomap_venv(repo_root: Path) -> CheckResult:
-    """tree-sitter 精确层（唯一精确层，nav_backend=auto/treesitter 时启用）。
+    """tree-sitter 语法索引层（nav_backend=auto/treesitter 时启用）。
 
     tree-sitter + tree-sitter-language-pack 装在独立 venv（~/.scan-android/repomap-venv/，
     比照 semgrep 隔离）。用于 hunter 的 RepoMap（签名骨架 + PageRank + 跨文件关系）与 verifier
-    的 AST 精确导航。**永不阻塞**——venv/包缺失则地图降级、导航自动回退 source-nav（纯标准库）。"""
+    的语法级导航。**永不阻塞**——venv/包缺失则地图降级、导航自动回退 source-nav（纯标准库）。"""
     pref = (os.environ.get("SCAN_ANDROID_NAV_BACKEND") or "").strip().lower()
     if not pref:
         pref = str(_read_scan_config(repo_root).get("nav_backend", "")).strip().lower()
@@ -242,15 +244,21 @@ def _detect_repomap_venv(repo_root: Path) -> CheckResult:
     if venv_py.exists():
         # 校验包可导入
         try:
-            r = subprocess.run([str(venv_py), "-c", "import tree_sitter, tree_sitter_language_pack"],
+            version_check = (
+                "import importlib.metadata as m, tree_sitter, tree_sitter_language_pack; "
+                f"assert m.version('tree-sitter') == {_TREE_SITTER_VERSION!r}; "
+                "assert m.version('tree-sitter-language-pack') == "
+                f"{_TREE_SITTER_LANGUAGE_PACK_VERSION!r}"
+            )
+            r = subprocess.run([str(venv_py), "-c", version_check],
                                capture_output=True, timeout=30)
             if r.returncode == 0:
-                return CheckResult("repomap", "ok", f"{REPOMAP_VENV_DIR}（tree-sitter 精确层）")
+                return CheckResult("repomap", "ok", f"{REPOMAP_VENV_DIR}（tree-sitter 语法索引）")
         except Exception:
             pass
     return CheckResult(
         "repomap", "missing",
-        f"尚未就绪: {REPOMAP_VENV_DIR}（tree-sitter 精确层；非阻塞，缺失则地图降级、导航回退 source-nav）",
+        f"尚未就绪: {REPOMAP_VENV_DIR}（tree-sitter 语法索引；非阻塞，缺失则地图降级、导航回退 source-nav）",
         can_auto_install=True, is_hard_required=False,
     )
 
@@ -258,16 +266,15 @@ def _detect_repomap_venv(repo_root: Path) -> CheckResult:
 def _detect_gradle_wrapper(gradle_needed: bool, repo_root: Path) -> CheckResult:
     """gradlew：Lint 依赖它。"""
     if not gradle_needed:
-        return CheckResult("gradle_wrapper", "skip", "lint 已关闭，无需 gradlew")
+        return CheckResult("gradle_wrapper", "skip", "未授权执行 Gradle/Lint，无需 gradlew")
     gradlew = repo_root / "gradlew"
     if gradlew.exists():
         return CheckResult("gradle_wrapper", "ok", str(gradlew))
-    # strict：Lint 依赖 gradlew，缺失即阻塞（gradlew 属工程，无法自动安装）
     return CheckResult(
         "gradle_wrapper", "missing",
-        "gradlew 不存在 — Lint 无法运行（strict 中断）。若该工程无 Gradle wrapper，"
+        "gradlew 不存在 — Lint 无法运行，扫描将标记 incomplete。若该工程无 Gradle wrapper，"
         '请在 .scan/config.json 的 excluded_engines 加入 "lint" 关闭它。',
-        is_hard_required=True,
+        is_hard_required=False,
     )
 
 
@@ -345,20 +352,25 @@ def _try_install(name: str) -> tuple[bool, str]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_preflight(repo_root: Path) -> dict:
-    config = _read_scan_config(repo_root)
-    excluded_engines: list[str] = config.get("excluded_engines", [])
+    config = dict(_read_scan_config(repo_root))
+    config_error = str(config.pop("__config_error__", ""))
+    raw_excluded = config.get("excluded_engines", [])
+    excluded_engines: list[str] = (
+        [str(x) for x in raw_excluded] if isinstance(raw_excluded, list) else []
+    )
 
-    # 每个引擎是否需要（决定其工具是否计入 strict 中断判定）。
+    # 每个引擎是否需要（被配置排除的引擎不检测）。
     # excluded_engines 里的引擎 → 工具标记 skip，不参与就绪判定（决定 3）。
     semgrep_needed = "semgrep" not in excluded_engines
     detekt_needed = "detekt" not in excluded_engines
     pmd_needed = "pmd" not in excluded_engines
     lint_needed = "lint" not in excluded_engines
+    allow_gradle_execution = config.get("allow_gradle_execution", False) is True
     # 依赖关系：Detekt / PMD / Lint 需要 Java；Semgrep 需要 venv。
-    java_needed = detekt_needed or pmd_needed or lint_needed
+    java_needed = detekt_needed or pmd_needed or (lint_needed and allow_gradle_execution)
     venv_needed = semgrep_needed
     # gradlew：Lint 依赖它。
-    gradle_needed = lint_needed
+    gradle_needed = lint_needed and allow_gradle_execution
 
     detect_kwargs = dict(
         java_needed=java_needed,
@@ -402,9 +414,7 @@ def run_preflight(repo_root: Path) -> dict:
                 _eprint(f"  ❌ {r.name} 安装失败: {detail}")
         # 继续循环，重新检测
 
-    # ── 后处理（strict）：标记 fixed / 任何 hard-required 仍缺失即升级为 blocker ──
-    # v3 决定：只有 strict 模式，绝不降级。必需引擎未就绪即中断，无论是否尝试过安装、
-    # 能否自动安装（如 Java 不自动装均构成阻塞）。repomap 精确层非必需，缺失不阻塞（回退 source-nav）。
+    # 标记 fixed；只有 Python 运行时等真正硬前提才升级为 blocker。
     for r in results:
         if r.name in newly_installed and r.status == "ok":
             r.status = "fixed"
@@ -418,6 +428,8 @@ def run_preflight(repo_root: Path) -> dict:
     # ── 汇总 ──
     blockers = [r.detail for r in results if r.is_blocker]
     warnings = [f"{r.name}: {r.detail}" for r in results if r.status == "missing"]
+    if config_error:
+        warnings.insert(0, f"config: 配置无效，已使用安全默认值: {config_error}")
 
     return {
         "ready": len(blockers) == 0,
@@ -456,14 +468,14 @@ def _print_summary(result: dict) -> None:
 
     if result["blockers"]:
         lines.append("")
-        lines.append("❌ 以下必需项未就绪，strict 模式中止扫描（不降级）：")
+        lines.append("❌ 以下运行时硬前提未就绪，扫描中止：")
         for b in result["blockers"]:
             lines.append(f"   • {b}")
         lines.append("")
         lines.append("请按提示修复后重试。扫描已中止。")
     else:
         lines.append("")
-        lines.append("✅ 预检通过，所有必需引擎就绪，开始扫描…")
+        lines.append("✅ 预检通过；缺失的可选引擎会使报告明确标记 incomplete。")
 
     lines.append("")
     _eprint("\n".join(lines))

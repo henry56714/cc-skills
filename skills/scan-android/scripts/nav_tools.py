@@ -3,9 +3,9 @@
 LLM 导航工具 —— 跨文件调用/类型查询的统一门面，把 LLM 从"猜文件"变成"查索引"。
 
 后端按 `nav_backend`（config 或 env `SCAN_ANDROID_NAV_BACKEND`，取值 auto|treesitter|source）选择：
-  - treesitter（**唯一精确层**，auto 首选）—— tree-sitter AST 精确识别 def/ref，Java+Kotlin
-    无盲区；同名重载/接收者不消歧，常见名歧义由 verifier 逐跳 Read 复核（见 repo_map.py）。
-  - source-nav（纯标准库兜底）—— 正则名义级精度，召回满，永远可用。**仅当 tree-sitter 精确层
+  - treesitter（auto 首选）—— tree-sitter 语法级识别 def/ref，不误命中注释/字符串；
+    同名重载、接收者类型与动态分派不消歧，必须由 verifier 逐跳 Read 复核。
+  - source-nav（纯标准库兜底）—— 正则名义级索引，永远可用。**仅当 tree-sitter
     不可用时启用，并打印 `[WARN] nav-degraded` 告警。**
 
 用法（由 verifier agent 调用）:
@@ -41,7 +41,7 @@ def _log(msg: str) -> None:
 def _nav_backend_pref(repo: Path) -> str:
     """读取导航后端偏好：env `SCAN_ANDROID_NAV_BACKEND` 优先，其次 `.scan/config.json` 的
     `nav_backend`。取值 auto|treesitter|source，默认 auto。
-    `auto` = treesitter（**唯一精确层**，tree-sitter AST）→ source（纯标准库兜底）。"""
+    `auto` = treesitter（语法级索引）→ source（纯标准库兜底）。"""
     val = (os.environ.get("SCAN_ANDROID_NAV_BACKEND") or "").strip().lower()
     if not val:
         try:
@@ -55,14 +55,14 @@ def _nav_backend_pref(repo: Path) -> str:
 
 
 class NavTools:
-    """tree-sitter（唯一精确层）+ source-nav（纯标准库兜底）支撑的 LLM 导航工具集。"""
+    """tree-sitter 语法索引 + source-nav 正则兜底支撑的 LLM 导航工具集。"""
 
     def __init__(self, repo: str | Path):
         self.repo = Path(repo).resolve()
         self._src: Any = None          # source_nav.SourceNav 纯标准库兜底后端
         self._ts: Any = None           # repo_map.RepoMap / RepoMapNav 精确后端（tree-sitter）
         self.backend: str = ""         # "treesitter" | "source"
-        self.degraded: bool = False    # True = 精确层不可用、已回退 source-nav（附告警）
+        self.degraded: bool = False    # True = tree-sitter 不可用、已回退 source-nav（附告警）
 
     # ------------------------------------------------------------------
     # 索引生命周期
@@ -71,11 +71,11 @@ class NavTools:
     def start(self) -> bool:
         """就绪导航后端（幂等）。后端选择（默认 auto）：
 
-        - `nav_backend=treesitter`（**唯一精确层**，或 auto 首选）：tree-sitter 解析 Java/Kotlin，
-          AST 精确识别 def/ref（不误命中注释/字符串，enclosing 精确，Kotlin 无盲区）。同名重载/
-          接收者类型不消歧——常见名歧义由 verifier 逐跳 Read 复核。
+        - `nav_backend=treesitter`（auto 首选）：tree-sitter 解析 Java/Kotlin，
+          语法级识别 def/ref（不误命中注释/字符串，enclosing scope 较可靠）。同名重载、
+          接收者类型与动态分派不消歧——必须由 verifier 逐跳 Read 复核。
           需 tree-sitter（本进程可导入或 repomap venv 就绪）；不可用则**告警并回退 source-nav**。
-        - 兜底：纯标准库 source-nav（正则名义级精度，召回满，永远可用）。**仅当精确层不可用时启用，
+        - 兜底：纯标准库 source-nav（正则名义级，永远可用）。仅当 tree-sitter 不可用时启用，
           且会打印 `[WARN] nav-degraded` 告警——精度低于 tree-sitter，请优先修复 repomap venv。**
 
         无论选择如何，最终都会落到一个可用后端。恒返回 True。"""
@@ -83,14 +83,14 @@ class NavTools:
             return True
         pref = _nav_backend_pref(self.repo)
 
-        # 0) 精确层：tree-sitter（auto 首选 或 显式 treesitter）
+        # 0) tree-sitter 语法索引（auto 首选 或显式 treesitter）
         if pref in ("auto", "treesitter"):
             try:
                 from repo_map import repomap_available, RepoMap, RepoMapNav, _ts_available
                 if repomap_available():
                     self._ts = RepoMap(self.repo) if _ts_available() else RepoMapNav(self.repo)
                     self.backend = "treesitter"
-                    _log("导航后端: treesitter（tree-sitter AST 精确；Java+Kotlin 无盲区，常见名歧义由 Read 复核）")
+                    _log("导航后端: treesitter（语法级 def/ref；重载/接收者/动态分派由 Read 复核）")
                     return True
                 _log("tree-sitter 不可用（repomap venv 未装）")
             except Exception as e:
@@ -102,11 +102,11 @@ class NavTools:
         self.backend = "source"
         self.degraded = True
         if pref != "source":
-            # 用户期望精确层但未就绪 → 明确告警（精度下降）
-            _log("[WARN] nav-degraded: tree-sitter 精确层不可用，已回退 source-nav（纯标准库，名义级精度）。"
+            # 用户期望 tree-sitter 但未就绪 → 明确告警
+            _log("[WARN] nav-degraded: tree-sitter 语法索引不可用，已回退 source-nav（纯标准库，正则名义级）。"
                  "请安装 repomap venv（preflight 会自动装 tree-sitter + tree-sitter-language-pack）以恢复精确导航。")
         else:
-            _log("导航后端: source-nav（纯标准库兜底；名义级精度，跨文件调用/定义/继承可靠召回）")
+            _log("导航后端: source-nav（纯标准库兜底；正则名义级线索，需逐跳 Read）")
         return True
 
     # 兼容旧调用名（verifier 历史脚本可能调用 start_server / stop_server）
@@ -122,7 +122,7 @@ class NavTools:
     # ------------------------------------------------------------------
 
     def _backend(self):
-        """返回当前后端对象（tree-sitter 精确层优先，否则 source-nav 兜底）。"""
+        """返回当前后端对象（tree-sitter 语法索引优先，否则 source-nav 兜底）。"""
         self.start()
         return self._ts if self._ts is not None else self._src
 
@@ -168,7 +168,7 @@ class NavTools:
 
         从 `symbol`（`Class#method` 子串）解析出的方法定义出发，递归列出
         「谁调用了它 → 调用所在方法 → 谁又调用了那个方法 → …」，每跳附调用点源码
-        `snippet` 与所在方法 `enclosing_symbol`，直到到达入口（无调用方）或达 max_depth。
+        `snippet` 与所在方法 `enclosing_symbol`，直到索引无调用方或达 max_depth。
 
         无 AST 实参映射：本工具给出调用方链 + 每跳源码，由验证器读 snippet 沿目标实参
         （如 Context）人工判定其真实来源（Application / Activity / 字面量 / 外部输入）。
@@ -190,7 +190,7 @@ class NavTools:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="LLM 跨文件导航工具 CLI（tree-sitter 精确层 + source-nav 兜底）")
+    ap = argparse.ArgumentParser(description="LLM 跨文件导航工具 CLI（tree-sitter 语法索引 + source-nav 兜底）")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--action", required=True,
                     choices=["callers", "callees", "definition", "hierarchy", "dataflow", "trace-origin"])
@@ -200,7 +200,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     nav = NavTools(args.repo)
-    nav.start()  # 恒返回 True（精确层不可用会告警并回退 source-nav）
+    nav.start()  # 恒返回 True（tree-sitter 不可用会告警并回退 source-nav）
 
     result: Any
     if args.action == "callers":

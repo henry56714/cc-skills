@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-source_nav.py — 纯标准库的源码级调用/类型导航（tree-sitter 精确层不可用时的兜底后端）。
+source_nav.py — 纯标准库的源码级调用/类型导航（tree-sitter 语法索引不可用时的兜底后端）。
 
 目标导向：导航的目的是给 verifier 提供「谁调用了它 / 它定义在哪 / 谁继承它」这类**调用逻辑**，
-用来判断漏洞与业务逻辑是否成立。默认精确层是 tree-sitter（repo_map.py，AST 精确、Java+Kotlin
-无盲区）；但它需要 repomap venv（tree-sitter + language-pack）。本后端**只用 Python 标准库、零依赖**，
+用来判断漏洞与业务逻辑是否成立。默认后端是 tree-sitter（repo_map.py，语法级 def/ref）；
+但它需要 repomap venv（tree-sitter + language-pack）。本后端**只用 Python 标准库、零依赖**，
 直接对源码做 AST 友好的正则检索，输出与 tree-sitter 后端**同形**的结果——保证在**任意**工程、
 **裸机/离线**环境上跨文件取证都能跑出东西（nav_tools 回退到它时会打印 [WARN] nav-degraded 告警）。
 
-精度说明：基于「方法名 + 调用/声明形态」的名义匹配，不解析重载/泛型/具体类型（与 tree-sitter
-后端一样不消歧同名重载，但缺少 AST 精度：可能命中注释/字符串）。跨文件的调用方 / 定义 / 继承
-关系**可靠召回**；同名歧义由调用方读 snippet 复核——verifier 本就逐跳 Read。
+精度说明：基于「方法名 + 调用/声明形态」的名义匹配，不解析重载/泛型/具体类型/动态分派，
+并可能命中注释或字符串。跨文件关系只提供保守线索；反射和间接调用仍可能漏报，所有命中必须读源码复核。
 
 仅用 Python 标准库（os.walk + re）。只读被扫描仓库。
 CLI 与 nav_tools.py 对齐：--action callers|definition|hierarchy|trace-origin --symbol "Class#method"。
@@ -20,12 +19,14 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Any
 
 _SRC_EXT = (".java", ".kt", ".aidl")
-_SKIP_DIRS = {"build", ".gradle", ".git", "generated", ".idea", "node_modules"}
+_SKIP_DIRS = {
+    "build", ".gradle", ".git", "generated", ".idea", "node_modules",
+    ".cxx", ".externalNativeBuild", "CMakeFiles", ".scan", ".vscode", "docs",
+}
 _MAX_FILE_BYTES = 800_000
 
 # 控制流关键字——形如 name( 但不是方法声明/调用目标
@@ -169,26 +170,30 @@ class SourceNav:
     def trace_origin(self, symbol: str, max_depth: int = 6, max_callers: int = 25) -> dict[str, Any]:
         method = _method_hint(symbol) or symbol
         defs = self.get_definition(symbol)
-        visited: set[str] = set()
-
-        def expand(name: str, depth: int) -> list[dict[str, Any]]:
-            if depth <= 0 or name in visited or not name:
-                return [{"truncated": True, "reason": "达到深度上限或检测到环"}] if (name in visited or depth <= 0) and name else []
-            visited.add(name)
+        def expand(name: str, depth: int, path: frozenset[str]) -> list[dict[str, Any]]:
+            # Cycle detection must be path-local.  A global visited set silently
+            # drops sibling branches when two callers have the same method name.
+            if depth <= 0 or name in path or not name:
+                return [{"truncated": True, "reason": "达到深度上限或检测到当前路径中的环"}] if (name in path or depth <= 0) and name else []
+            next_path = path | {name}
             callers = self.get_callers(name)
             nodes: list[dict[str, Any]] = []
             for c in callers[:max_callers]:
                 node: dict[str, Any] = dict(c)
                 enc = c.get("enclosing_symbol") or ""
                 if enc and depth > 1:
-                    node["callers"] = expand(enc, depth - 1)
+                    node["callers"] = expand(enc, depth - 1, next_path)
                 elif not enc:
                     node["note"] = "无法定位调用所在方法（lambda/匿名类/字段初始化，请 Read 复核）"
                 nodes.append(node)
             if len(callers) > max_callers:
                 nodes.append({"truncated": True, "reason": f"调用方过多，仅列前 {max_callers} 个"})
             if not callers:
-                nodes.append({"entry_point": True, "note": "无调用方（入口/未被调用/仅经接口或反射调用）"})
+                nodes.append({
+                    "terminal_no_callers": True,
+                    "entry_point": False,
+                    "note": "静态名义索引未找到调用方；可能是框架入口、未调用代码、接口分派或反射，须结合 Manifest/override 复核",
+                })
             return nodes
 
         chains = []
@@ -197,7 +202,7 @@ class SourceNav:
             chains.append({
                 "symbol": d["symbol"],
                 "definition": {"file": d["file"], "line": d["line"]},
-                "callers": expand(method, max_depth),
+                "callers": expand(method, max_depth, frozenset()),
             })
         return {"target": symbol, "chains": chains, "backend": "source-nav"}
 

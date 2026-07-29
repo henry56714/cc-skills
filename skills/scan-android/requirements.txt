@@ -10,4 +10,5 @@
 # 覆盖虚拟环境路径:
 #   export SCAN_ANDROID_VENV_DIR=/path/to/custom/venv
 
-semgrep>=1.100.0
+# 精确固定，避免扫描器自身随一次无审查的上游发布改变规则语义或依赖树。
+semgrep==1.165.0

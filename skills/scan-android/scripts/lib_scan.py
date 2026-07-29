@@ -30,8 +30,24 @@ def short_commit(commit: str, length: int = 8) -> str:
     return commit[:length] if commit else ""
 
 
-def finding_id(file_: str, line: int, category: str) -> str:
-    raw = f"{file_}:{line}:{category}".encode("utf-8")
+def finding_id(file_: str, line: int, category: str, rule_id: str = "") -> str:
+    """Return a stable id without collapsing distinct rules on the same line.
+
+    ``rule_id`` is optional for compatibility with older callers.  New callers
+    must provide it because two independently verified defects can legitimately
+    share file, line and category.
+    """
+    raw = f"{file_}:{line}:{category}:{rule_id}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def root_cause_id(primary_file: str, symbol: str, failure_mode: str) -> str:
+    """Stable id for one remediation root across files, rules and samples."""
+    raw = "\0".join((
+        primary_file.strip().replace("\\", "/").lower(),
+        " ".join(symbol.strip().lower().split()),
+        "-".join(failure_mode.strip().lower().replace("_", "-").split()),
+    )).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()
 
 
@@ -211,7 +227,7 @@ class Candidate:
     报告都只消费本契约，不关心来源引擎。详见 docs/architecture-v2.md §4。
     """
 
-    engine: str            # 产出引擎: semgrep|detekt|pmd|lint|mobsf|flowdroid
+    engine: str            # 产出引擎: semgrep|detekt|pmd|lint
     rule_id: str           # 我们的统一 id（经 taxonomy 映射），如 R-SEC-001
     file: str              # 相对仓库根，正斜杠
     line: int              # 1-based 主要违规行

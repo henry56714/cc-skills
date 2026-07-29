@@ -1,43 +1,44 @@
-# CLAUDE.md
+# scan-android 开发约束
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+行为入口在 `SKILL.md`，schema/去重/完整性在 `CONVENTIONS.md`。修改流程时同步两者与 `README.md`。
 
-`scan-android` is a stateless Android/APK code scanner packaged as a Claude Code skill. The entry point and workflow are in `SKILL.md`; schema/dedup/report details are in `CONVENTIONS.md`. Read those before changing behavior.
+## 硬约束
 
-## Hard invariants
+- 只支持 Android source 扫描。不要添加 APK/AAB、反编译、MobSF、FlowDroid 或 hybrid 分支。
+- 目标源码只读，只能在目标仓库 `.scan/` 下写扫描产物。Gradle/Lint 默认禁用，必须显式授权。
+- 编排脚本仅用 Python 标准库。Semgrep 与 tree-sitter 分别在隔离 venv 中运行，不导入编排进程。
+- 扫描无状态；不恢复 ledger、first_seen/last_seen 或跨扫描关闭状态。
+- 不确定项进入 needs-review，不能静默丢弃；引擎失败保留部分结果并标 incomplete。
+- 无默认候选截断。任何显式截断必须可计数并令状态 partial。
+- tree-sitter 提供更好的语法级 def/ref 与 RepoMap，但仍不解析重载、接收者类型、动态分派或反射。不要称其为完整语义/精确调用图；verifier 必须逐跳读源码。
 
-- **Orchestration scripts are Python standard-library only.** Two third-party dependencies are allowed, each in its **own isolated venv**, never imported by the orchestration scripts: `semgrep` (`~/.scan-android/venv/`) and the tree-sitter precision tier `tree-sitter` + `tree-sitter-language-pack` (`~/.scan-android/repomap-venv/`, used by `repo_map.py`, which re-execs into that venv or falls back to stdlib `source_nav.py`). Do **not** add `requests`, `pyyaml`, `lxml`, etc. to any orchestration script under `scripts/` — parse with stdlib (`json`, `xml.etree`, `urllib`). Both venvs are auto-installed and non-blocking: a bare machine still runs (semgrep blocks only if not excluded; tree-sitter degrades to source-nav).
-- **The skill is read-only.** It never modifies the scanned project's source. Only write under the scanned repo's `.scan/` (findings, reports, tmp, cache).
-- **v3 is stateless.** No ledger, no `first_seen`/`last_seen`, no cross-scan reopen/close. `merge_findings.py` overwrites `.scan/findings.json` every run. Don't reintroduce historical state.
-- **False-positive discipline.** When verification is uncertain, discard the candidate. User trust outweighs recall.
+## 两个根目录
 
-## Two-root model (don't confuse them)
+- `<SKILL_DIR>`：本 skill 安装目录。脚本资源一律用 `Path(__file__)` 定位，不写死 `.claude/skills`。
+- scanned repo：命令 cwd / `--repo-root`，`.scan/` 相对此处。
 
-Scripts run against **two independent roots**:
+## 当前引擎
 
-- **`<SKILL_DIR>`** = this skill's install dir (where `SKILL.md`/`scripts/`/`rules/` live). It can sit at any path (often symlinked, not necessarily under `.claude/skills/`). Scripts locate their own resources via `Path(__file__)` — **never hardcode `.claude/skills/...`** and don't rely on cwd to find `rules/` or `lib_scan.py`.
-- **Scanned repo root** = the cwd when scripts run. `--repo-root` defaults to `.`; all `.scan/...` artifacts are relative to here.
+- Semgrep：本地 Android 规则 + taint，online registry 显式 opt-in。
+- Detekt：Kotlin。
+- PMD：Java。
+- Android Lint：只有 `allow_gradle_execution=true` 或 CLI 显式授权才运行。
+- RepoMap/nav：tree-sitter 优先，source-nav 兜底；二者都需要源码复核。
+- AI hunter + 独立 verifier：深层逻辑与跨文件判断。
 
-When invoking scripts in docs/workflow, write `python3 <SKILL_DIR>/scripts/X.py` and let the caller substitute the real path. Shell env vars don't persist between Bash calls, so inline the path per command rather than `export`-ing once.
+## 规则维护
 
-## Engine set (current)
+- 浅层/taint 模式：`queries/semgrep/android.yaml`，metadata 必须给统一 rule/category/severity。
+- 深层逻辑：`rules/ai/hunting.md`，同步 `agents/hunter.md` perspective 与 `build_hunt_batches.py`。
+- 持续误报通过修正规则/验证要点解决，不默认禁用。
 
-`semgrep` (breadth, incl. taint), `detekt` (Kotlin), `pmd` (Java), `lint` (Android, via `./gradlew`), plus tree-sitter for both the hunter's **RepoMap** (cross-file code map) and verification-time call/type navigation via `nav_tools.py`. **Navigation backend is selected by `.scan/config.json` `nav_backend` (or env `SCAN_ANDROID_NAV_BACKEND`); default `auto`:**
-- **`repo_map.py` (tree-sitter, the single precision tier) is the default.** Parses Java/Kotlin with tree-sitter tags queries (`scripts/tags/{java,kotlin}-tags.scm`; **we ship our own kotlin-tags — Aider has none — so Kotlin is not a blind spot**). AST-precise def/ref (no matches inside comments/strings, correct enclosing scope). Does **not** resolve overloads/receiver types — common-name disambiguation (`init`/`d`) is still name-level and closed by the verifier's per-hop Read (same as source-nav). Benchmarked (`nav_benchmark.py`) **on par with source-nav on nav precision** — its reason for being default is the RepoMap capability source-nav cannot produce (signature skeletons + PageRank + cross-file relations, fed to the hunter). Installed via pip into an isolated venv `~/.scan-android/repomap-venv/` (mirrors semgrep). Non-blocking: if the venv can't be built, nav falls back to source-nav.
-- **`source_nav.py` (stdlib-only regex nav) is the fallback**, used only when tree-sitter is unavailable. Recall complete, precision name-collision-driven. Guarantees nav works on a bare/offline machine. **When nav_tools falls back to it, it prints an explicit `[WARN] nav-degraded`** so the operator knows precision dropped and should fix the repomap venv.
+## 验证
 
-Never let tree-sitter's unavailability block a scan — it falls back to source-nav (with a warning). **`joern`, `scip-java`, and `stack-graphs` were all removed** (joern: `.kt` blind spot + 2GB + build requirement; scip-java: needs semanticdb that Gradle toolchain-forked javac rarely emits; stack-graphs: benchmark-rejected). tree-sitter is now the **single precision tier**, serving both hunter and verifier with no Kotlin blind spot — see memory `project-nav-backend-benchmark`. `mobsf` and `flowdroid` are opt-in. **CodeQL stays removed** (don't reintroduce). Navigation handles only call/type relations; dataflow/taint is covered by semgrep taint + the AI hunting line (`rules/ai/hunting.md`). Choose nav backends by benchmark (`nav_benchmark.py` + `benchmarks/*.json`), not by reputation.
+修改脚本后至少运行：
 
-## Adding/tuning rules
+```text
+python3 -m unittest discover -s skills/scan-android/tests -v
+PYTHONPYCACHEPREFIX=/tmp/scan-android-pycache python3 -m py_compile skills/scan-android/scripts/*.py skills/scan-android/scripts/adapters/*.py
+```
 
-- Breadth rules: prefer engine packs — add a Semgrep registry pack or a small local rule under `queries/semgrep/`. Detekt/PMD/Lint rules ship with the engines. This skill does **not** maintain single-line detection rules.
-- Deep/logic hunches: append a natural-language entry (`R-AI-*` id) to `rules/ai/hunting.md`.
-- Persistent false positives: update the relevant source (`queries/` or `rules/ai/`) — never silently disable a rule.
-
-## Verifying changes
-
-There is no test suite. After editing scripts, run `/smoke-scan` (py_compile all scripts + each touched script's `--help` + `detect_project.py` against the sample repo). The sample Android repo is `/path/to/sample/android-project`.
-
-## Doc sync
-
-Behavior is documented in three places that must agree: `SKILL.md` (workflow), `CONVENTIONS.md` (schema/dedup/report), `README.md` (usage). When you change a script's flags or the workflow, update all three and keep each script's `--help` in sync.
+再对一个小型 Android 源码 fixture 做 forward test，核对：作用域、引擎状态、AI 文件/视角覆盖、verifier 批次数量、confirmed/needs-review 与报告。

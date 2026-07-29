@@ -4,13 +4,14 @@
 规则来源（v3）：
 - **社区 registry 规则包**（广度主力，数千条）：按 check 类别挂 `p/...` 包；
 - **本地自写规则** `queries/semgrep/`：只补社区库未覆盖的 Android/项目特定缺口。
-两者结果统一归一化为 Candidate 契约。registry 默认开启，离线场景可在
-`.scan/config.json` 用 `semgrep_use_registry:false` 关闭。
+两者结果统一归一化为 Candidate 契约。为保证可复现并避免扫描时隐式联网，registry
+默认关闭；需要时在 `.scan/config.json` 显式设置 `semgrep_use_registry:true`。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,7 +44,7 @@ def _load_semgrep_config(repo: Path) -> tuple[bool, list[str] | None]:
     """读取 .scan/config.json 的 semgrep 配置。
 
     返回 (use_registry, packs_override)：
-    - use_registry: 默认 True；离线场景可设 false。
+    - use_registry: 默认 False；显式授权联网拉取规则包时设 true。
     - packs_override: 显式覆盖默认 registry 包清单；None = 用默认全集。
     """
     cfg: dict = {}
@@ -51,10 +52,11 @@ def _load_semgrep_config(repo: Path) -> tuple[bool, list[str] | None]:
     if p.exists():
         try:
             with open(p, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+                loaded = json.load(f)
+                cfg = loaded if isinstance(loaded, dict) else {}
         except Exception:
             pass
-    use_registry = bool(cfg.get("semgrep_use_registry", True))
+    use_registry = cfg.get("semgrep_use_registry", False) is True
     packs = cfg.get("semgrep_registry_packs")
     if isinstance(packs, list) and packs:
         return use_registry, [str(x) for x in packs]
@@ -94,7 +96,7 @@ class SemgrepAdapter(EngineAdapter):
         # 本地自写规则：queries/semgrep/ 下的全部 yaml（只补社区库未覆盖的缺口）
         rule_files = sorted(_QUERIES_DIR.glob("*.yaml"))
 
-        # 社区 registry 规则包（v3 广度主力）。默认开，离线可在配置关闭。
+        # 社区 registry 规则包需显式开启，避免隐式联网与规则漂移。
         use_registry, packs_override = _load_semgrep_config(ctx.repo)
         registry_packs = (packs_override if packs_override is not None else _DEFAULT_REGISTRY_PACKS) if use_registry else []
 
@@ -103,7 +105,13 @@ class SemgrepAdapter(EngineAdapter):
             return result
 
         # 构建 semgrep 命令：本地规则 + 社区 registry 包
-        cmd = [semgrep, "--json", "--quiet", "--no-git-ignore"]
+        cmd = [
+            semgrep, "--json", "--quiet", "--no-git-ignore", "--dataflow-traces",
+            "--metrics", "off", "--disable-version-check", "--project-root", ".",
+            # Scope/excludes 由 prepare_scope + 结果过滤统一决定，目标仓库不能用
+            # .semgrepignore 静默隐藏代码；大于 Semgrep 默认 1 MB 的源文件也不能静默跳过。
+            "--x-ignore-semgrepignore-files", "--max-target-bytes", "0",
+        ]
         for rf in rule_files:
             cmd += ["--config", str(rf)]
         for pack in registry_packs:
@@ -117,39 +125,53 @@ class SemgrepAdapter(EngineAdapter):
             "registry_packs": registry_packs,
         })
 
-        # 传入仓库根，让 semgrep 扫描整个仓库（后续按 scope 过滤）
-        cmd.append(str(ctx.repo))
+        # cwd 已是仓库根。使用 "." 避免 Semgrep 默认 ignore 规则误把仓库祖先目录
+        # （例如 /work/tests/project）当成仓库内路径并整仓跳过。
+        cmd.append(".")
 
         try:
+            env = os.environ.copy()
+            env.setdefault("SEMGREP_SEND_METRICS", "off")
+            env.setdefault("SEMGREP_LOG_FILE", str(ctx.repo / ".scan" / "tmp" / "semgrep.log"))
+            if not env.get("SSL_CERT_FILE"):
+                for cert in sorted(Path(semgrep).parent.parent.glob("lib/python*/site-packages/certifi/cacert.pem")):
+                    env["SSL_CERT_FILE"] = str(cert)
+                    break
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=600,
                 cwd=str(ctx.repo),
+                env=env,
             )
         except subprocess.TimeoutExpired:
-            result.notes.append({"engine": self.name, "note": "semgrep 超时（300s），结果可能不完整"})
+            result.status = "partial"
+            result.notes.append({"engine": self.name, "note": "semgrep 超时（600s），未产生可验证的完整结果"})
             return result
         except Exception as e:
             result.available = False
+            result.status = "failed"
             result.unavailable_reason = f"semgrep 运行失败: {e}"
             return result
 
         # semgrep --json 的退出码：0=无发现，1=有发现，2=错误
         if proc.returncode not in (0, 1):
+            result.status = "partial"
             result.notes.append({
                 "engine": self.name,
                 "note": f"semgrep 退出码 {proc.returncode}，stderr: {proc.stderr[:500]}",
             })
             if not proc.stdout.strip():
                 result.available = False
+                result.status = "failed"
                 result.unavailable_reason = "semgrep 返回空结果（可能出错）"
                 return result
 
         try:
             data = json.loads(proc.stdout)
         except json.JSONDecodeError as e:
+            result.status = "failed"
             result.notes.append({"engine": self.name, "note": f"semgrep JSON 解析失败: {e}"})
             return result
 
@@ -157,16 +179,20 @@ class SemgrepAdapter(EngineAdapter):
         scope_set = set(ctx.scope_files)
         rule_hit_count: dict[str, int] = {}
 
+        parse_failures = 0
         for item in data.get("results", []):
             try:
                 candidate = _parse_result(item, ctx.repo, scope_set)
             except Exception:
+                parse_failures += 1
                 continue
             if candidate is None:
                 continue
             rule_id = candidate.rule_id
             rule_hit_count[rule_id] = rule_hit_count.get(rule_id, 0) + 1
-            if rule_hit_count[rule_id] > ctx.max_per_rule:
+            if ctx.max_per_rule > 0 and rule_hit_count[rule_id] > ctx.max_per_rule:
+                result.truncated += 1
+                result.status = "partial"
                 if rule_hit_count[rule_id] == ctx.max_per_rule + 1:
                     result.notes.append({
                         "rule_id": rule_id,
@@ -182,23 +208,28 @@ class SemgrepAdapter(EngineAdapter):
 
         # 记录 semgrep 的错误/警告
         for err in data.get("errors", []):
+            result.status = "partial"
             result.notes.append({"engine": self.name, "note": f"semgrep error: {err.get('message', '')}"})
+        if parse_failures:
+            result.status = "partial"
+            result.notes.append({"engine": self.name, "note": f"{parse_failures} 条 Semgrep 结果解析失败"})
 
         return result
 
 
 def _find_semgrep() -> str | None:
-    # 1. 优先用 scan-android venv（版本固定、不受系统/conda 影响）
+    # 只接受 scan-android 管理的固定版本，避免 PATH/旧 venv 让规则语义漂移。
     try:
-        from tools.installer import venv_bin
+        from tools.installer import _SEMGREP_VERSION, _venv_package_version, venv_bin
         venv_semgrep = venv_bin("semgrep")
-        if Path(venv_semgrep).exists():
+        if (
+            Path(venv_semgrep).exists()
+            and _venv_package_version("semgrep") == _SEMGREP_VERSION
+        ):
             return venv_semgrep
     except Exception:
         pass
-    # 2. 系统 PATH 已有安装（兼容用户自行安装或 conda 环境中的 semgrep）
-    import shutil
-    return shutil.which("semgrep")
+    return None
 
 
 def _parse_result(item: dict, repo: Path, scope_set: set[str]) -> Candidate | None:
@@ -234,6 +265,7 @@ def _parse_result(item: dict, repo: Path, scope_set: set[str]) -> Candidate | No
         snippet = _read_snippet_from_file(repo, rel, line, end_line)
 
     snippet = snippet[:300]
+    dataflow_path = _extract_dataflow_path(extra, repo)
 
     return Candidate(
         engine="semgrep",
@@ -246,7 +278,66 @@ def _parse_result(item: dict, repo: Path, scope_set: set[str]) -> Candidate | No
         severity=severity,
         snippet=snippet,
         message=message,
+        dataflow_path=dataflow_path,
     )
+
+
+def _extract_dataflow_path(extra: dict, repo: Path) -> list[dict]:
+    """把 Semgrep taint 的 dataflow_trace 归一化为 source→sink 节点。
+
+    Semgrep 各版本对 taint_source/taint_sink 使用 tuple-like list 或 location
+    对象；这里递归寻找带 path/start 的 location，避免绑定某个小版本 schema。
+    """
+    repo = repo.resolve()
+    trace = extra.get("dataflow_trace")
+    if not isinstance(trace, dict):
+        return []
+
+    def locations(value, label: str):
+        found: list[dict] = []
+        if isinstance(value, list):
+            for item in value:
+                found.extend(locations(item, label))
+            return found
+        if not isinstance(value, dict):
+            return found
+        loc = value.get("location") if isinstance(value.get("location"), dict) else value
+        path = loc.get("path") if isinstance(loc, dict) else None
+        start = loc.get("start", {}) if isinstance(loc, dict) else {}
+        if path and isinstance(start, dict):
+            try:
+                raw_path = Path(str(path))
+                try:
+                    rel = raw_path.resolve().relative_to(repo).as_posix()
+                except ValueError:
+                    rel = raw_path.as_posix()
+                content = value.get("content") or loc.get("content") or label
+                if isinstance(content, dict):
+                    content = content.get("value") or content.get("text") or label
+                found.append({
+                    "file": rel,
+                    "line": int(start.get("line", 0)),
+                    "message": str(content).strip()[:300] or label,
+                })
+                return found
+            except (TypeError, ValueError):
+                pass
+        for child in value.values():
+            found.extend(locations(child, label))
+        return found
+
+    ordered: list[dict] = []
+    ordered.extend(locations(trace.get("taint_source"), "taint source"))
+    ordered.extend(locations(trace.get("intermediate_vars", []), "intermediate value"))
+    ordered.extend(locations(trace.get("taint_sink"), "taint sink"))
+    deduped: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for node in ordered:
+        key = (node["file"], node["line"], node["message"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(node)
+    return deduped
 
 
 def _read_snippet_from_file(repo: Path, rel_path: str, start_line: int, end_line: int) -> str:

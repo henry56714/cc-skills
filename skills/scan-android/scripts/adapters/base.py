@@ -16,12 +16,7 @@ from lib_scan import Candidate
 
 
 class InstallationError(Exception):
-    """引擎已被配置为必需，但安装（下载）失败。
-
-    由 adapter 的 is_available() 抛出，区别于"未启用"（返回 False）：
-    - 未启用   → 返回 (False, reason)，run_engines 静默跳过
-    - 安装失败 → 抛出 InstallationError，run_engines 中止整次扫描并报错
-    """
+    """引擎安装失败；编排器记录 failed 并保留其他引擎结果。"""
 
 
 @dataclass
@@ -31,10 +26,10 @@ class ScanContext:
     repo: Path
     scope_files: list[str]
     rules_dir: Path
-    max_per_rule: int = 100
+    max_per_rule: int = 0
     detect_info: dict = field(default_factory=dict)
-    opt_in_engines: list[str] = field(default_factory=list)
     excluded_engines: list[str] = field(default_factory=list)
+    allow_build_execution: bool = False
 
 
 @dataclass
@@ -48,6 +43,12 @@ class AdapterResult:
     rules_total: int = 0
     available: bool = True
     unavailable_reason: str = ""
+    # complete | partial | failed | not_applicable；partial 表示超时、解析错误或显式截断。
+    status: str = "complete"
+    truncated: int = 0
+    # 规则真实命中但按候选 profile 未送入漏洞 verifier 的数量；必须显式记账。
+    suppressed: int = 0
+    suppression_summary: dict[str, int] = field(default_factory=dict)
 
 
 class EngineAdapter(ABC):

@@ -421,7 +421,7 @@ rules:
   languages:
   - xml
   severity: WARNING
-  message: 'R-SG-015: android:allowBackup=true 允许 adb 导出私有数据'
+  message: 'R-SG-015: android:allowBackup=true 可能让默认范围内的数据进入系统备份或设备迁移；需结合 SDK 与备份规则验证'
   pattern-regex: android:allowBackup\s*=\s*"true"
   paths:
     include:
@@ -1273,3 +1273,130 @@ rules:
     rule_id: R-SG-055
     category: perf/heavy-onreceive
     severity: major
+- id: scan-android-r-sec-056-intent-to-webview-taint
+  mode: taint
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SG-056: 外部 Intent/URI/Bundle 数据流入 WebView 执行或导航接口'
+  pattern-sources:
+  - pattern-either:
+    - pattern: $I.getStringExtra(...)
+    - pattern: $I.getCharSequenceExtra(...)
+    - pattern: $I.getDataString()
+    - pattern: $I.getData()
+    - pattern: $U.getQueryParameter(...)
+    - pattern: $B.getString(...)
+  pattern-sinks:
+  - pattern-either:
+    - pattern: $WV.loadUrl(...)
+    - pattern: $WV.evaluateJavascript(...)
+    - pattern: $WV.loadData(...)
+    - pattern: $WV.loadDataWithBaseURL(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+    exclude:
+    - '**/test/**'
+    - '**/androidTest/**'
+  metadata:
+    rule_id: R-SG-056
+    category: security/webview-untrusted-data-flow
+    severity: critical
+- id: scan-android-r-sec-057-intent-to-command-taint
+  mode: taint
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SG-057: 外部 Intent/URI/Bundle 数据流入命令执行接口'
+  pattern-sources:
+  - pattern-either:
+    - pattern: $I.getStringExtra(...)
+    - pattern: $I.getDataString()
+    - pattern: $U.getQueryParameter(...)
+    - pattern: $B.getString(...)
+  pattern-sinks:
+  - pattern-either:
+    - pattern: Runtime.getRuntime().exec(...)
+    - pattern: $R.exec(...)
+    - pattern: new ProcessBuilder(...)
+    - pattern: ProcessBuilder(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+    exclude:
+    - '**/test/**'
+    - '**/androidTest/**'
+  metadata:
+    rule_id: R-SG-057
+    category: security/command-injection-data-flow
+    severity: critical
+- id: scan-android-r-sec-058-external-to-sql-taint
+  mode: taint
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SG-058: 外部 Intent/URI/Bundle 数据流入原始 SQL 接口'
+  pattern-sources:
+  - pattern-either:
+    - pattern: $I.getStringExtra(...)
+    - pattern: $I.getDataString()
+    - pattern: $U.getQueryParameter(...)
+    - pattern: $B.getString(...)
+  pattern-sinks:
+  - pattern-either:
+    - pattern: $DB.rawQuery(...)
+    - pattern: $DB.execSQL(...)
+    - pattern: $DB.compileStatement(...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+    exclude:
+    - '**/test/**'
+    - '**/androidTest/**'
+  metadata:
+    rule_id: R-SG-058
+    category: security/sql-injection-data-flow
+    severity: critical
+- id: scan-android-r-sec-059-external-to-file-taint
+  mode: taint
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SG-059: 外部路径或 ZIP 条目名数据流入文件系统接口'
+  pattern-sources:
+  - pattern-either:
+    - pattern: $I.getStringExtra(...)
+    - pattern: $I.getDataString()
+    - pattern: $U.getQueryParameter(...)
+    - pattern: $B.getString(...)
+    - pattern: $ENTRY.getName()
+  pattern-sinks:
+  - pattern-either:
+    - pattern: new File($PATH)
+    - pattern: new File($BASE, $PATH)
+    - pattern: File($PATH)
+    - pattern: File($BASE, $PATH)
+    - pattern: new FileInputStream($PATH)
+    - pattern: new FileOutputStream($PATH)
+    - pattern: FileInputStream($PATH)
+    - pattern: FileOutputStream($PATH)
+    - pattern: $CTX.openFileOutput($PATH, ...)
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+    exclude:
+    - '**/test/**'
+    - '**/androidTest/**'
+  metadata:
+    rule_id: R-SG-059
+    category: security/path-traversal-data-flow
+    severity: critical

@@ -1,10 +1,4 @@
-"""Tests for scripts/merge_findings.py — within-scan dedup, schema, origin gate, exit codes.
-
-Predicate helpers are tested by import; end-to-end behavior is driven through the
-script's stdin/stdout contract via subprocess (how the workflow actually calls it).
-
-Runs with both `python3 -m unittest` (zero deps) and `pytest`.
-"""
+"""End-to-end tests for confirmed/needs-review merge behavior."""
 
 import hashlib
 import json
@@ -16,112 +10,233 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
-
-import merge_findings as mf  # noqa: E402  (after sys.path tweak)
+import merge_findings as mf  # noqa: E402
 
 MERGE_SCRIPT = SCRIPTS / "merge_findings.py"
 
 
-def _run_merge(candidates, extra_args=()):
-    """Run merge_findings.py with candidates on stdin; return (proc, written_json_or_None)."""
-    with tempfile.TemporaryDirectory() as d:
-        out_path = Path(d) / "findings.json"
-        proc = subprocess.run(
-            [sys.executable, str(MERGE_SCRIPT), "--findings", str(out_path), *extra_args],
-            input=json.dumps(candidates),
-            capture_output=True,
-            text=True,
-        )
-        written = (
-            json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else None
-        )
-    return proc, written
-
-
 def _candidate(**override):
-    base = {
-        "file": "app/Foo.java",
-        "line": 42,
-        "rule_id": "R-SEC-001",
-        "category": "security/hardcoded-secret",
-        "severity": "critical",
+    item = {
+        "file": "app/Foo.java", "line": 42, "rule_id": "R-SEC-001",
+        "category": "security/hardcoded-secret", "severity": "critical",
         "title": "t", "evidence": "e", "why": "w", "repro": "r", "suggestion": "s",
     }
-    base.update(override)
-    return base
+    item.update(override)
+    return item
 
 
-class OriginGatePredicates(unittest.TestCase):
-    def test_needs_origin_by_prefix(self):
+def _root(failure_mode="hardcoded-client-secret"):
+    return {
+        "primary_file": "app/Foo.java",
+        "symbol": "Foo.report",
+        "failure_mode": failure_mode,
+    }
+
+
+def _run(payload):
+    with tempfile.TemporaryDirectory() as tmp:
+        findings = Path(tmp) / "findings.json"
+        review = Path(tmp) / "review.json"
+        proc = subprocess.run(
+            [sys.executable, str(MERGE_SCRIPT), "--findings", str(findings),
+             "--needs-review", str(review)],
+            input=json.dumps(payload), capture_output=True, text=True,
+        )
+        found_obj = json.loads(findings.read_text()) if findings.exists() else None
+        review_obj = json.loads(review.read_text()) if review.exists() else None
+        return proc, found_obj, review_obj
+
+
+def _run_verified_glob(batch_count: int, verified_indices: list[int]):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        out = root / ".scan/tmp"
+        out.mkdir(parents=True)
+        batch_files = []
+        for index in range(batch_count):
+            batch = out / f"verify_batch_{index}.json"
+            batch.write_text("[]")
+            batch_files.append(str(batch))
+        (out / "verify_coverage.json").write_text(json.dumps({
+            "coverage_ok": True,
+            "candidates_input": 0,
+            "candidates_batched": 0,
+            "batches": batch_count,
+            "batch_files": batch_files,
+        }))
+        for index in verified_indices:
+            (out / f"verified_batch_{index}.json").write_text(
+                json.dumps({
+                    "batch": index,
+                    "candidates_input": 0,
+                    "candidates_adjudicated": 0,
+                    "false_positive_count": 0,
+                    "duplicates_merged_count": 0,
+                    "confirmed": [],
+                    "needs_review": [],
+                })
+            )
+        findings = root / ".scan/findings.json"
+        review = root / ".scan/needs-review.json"
+        proc = subprocess.run(
+            [sys.executable, str(MERGE_SCRIPT),
+             "--verified-glob", ".scan/tmp/verified_batch_*.json",
+             "--findings", str(findings), "--needs-review", str(review)],
+            cwd=root, capture_output=True, text=True,
+        )
+        return proc, findings.exists(), review.exists()
+
+
+class Predicates(unittest.TestCase):
+    def test_origin_predicates(self):
         self.assertTrue(mf._needs_origin("perf/main-thread"))
-        self.assertTrue(mf._needs_origin("stability/static-context-leak"))
+        self.assertTrue(mf._needs_origin("security/sql-injection-data-flow"))
+        self.assertTrue(mf._needs_origin("security/exported-unprotected"))
         self.assertFalse(mf._needs_origin("security/hardcoded-secret"))
-
-    def test_needs_origin_by_substring(self):
-        self.assertTrue(mf._needs_origin("security/something-data-flow"))
-        self.assertTrue(mf._needs_origin("security/越权-call"))
-
-    def test_has_origin(self):
-        self.assertTrue(mf._has_origin({"dataflow_path": [{"file": "a"}]}))
-        self.assertTrue(mf._has_origin({"origin_trace": [1]}))
-        self.assertFalse(mf._has_origin({}))
+        self.assertTrue(mf._has_origin({"dataflow_path": [{"line": 1}]}))
         self.assertFalse(mf._has_origin({"dataflow_path": []}))
 
 
 class MergeEndToEnd(unittest.TestCase):
-    def test_schema_id_and_defaults(self):
-        proc, written = _run_merge([_candidate()])
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(written["schema_version"], 2)
-        self.assertEqual(len(written["findings"]), 1)
-        f = written["findings"][0]
-        self.assertEqual(
-            f["id"],
-            hashlib.sha1(b"app/Foo.java:42:security/hardcoded-secret").hexdigest(),
-        )
-        self.assertEqual(f["status"], "open")
-        self.assertEqual(f["end_line"], 42)  # defaults to line when absent
-        stats = json.loads(proc.stdout.strip())
-        self.assertEqual(stats["findings_total"], 1)
-        self.assertEqual(stats["findings_duplicate"], 0)
-
-    def test_dedup_keeps_first_of_same_file_line_category(self):
-        proc, written = _run_merge([_candidate(title="first"), _candidate(title="second")])
-        self.assertEqual(len(written["findings"]), 1)
-        self.assertEqual(written["findings"][0]["title"], "first")
-        self.assertEqual(json.loads(proc.stdout.strip())["findings_duplicate"], 1)
-
-    def test_different_category_not_deduped(self):
-        proc, written = _run_merge([_candidate(), _candidate(category="perf/algo")])
-        self.assertEqual(len(written["findings"]), 2)
-
-    def test_missing_required_field_exits_2(self):
-        bad = _candidate()
-        del bad["why"]
-        proc, _ = _run_merge([bad])
+    def test_verified_glob_rejects_missing_batch(self):
+        proc, findings_exists, review_exists = _run_verified_glob(2, [0])
         self.assertEqual(proc.returncode, 2)
+        self.assertIn("verifier 批次不完整", proc.stderr)
+        self.assertFalse(findings_exists)
+        self.assertFalse(review_exists)
 
-    def test_origin_gate_drops_unproven_conditional_finding(self):
-        proc, written = _run_merge([_candidate(category="perf/main-thread")])
-        self.assertEqual(len(written["findings"]), 0)
-        self.assertEqual(
-            json.loads(proc.stdout.strip())["findings_dropped_no_origin"], 1
-        )
-
-    def test_origin_gate_keeps_finding_with_dataflow_path(self):
-        proc, written = _run_merge(
-            [_candidate(
-                category="perf/main-thread",
-                dataflow_path=[{"file": "A", "line": 1, "message": "src"}],
-            )]
-        )
-        self.assertEqual(len(written["findings"]), 1)
-        self.assertIn("dataflow_path", written["findings"][0])
-
-    def test_empty_input_writes_empty_findings(self):
-        proc, written = _run_merge([])
+    def test_verified_glob_accepts_exact_coverage(self):
+        proc, findings_exists, review_exists = _run_verified_glob(2, [0, 1])
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(written, {"schema_version": 2, "findings": []})
+        self.assertTrue(findings_exists)
+        self.assertTrue(review_exists)
+
+    def test_adjudication_receipt_rejects_unaccounted_candidates(self):
+        with self.assertRaises(ValueError):
+            mf._validate_adjudication({
+                "batch": 0,
+                "candidates_input": 2,
+                "candidates_adjudicated": 2,
+                "false_positive_count": 0,
+                "duplicates_merged_count": 0,
+                "confirmed": [],
+                "needs_review": [],
+            }, Path("verified_batch_0.json"), 0, 2)
+
+    def test_schema_id_and_bare_array_compatibility(self):
+        proc, found, review = _run([_candidate()])
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(found["schema_version"], 4)
+        f = found["findings"][0]
+        expected = hashlib.sha1(
+            b"app/Foo.java:42:security/hardcoded-secret:R-SEC-001"
+        ).hexdigest()
+        self.assertEqual(f["id"], expected)
+        self.assertEqual(f["end_line"], 42)
+        self.assertEqual(review, {"schema_version": 2, "needs_review": []})
+
+    def test_same_line_category_different_rule_is_preserved(self):
+        _, found, _ = _run({"confirmed": [
+            _candidate(rule_id="R-A"), _candidate(rule_id="R-B")
+        ], "needs_review": []})
+        self.assertEqual(len(found["findings"]), 2)
+
+    def test_exact_duplicate_keeps_richer_evidence(self):
+        _, found, _ = _run({"confirmed": [
+            _candidate(evidence="x"), _candidate(evidence="much richer evidence")
+        ], "needs_review": []})
+        self.assertEqual(len(found["findings"]), 1)
+        self.assertEqual(found["findings"][0]["evidence"], "much richer evidence")
+
+    def test_cross_file_same_root_cause_merges_and_keeps_locations(self):
+        first = _candidate(root_cause=_root(), source_candidate_ids=["a"],
+                           provenance=[{"source_kind": "ai_hunter", "hunter_sample": 0}])
+        second = _candidate(
+            file="app/network_security_config.xml", line=8,
+            category="security/cleartext-transport", rule_id="R-AI-034",
+            root_cause=_root(), source_candidate_ids=["b"],
+            provenance=[{"source_kind": "ai_hunter", "hunter_sample": 1}],
+        )
+        proc, found, _ = _run({"confirmed": [first, second], "needs_review": []})
+        self.assertEqual(len(found["findings"]), 1)
+        merged = found["findings"][0]
+        self.assertEqual(merged["dedup_scope"], "root_cause")
+        self.assertEqual(set(merged["source_candidate_ids"]), {"a", "b"})
+        self.assertEqual(len(merged["related_locations"]), 2)
+        self.assertEqual(json.loads(proc.stdout)["semantic_duplicates_merged"], 1)
+
+    def test_missing_origin_moves_to_review(self):
+        proc, found, review = _run({
+            "confirmed": [_candidate(category="perf/main-thread")], "needs_review": []
+        })
+        self.assertEqual(found["findings"], [])
+        self.assertEqual(len(review["needs_review"]), 1)
+        stats = json.loads(proc.stdout)
+        self.assertEqual(stats["moved_to_review_no_origin"], 1)
+
+    def test_needs_review_accepts_relaxed_explanatory_fields(self):
+        item = _candidate()
+        item.pop("why")
+        item.pop("repro")
+        item.pop("suggestion")
+        item["review_reason"] = "merged manifest unavailable"
+        proc, _, review = _run({"confirmed": [], "needs_review": [item]})
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(review["needs_review"][0]["review_reason"], "merged manifest unavailable")
+
+    def test_confirmed_wins_over_same_needs_review_item(self):
+        confirmed = _candidate(dataflow_path=[{"file": "app/Foo.java", "line": 42}])
+        review_item = _candidate(review_reason="uncertain")
+        _, found, review = _run({
+            "confirmed": [confirmed],
+            "needs_review": [review_item],
+        })
+        self.assertEqual(len(found["findings"]), 1)
+        self.assertEqual(review["needs_review"], [])
+
+    def test_confirmed_wins_over_cross_file_review_with_same_root(self):
+        confirmed = _candidate(root_cause=_root())
+        review_item = _candidate(
+            file="app/Config.xml", line=9, category="security/cleartext",
+            rule_id="R-AI-034", root_cause=_root(), review_reason="uncertain",
+        )
+        proc, found, review = _run({"confirmed": [confirmed], "needs_review": [review_item]})
+        self.assertEqual(len(found["findings"]), 1)
+        self.assertEqual(review["needs_review"], [])
+        self.assertEqual(json.loads(proc.stdout)["confirmed_review_conflicts_resolved"], 1)
+
+    def test_bad_confirmed_rejected(self):
+        bad = _candidate()
+        bad.pop("why")
+        proc, found, _ = _run({"confirmed": [bad], "needs_review": []})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIsNone(found)
+
+    def test_empty_input_writes_both_outputs(self):
+        proc, found, review = _run({"confirmed": [], "needs_review": []})
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(found, {"schema_version": 4, "findings": []})
+        self.assertEqual(review, {"schema_version": 2, "needs_review": []})
+
+    def test_verified_output_requires_root_cause_and_provenance(self):
+        input_items = [{"candidate_id": "c1"}]
+        with self.assertRaisesRegex(ValueError, "root_cause"):
+            mf._validate_adjudication({
+                "batch": 0, "candidates_input": 1, "candidates_adjudicated": 1,
+                "false_positive_count": 0, "duplicates_merged_count": 0,
+                "confirmed": [_candidate()], "needs_review": [],
+            }, Path("verified_batch_0.json"), 0, input_items)
+
+    def test_verified_provenance_count_is_conserved(self):
+        item = _candidate(
+            root_cause=_root(), source_candidate_ids=["c1", "c2"],
+            provenance=[{"source_kind": "ai_hunter"}],
+        )
+        mf._validate_adjudication({
+            "batch": 0, "candidates_input": 2, "candidates_adjudicated": 2,
+            "false_positive_count": 0, "duplicates_merged_count": 1,
+            "confirmed": [item], "needs_review": [],
+        }, Path("verified_batch_0.json"), 0, [{"candidate_id": "c1"}, {"candidate_id": "c2"}])
 
 
 if __name__ == "__main__":

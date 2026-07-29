@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-repo_map.py — tree-sitter 驱动的跨文件「代码地图」+ AST 精确调用/类型导航（唯一精确层）。
+repo_map.py — tree-sitter 驱动的跨文件代码地图与语法级调用/类型导航。
 
 动机（见 SKILL.md 第 5.5 步与 CLAUDE.md「Engine set」）：
   hunter（AI 检测子代理）过去只拿到批次文件、孤立 Read，**既无 repo 全局代码地图、也不能查调用关系**
@@ -11,12 +11,11 @@ repo_map.py — tree-sitter 驱动的跨文件「代码地图」+ AST 精确调�
     2. 建符号引用图，纯标准库幂迭代 PageRank 排序（被引多的类/方法权重高）；
     3. 在 token 预算内输出签名骨架（函数体折叠为 `...`）——「全局地图」或「聚焦地图」；
     4. 同时暴露与 source_nav 同接口的 get_callers/get_definition/get_type_hierarchy/trace_origin，
-       供 nav_tools.py 作**唯一精确后端**（AST 精确：不误命中注释/字符串，enclosing scope 精确）。
+       供 nav_tools.py 作语法索引后端（不误命中注释/字符串，能定位 enclosing scope）。
 
-诚实取舍：AST 精确识别 def/ref，但**不解析重载/接收者类型**——常见名（init/d）消歧仍是名义级，
+诚实取舍：AST 识别 def/ref，但**不解析重载/接收者类型/动态分派**——常见名（init/d）消歧仍是名义级，
 由 verifier 逐跳 Read 补齐（与 source-nav 一致）。相比 source-nav 的正则，精度提升在「不误命中
-非代码文本 + enclosing 精确 + Kotlin 结构正确」；相比 joern 放弃了编译器级消歧，换来免编译 +
-Kotlin 无盲区 + 兼服务 hunter。
+非代码文本 + enclosing scope 更可靠 + Kotlin 结构可解析」；它不是编译器级语义调用图。
 
 依赖与降级：
   - tree-sitter + tree-sitter-language-pack 装在独立 venv（~/.scan-android/repomap-venv/，比照 semgrep）。
@@ -46,7 +45,10 @@ REPOMAP_VENV = Path(os.environ.get(
     "SCAN_ANDROID_REPOMAP_VENV", Path.home() / ".scan-android" / "repomap-venv"))
 
 _SRC_LANG = {".java": "java", ".kt": "kotlin"}
-_SKIP_DIRS = {"build", ".gradle", ".git", "generated", ".idea", "node_modules"}
+_SKIP_DIRS = {
+    "build", ".gradle", ".git", "generated", ".idea", "node_modules",
+    ".cxx", ".externalNativeBuild", "CMakeFiles", ".scan", ".vscode", "docs",
+}
 _MAX_FILE_BYTES = 800_000
 _CHARS_PER_TOKEN = 4  # 粗略 token 估算（char/4），仅用于预算截断
 
@@ -286,32 +288,35 @@ class RepoMap:
     def trace_origin(self, symbol: str, max_depth: int = 6, max_callers: int = 25) -> dict[str, Any]:
         method = self._method_hint(symbol) or symbol
         defs = self.get_definition(symbol)
-        visited: set[str] = set()
-
-        def expand(name: str, depth: int) -> list[dict[str, Any]]:
-            if depth <= 0 or name in visited or not name:
-                return [{"truncated": True, "reason": "达到深度上限或检测到环"}] if name and (name in visited or depth <= 0) else []
-            visited.add(name)
+        def expand(name: str, depth: int, path: frozenset[str]) -> list[dict[str, Any]]:
+            # Path-local cycle detection keeps independent same-name branches.
+            if depth <= 0 or name in path or not name:
+                return [{"truncated": True, "reason": "达到深度上限或检测到当前路径中的环"}] if name and (name in path or depth <= 0) else []
+            next_path = path | {name}
             callers = self.get_callers(name)
             nodes: list[dict[str, Any]] = []
             for c in callers[:max_callers]:
                 node = dict(c)
                 enc = c.get("enclosing_symbol") or ""
                 if enc and depth > 1:
-                    node["callers"] = expand(enc, depth - 1)
+                    node["callers"] = expand(enc, depth - 1, next_path)
                 elif not enc:
                     node["note"] = "无法定位调用所在方法（lambda/匿名类/字段初始化，请 Read 复核）"
                 nodes.append(node)
             if len(callers) > max_callers:
                 nodes.append({"truncated": True, "reason": f"调用方过多，仅列前 {max_callers} 个"})
             if not callers:
-                nodes.append({"entry_point": True, "note": "无调用方（入口/未被调用/仅经接口或反射调用）"})
+                nodes.append({
+                    "terminal_no_callers": True,
+                    "entry_point": False,
+                    "note": "AST 名义索引未找到调用方；可能是框架入口、未调用代码、接口分派或反射，须结合 Manifest/override 复核",
+                })
             return nodes
 
         chains = []
         for d in (defs or [{"symbol": symbol, "file": "", "line": 0}]):
             chains.append({"symbol": d["symbol"], "definition": {"file": d["file"], "line": d["line"]},
-                           "callers": expand(method, max_depth)})
+                           "callers": expand(method, max_depth, frozenset())})
         return {"target": symbol, "chains": chains, "backend": "treesitter"}
 
     # ---- 地图渲染 ----
@@ -453,7 +458,6 @@ def _source_nav_fallback(repo: str):
 
 def _degraded_map_from_source(repo: str, files: list[str]) -> str:
     """tree-sitter 不可用时的降级地图：用 source_nav 的定义抽取列签名（名义级）。"""
-    nav = _source_nav_fallback(repo)
     out = ["# 代码地图（降级：tree-sitter 不可用，改用 source-nav 名义级抽取）", ""]
     for rel in files:
         out.append(f"### {rel}")

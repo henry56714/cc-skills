@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -27,23 +28,25 @@ _RULE_MAP: dict[str, tuple[str, str, str]] = {
     "TooGenericExceptionCaught": ("R-DK-001", "stability/swallowed-exception", "major"),
     "SwallowedException": ("R-DK-001", "stability/swallowed-exception", "major"),
     "EmptyCatchBlock": ("R-DK-001", "stability/swallowed-exception", "major"),
-    "ComplexCondition": ("R-DK-001", "stability/swallowed-exception", "minor"),
-    "MissingWhenCase": ("R-DK-001", "stability/swallowed-exception", "major"),
     "GlobalCoroutineUsage": ("R-DK-002", "stability/globalscope", "major"),
     "InjectDispatcher": ("R-DK-002", "stability/globalscope", "minor"),
+    "SleepInsteadOfDelay": ("R-DK-002", "stability/blocking-call-in-coroutine", "major"),
+    "SuspendFunWithFlowReturnType": ("R-DK-002", "stability/coroutine-api-misuse", "minor"),
     "UnnecessaryNotNullOperator": ("R-DK-003", "stability/kotlin-not-null-assert", "minor"),
     "UnsafeCallOnNullableType": ("R-DK-003", "stability/kotlin-not-null-assert", "major"),
     "NullableToStringCall": ("R-DK-003", "stability/kotlin-not-null-assert", "minor"),
     "UnsafeCast": ("R-DK-003", "stability/kotlin-not-null-assert", "major"),
     "LateinitUsage": ("R-DK-003", "stability/kotlin-not-null-assert", "minor"),
     "UselessCallOnNotNull": ("R-DK-003", "stability/kotlin-not-null-assert", "info"),
-    "HardCodedStringLiteral": ("R-DK-004", "security/hardcoded-secret", "minor"),
     "ForbiddenComment": ("R-DK-004", "security/hardcoded-secret", "info"),
-    "MaxLineLength": ("R-DK-005", "perf/string-concat-in-loop", "info"),
-    "LongMethod": ("R-DK-006", "perf/hotpath-allocation", "minor"),
-    "NestedBlockDepth": ("R-DK-007", "stability/broken-dcl", "minor"),
-    "ThreadSafeValidator": ("R-DK-008", "stability/non-threadsafe-formatter", "major"),
-    "SuspendFunWithFlowReturnType": ("R-DK-009", "stability/rxjava-disposable-leak", "major"),
+    "HasPlatformType": ("R-DK-005", "stability/platform-type", "minor"),
+    "UnreachableCode": ("R-DK-006", "stability/unreachable-code", "minor"),
+    "InvalidRange": ("R-DK-007", "stability/invalid-range", "major"),
+    "IteratorHasNextCallsNextMethod": ("R-DK-008", "stability/iterator-contract", "major"),
+    "IteratorNotThrowingNoSuchElementException": ("R-DK-008", "stability/iterator-contract", "major"),
+    "MapGetWithNotNullAssertionOperator": ("R-DK-003", "stability/kotlin-not-null-assert", "major"),
+    "UnconditionalJumpStatementInLoop": ("R-DK-009", "stability/loop-control", "minor"),
+    "WrongEqualsTypeParameter": ("R-DK-010", "stability/equals-contract", "major"),
 }
 
 _DEFAULT_RULE = ("R-DK-000", "stability/general", "minor")
@@ -80,54 +83,62 @@ class DetektAdapter(EngineAdapter):
         # 只处理 Kotlin 文件
         kt_files = [f for f in ctx.scope_files if f.endswith(".kt")]
         if not kt_files:
+            result.status = "not_applicable"
             result.notes.append({"engine": self.name, "note": "作用域内无 Kotlin 文件，跳过"})
             return result
 
         # 直接传入 scope 内的 Kotlin 文件（绝对路径），避免扫描整个模块目录
         input_paths = [str(ctx.repo / f) for f in kt_files]
 
-        with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tf:
-            report_xml = tf.name
+        with tempfile.TemporaryDirectory(prefix="scan-android-detekt-") as tmp:
+            report_xml = str(Path(tmp) / "detekt.xml")
+            cmd = [
+                "java", "-jar", str(jar),
+                "--input", ",".join(input_paths),
+                "--report", f"xml:{report_xml}",
+            ]
+            if _DETEKT_CONFIG.exists():
+                cmd += ["--config", str(_DETEKT_CONFIG)]
+            cmd += ["--jvm-target", "11"]
 
-        cmd = [
-            "java", "-jar", str(jar),
-            "--input", ",".join(input_paths),
-            "--report", f"xml:{report_xml}",
-        ]
-        if _DETEKT_CONFIG.exists():
-            cmd += ["--config", str(_DETEKT_CONFIG)]
-        cmd += ["--jvm-target", "11"]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    cwd=str(ctx.repo),
+                )
+            except subprocess.TimeoutExpired:
+                result.status = "partial"
+                result.notes.append({"engine": self.name, "note": "Detekt 超时（300s）"})
+                return result
+            except Exception as e:
+                result.available = False
+                result.status = "failed"
+                result.unavailable_reason = f"Detekt 运行失败: {e}"
+                return result
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                cwd=str(ctx.repo),
-            )
-        except subprocess.TimeoutExpired:
-            result.notes.append({"engine": self.name, "note": "Detekt 超时（300s）"})
-            return result
-        except Exception as e:
-            result.available = False
-            result.unavailable_reason = f"Detekt 运行失败: {e}"
-            return result
+            # Detekt CLI: 0=正常且未超阈值，2=规则命中超过 maxIssues；1=异常，3=配置错误。
+            if proc.returncode not in (0, 2):
+                result.status = "failed" if proc.returncode == 3 else "partial"
+                result.notes.append({
+                    "engine": self.name,
+                    "note": f"Detekt 退出码 {proc.returncode}: {(proc.stderr or proc.stdout)[:300]}",
+                })
+                if proc.returncode == 3:
+                    result.available = False
+                    result.unavailable_reason = "Detekt 配置校验失败"
+                    return result
 
-        # Detekt 退出码: 0=无问题, 1=有问题(低于阈值), 2=有问题(超过maxIssues), 3=配置错误
-        if proc.returncode == 3:
-            result.available = False
-            result.unavailable_reason = f"Detekt 配置错误: {(proc.stderr or proc.stdout)[:300]}"
-            return result
-
-        # 解析 XML 报告
-        try:
-            candidates, rules_run = _parse_xml_report(report_xml, ctx.repo, ctx.scope_files)
-            result.candidates = candidates
-            result.rules_run = rules_run
-            result.rules_total = rules_run
-        except Exception as e:
-            result.notes.append({"engine": self.name, "note": f"XML 报告解析失败: {e}"})
+            try:
+                candidates, rules_run = _parse_xml_report(report_xml, ctx.repo, ctx.scope_files)
+                result.candidates = candidates
+                result.rules_run = rules_run
+                result.rules_total = rules_run
+            except Exception as e:
+                result.status = "failed"
+                result.notes.append({"engine": self.name, "note": f"XML 报告解析失败: {e}"})
 
         return result
 
@@ -135,23 +146,18 @@ class DetektAdapter(EngineAdapter):
 def _find_detekt_jar() -> Path | None:
     from tools.installer import TOOLS_DIR, _DETEKT_VERSION
     jar = TOOLS_DIR / "detekt" / f"detekt-cli-{_DETEKT_VERSION}-all.jar"
-    if jar.exists():
+    if jar.exists() and zipfile.is_zipfile(jar):
         return jar
-    # 在 PATH 中查找 detekt 可执行文件（某些系统通过包管理安装）
-    if shutil.which("detekt"):
-        return Path(shutil.which("detekt"))
     return None
 
 
 def _parse_xml_report(report_path: str, repo: Path, scope_files: list[str]) -> tuple[list[Candidate], int]:
+    repo = repo.resolve()
     scope_set = set(scope_files)
     candidates: list[Candidate] = []
     rules_seen: set[str] = set()
 
-    try:
-        tree = ET.parse(report_path)
-    except ET.ParseError:
-        return [], 0
+    tree = ET.parse(report_path)
 
     root = tree.getroot()
     # Detekt XML 格式: <checkstyle> → <file name="..."> → <error line="..." source="..." message="..."/>

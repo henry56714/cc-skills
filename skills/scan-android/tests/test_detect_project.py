@@ -152,6 +152,15 @@ class LoadConfig(unittest.TestCase):
             p.write_text("[1, 2, 3]", encoding="utf-8")
             self.assertEqual(dp._load_config(p), {})
 
+    def test_invalid_existing_config_is_reported_in_project_notes(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            (repo / ".scan").mkdir()
+            (repo / ".scan/config.json").write_text("[]", encoding="utf-8")
+            info = dp.detect_project(repo)
+            self.assertEqual(info["config"], {})
+            self.assertTrue(any("invalid project config" in note for note in info["notes"]))
+
 
 class SampleRepoIntegration(unittest.TestCase):
     """Smoke test against the real sample repo; skipped when it isn't present."""

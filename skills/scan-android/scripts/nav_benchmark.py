@@ -2,8 +2,7 @@
 """
 nav_benchmark.py — 跨文件调用导航后端的「地面真值」基准评测器。
 
-为什么有它：导航后端（source-nav / scip-java / joern / stack-graphs）当年是靠**一个例子**
-（DbSizeManager#init 的 51% 未解析）拍板取舍的——那是轶事，不是基准。本工具用**人工核验过的
+为什么有它：导航后端不应靠单个案例拍板取舍。本工具用**人工核验过的
 ground-truth 调用集**，对每个可用后端量化 precision / recall / 延迟，让"用谁做默认后端"由数据决定，
 而不是再凭单一例子。
 
@@ -11,7 +10,7 @@ ground-truth 调用集**，对每个可用后端量化 precision / recall / 延�
 
 后端是**可插拔**的（见 BACKENDS 注册表）：
   - source-nav  : 纯标准库源码导航（始终可用，兜底）—— scripts/source_nav.py
-  - treesitter  : tree-sitter AST 精确导航（**唯一运行时精确层**）—— scripts/repo_map.py
+  - treesitter  : tree-sitter 语法级导航 —— scripts/repo_map.py
 
 基准文件格式（JSON，见 --help 末尾或 benchmarks/*.json）：
   {
@@ -32,13 +31,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 SKILL_DIR = Path(__file__).resolve().parent
 SCAN_TOOLS = Path(os.environ.get("SCAN_ANDROID_TOOLS_DIR", os.path.expanduser("~/.scan-android/tools")))
@@ -136,7 +133,7 @@ class SourceNavBackend(Backend):
 
 
 class TreeSitterBackend(Backend):
-    """tree-sitter 精确后端（唯一运行时精确层）。直接调 repo_map.py CLI。
+    """tree-sitter 语法级后端。直接调 repo_map.py CLI。
 
     优先用 repomap venv 的 python（~/.scan-android/repomap-venv/bin/python）以保证
     tree-sitter 可导入；venv 缺失则用当前解释器（repo_map 会自行降级 source-nav——
@@ -228,8 +225,12 @@ def evaluate(ctx: dict[str, Any], bench: dict[str, Any], backends: list[str]) ->
                 sd = score(ret_d, gt_defs)
                 entry = {"callers": sc, "definition": sd, "seconds": round(dt, 3)}
                 a = agg[name]
-                a["tp"] += sc["tp"]; a["ret"] += sc["returned"]; a["truth"] += sc["truth"]
-                a["dtp"] += sd["tp"]; a["dret"] += sd["returned"]; a["dtruth"] += sd["truth"]
+                a["tp"] += sc["tp"]
+                a["ret"] += sc["returned"]
+                a["truth"] += sc["truth"]
+                a["dtp"] += sd["tp"]
+                a["dret"] += sd["returned"]
+                a["dtruth"] += sd["truth"]
                 a["t"] += dt
             except subprocess.TimeoutExpired:
                 entry = {"error": f"超时(>{ctx['timeout']}s)"}
