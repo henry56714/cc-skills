@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-LLM 导航工具 —— 跨文件调用/类型查询的统一门面，把 LLM 从"猜文件"变成"查索引"。
+LLM source-only 导航工具 —— 宿主 LSP 缺失或不完整时的跨文件查询门面。
+
+若 coding agent 宿主提供 LSP，应先使用 definition/references/implementation/call hierarchy；
+本脚本作为确定性降级和 trace-origin 补充，不尝试从 Python 进程控制宿主工具。
 
 后端按 `nav_backend`（config 或 env `SCAN_ANDROID_NAV_BACKEND`，取值 auto|treesitter|source）选择：
   - treesitter（auto 首选）—— tree-sitter 语法级识别 def/ref，不误命中注释/字符串；
-    同名重载、接收者类型与动态分派不消歧，必须由 verifier 逐跳 Read 复核。
+    `Class#method` 会按定义所属类过滤，并给调用边标记 high/ambiguous 置信度；
+    重载、变量接收者类型与动态分派仍须由 verifier 逐跳 Read 复核。
   - source-nav（纯标准库兜底）—— 正则名义级索引，永远可用。**仅当 tree-sitter
     不可用时启用，并打印 `[WARN] nav-degraded` 告警。**
 
@@ -55,7 +59,7 @@ def _nav_backend_pref(repo: Path) -> str:
 
 
 class NavTools:
-    """tree-sitter 语法索引 + source-nav 正则兜底支撑的 LLM 导航工具集。"""
+    """tree-sitter 语法索引 + source-nav 正则兜底支撑的导航工具集。"""
 
     def __init__(self, repo: str | Path):
         self.repo = Path(repo).resolve()
@@ -127,7 +131,7 @@ class NavTools:
         return self._ts if self._ts is not None else self._src
 
     def get_definition(self, symbol: str) -> list[dict[str, Any]]:
-        """查找符号定义位置。symbol 为 `Class#method` 子串，如 "DbSizeManager#init"。
+        """查找符号定义位置。symbol 为 `Class#method`，如 "DbSizeManager#init"。
         返回 [{symbol, file, line}]"""
         return self._backend().get_definition(symbol)
 

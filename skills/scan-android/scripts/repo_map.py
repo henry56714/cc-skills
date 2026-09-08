@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -82,6 +83,8 @@ def repomap_available() -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 _METHOD_DECL_TYPES = {"method_declaration", "constructor_declaration", "function_declaration"}
+_TYPE_DECL_TYPES = {"class_declaration", "interface_declaration", "enum_declaration", "object_declaration"}
+_PACKAGE_RE = re.compile(r"(?m)^\s*package\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)")
 
 
 class RepoMap:
@@ -153,6 +156,30 @@ class RepoMap:
             cur = cur.parent
         return ""
 
+    def _enclosing_type_name(self, node) -> str:
+        """Return the nearest owning class/interface/object name."""
+        cur = node.parent
+        while cur is not None:
+            if cur.type in _TYPE_DECL_TYPES:
+                nm = cur.child_by_field_name("name")
+                if nm is not None:
+                    return self._text(nm)
+                for ch in cur.children:
+                    if ch.type in ("type_identifier", "identifier", "simple_identifier"):
+                        return self._text(ch)
+            cur = cur.parent
+        return ""
+
+    @staticmethod
+    def _receiver_from_line(line: str, method: str) -> str:
+        """Best-effort receiver text for confidence labels; never used as proof."""
+        match = re.search(
+            r"(?:\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\.\s*)?"
+            + re.escape(method) + r"\s*\(",
+            line,
+        )
+        return match.group(1) if match and match.group(1) else ""
+
     # ---- 文件遍历 ----
     def _source_files(self) -> list[Path]:
         out: list[Path] = []
@@ -191,21 +218,41 @@ class RepoMap:
                 continue
             lines = src.split(b"\n")
             rel = self._rel(p)
+            package_match = _PACKAGE_RE.search(src.decode("utf-8", "replace"))
+            package = package_match.group(1) if package_match else ""
             for node, cap in caps:
                 if cap.startswith("name.definition."):
                     kind = cap.rsplit(".", 1)[1]
                     # 签名行取「名字所在行」而非声明起始行——后者可能是 @Override 等注解行
                     row = node.start_point[0]
                     sig = lines[row].decode("utf-8", "replace").strip()[:200] if row < len(lines) else ""
-                    defs.append({"name": self._text(node), "kind": kind,
-                                 "file": rel, "line": row + 1, "sig": sig})
+                    name = self._text(node)
+                    owner = self._enclosing_type_name(node) if kind == "method" else ""
+                    owner_fqn = f"{package}.{owner}" if package and owner else owner
+                    fqn = (
+                        f"{owner_fqn}#{name}" if kind == "method" and owner_fqn
+                        else f"{package}.{name}" if package else name
+                    )
+                    defs.append({"name": name, "kind": kind, "file": rel,
+                                 "line": row + 1, "sig": sig, "package": package,
+                                 "owner": owner, "owner_fqn": owner_fqn, "fqn": fqn})
                 elif cap.startswith("name.reference."):
                     kind = cap.rsplit(".", 1)[1]
                     row = node.start_point[0]
                     snip = lines[row].decode("utf-8", "replace").strip()[:200] if row < len(lines) else ""
-                    refs.append({"name": self._text(node), "kind": kind,
+                    name = self._text(node)
+                    enclosing = self._enclosing_name(node)
+                    enclosing_type = self._enclosing_type_name(node)
+                    enclosing_owner = f"{package}.{enclosing_type}" if package and enclosing_type else enclosing_type
+                    refs.append({"name": name, "kind": kind,
                                  "file": rel, "line": row + 1,
-                                 "enclosing": self._enclosing_name(node), "snippet": snip})
+                                 "package": package, "enclosing": enclosing,
+                                 "enclosing_type": enclosing_type,
+                                 "enclosing_symbol": (
+                                     f"{enclosing_owner}#{enclosing}" if enclosing_owner and enclosing else enclosing
+                                 ),
+                                 "receiver": self._receiver_from_line(snip, name),
+                                 "snippet": snip})
         self._defs, self._refs = defs, refs
 
     # ---- PageRank（纯标准库幂迭代，文件级引用图） ----
@@ -255,30 +302,61 @@ class RepoMap:
     def _type_hint(self, symbol: str) -> str:
         return symbol.split("#", 1)[0].split(".")[-1].strip().strip("`")
 
+    def _class_hint(self, symbol: str) -> str:
+        if "#" not in symbol:
+            return ""
+        hint = self._type_hint(symbol)
+        return "" if hint.lower() in {"", "any", "unknown", "*"} else hint
+
     def get_definition(self, symbol: str) -> list[dict[str, Any]]:
         self.build_index()
         assert self._defs is not None
         method = self._method_hint(symbol)
         if method:
-            return [{"symbol": f"{d['file']}#{d['name']}", "file": d["file"], "line": d["line"]}
-                    for d in self._defs if d["name"] == method and d["kind"] in ("method",)]
+            class_hint = self._class_hint(symbol)
+            return [{"symbol": d["fqn"], "file": d["file"], "line": d["line"],
+                     "owner": d.get("owner_fqn", "")}
+                    for d in self._defs
+                    if d["name"] == method and d["kind"] == "method"
+                    and (not class_hint or d.get("owner") == class_hint)]
         t = self._type_hint(symbol)
-        return [{"symbol": f"{d['file']}#{d['name']}", "file": d["file"], "line": d["line"]}
+        return [{"symbol": d["fqn"], "file": d["file"], "line": d["line"]}
                 for d in self._defs if d["name"] == t and d["kind"] in ("class", "interface", "type")]
 
     def get_callers(self, method: str, depth: int = 1) -> list[dict[str, Any]]:
         self.build_index()
         assert self._refs is not None
         m = self._method_hint(method) or method
-        return [{"file": r["file"], "line": r["line"], "snippet": r["snippet"],
-                 "enclosing_symbol": r["enclosing"]}
-                for r in self._refs if r["name"] == m and r["kind"] == "method"]
+        class_hint = self._class_hint(method)
+        results: list[dict[str, Any]] = []
+        for r in self._refs:
+            if r["name"] != m or r["kind"] != "method":
+                continue
+            receiver_tail = r.get("receiver", "").rsplit(".", 1)[-1]
+            if not class_hint:
+                confidence, matched_by = "nominal", "method-name"
+            elif receiver_tail == class_hint:
+                confidence, matched_by = "high", "explicit-receiver"
+            elif r.get("enclosing_type") == class_hint and receiver_tail in {"", "this", "super"}:
+                confidence, matched_by = "high", "same-owner"
+            else:
+                confidence, matched_by = "ambiguous", "method-name-only"
+            results.append({
+                "file": r["file"], "line": r["line"], "snippet": r["snippet"],
+                "enclosing_symbol": r.get("enclosing_symbol") or r["enclosing"],
+                "receiver": r.get("receiver", ""), "confidence": confidence,
+                "matched_by": matched_by,
+            })
+        return sorted(results, key=lambda item: (
+            {"high": 0, "nominal": 1, "ambiguous": 2}.get(item["confidence"], 3),
+            item["file"], item["line"],
+        ))
 
     def get_type_hierarchy(self, type_name: str) -> dict[str, Any]:
         self.build_index()
         assert self._defs is not None and self._refs is not None
         t = self._type_hint(type_name)
-        defs = [{"symbol": f"{d['file']}#{d['name']}", "file": d["file"], "line": d["line"]}
+        defs = [{"symbol": d["fqn"], "file": d["file"], "line": d["line"]}
                 for d in self._defs if d["name"] == t and d["kind"] in ("class", "interface", "type")]
         refs = [{"file": r["file"], "line": r["line"], "snippet": r["snippet"]}
                 for r in self._refs
@@ -286,14 +364,13 @@ class RepoMap:
         return {"definitions": defs, "references": refs}
 
     def trace_origin(self, symbol: str, max_depth: int = 6, max_callers: int = 25) -> dict[str, Any]:
-        method = self._method_hint(symbol) or symbol
         defs = self.get_definition(symbol)
-        def expand(name: str, depth: int, path: frozenset[str]) -> list[dict[str, Any]]:
+        def expand(query: str, depth: int, path: frozenset[str]) -> list[dict[str, Any]]:
             # Path-local cycle detection keeps independent same-name branches.
-            if depth <= 0 or name in path or not name:
-                return [{"truncated": True, "reason": "达到深度上限或检测到当前路径中的环"}] if name and (name in path or depth <= 0) else []
-            next_path = path | {name}
-            callers = self.get_callers(name)
+            if depth <= 0 or query in path or not query:
+                return [{"truncated": True, "reason": "达到深度上限或检测到当前路径中的环"}] if query and (query in path or depth <= 0) else []
+            next_path = path | {query}
+            callers = self.get_callers(query)
             nodes: list[dict[str, Any]] = []
             for c in callers[:max_callers]:
                 node = dict(c)
@@ -316,7 +393,7 @@ class RepoMap:
         chains = []
         for d in (defs or [{"symbol": symbol, "file": "", "line": 0}]):
             chains.append({"symbol": d["symbol"], "definition": {"file": d["file"], "line": d["line"]},
-                           "callers": expand(method, max_depth, frozenset())})
+                           "callers": expand(d["symbol"] if defs else symbol, max_depth, frozenset())})
         return {"target": symbol, "chains": chains, "backend": "treesitter"}
 
     # ---- 地图渲染 ----
@@ -351,7 +428,8 @@ class RepoMap:
         return "\n".join(out)
 
     def focused_map(self, batch_files: list[str], budget_tokens: int,
-                    risk_by_file: dict[str, int] | None = None) -> str:
+                    risk_by_file: dict[str, int] | None = None,
+                    structural_relations: list[dict[str, Any]] | None = None) -> str:
         """聚焦地图：本批文件的签名骨架 + 其符号的跨文件调用方/被调关系 + 类型层次。
 
         `risk_by_file`（可选，来自批次文件的 risk_score）用于**按风险降序**输出跨文件关系——
@@ -360,8 +438,19 @@ class RepoMap:
         self.build_index()
         assert self._defs is not None and self._refs is not None
         risk_by_file = risk_by_file or {}
+        structural_relations = structural_relations or []
         bset = set(batch_files)
         out: list[str] = ["# 聚焦代码地图（本批符号 + 跨文件关系；线索非结论，仍须逐文件通读）", ""]
+
+        if structural_relations:
+            out.append("## Android/source-set 结构关系")
+            for edge in structural_relations:
+                evidence = ", ".join(str(x) for x in edge.get("evidence", []))
+                out.append(
+                    f"- `{edge.get('source', '')}` → `{edge.get('target', '')}` "
+                    f"[{edge.get('kind', 'relation')}]" + (f"：{evidence}" if evidence else "")
+                )
+            out.append("")
 
         out.append("## 本批文件签名骨架")
         for rel in batch_files:
@@ -370,31 +459,25 @@ class RepoMap:
                 out += block
         out.append("")
 
-        # 跨文件关系：本批定义的符号，谁在批外调用它 / 它调用了批外什么
-        out.append("## 跨文件关系（顺藤摸瓜的线索；按所属文件风险降序）")
-        # 每个本批方法符号 → 其定义所在文件的最高 risk_score（跨同名多定义取最大）
-        name_risk: dict[str, int] = {}
-        for d in self._defs:
-            if d["file"] in bset and d["kind"] == "method":
-                r = risk_by_file.get(d["file"], 0)
-                if r > name_risk.get(d["name"], -1):
-                    name_risk[d["name"]] = r
-        # 风险降序、同风险按名字升序（确定性）
-        batch_names = sorted(name_risk, key=lambda n: (-name_risk[n], n))
-        name_files: dict[str, set[str]] = {}
-        for d in self._defs:
-            name_files.setdefault(d["name"], set()).add(d["file"])
-
+        # 跨文件关系：本批定义的符号，谁在批外调用它 / 本批代码调用了批外什么。
+        out.append("## AST 跨文件关系（FQN/receiver 优先，歧义边显式标记）")
+        batch_defs = sorted(
+            (d for d in self._defs if d["file"] in bset and d["kind"] == "method"),
+            key=lambda d: (-risk_by_file.get(d["file"], 0), d["fqn"], d["line"]),
+        )
         used = len("\n".join(out)) // _CHARS_PER_TOKEN
-        for name in batch_names:
-            # 批外调用方（谁调用了本批方法）
-            ext_callers = [r for r in self._refs
-                           if r["name"] == name and r["kind"] == "method" and r["file"] not in bset]
+        for definition in batch_defs:
+            ext_callers = [r for r in self.get_callers(definition["fqn"]) if r["file"] not in bset]
             if not ext_callers:
                 continue
-            seg = [f"- **{name}()**（所属文件风险 {name_risk.get(name, 0)}）被批外调用："]
+            seg = [
+                f"- **{definition['fqn']}**（所属文件风险 {risk_by_file.get(definition['file'], 0)}）被批外调用："
+            ]
             for r in ext_callers[:8]:
-                seg.append(f"    - {r['file']}:{r['line']}  在 `{r['enclosing'] or '?'}()`  → `{r['snippet']}`")
+                seg.append(
+                    f"    - {r['file']}:{r['line']}  在 `{r['enclosing_symbol'] or '?'}` "
+                    f"[{r['confidence']}/{r['matched_by']}] → `{r['snippet']}`"
+                )
             if len(ext_callers) > 8:
                 seg.append(f"    - …（共 {len(ext_callers)} 处，余略）")
             chunk = "\n".join(seg) + "\n"
@@ -404,6 +487,43 @@ class RepoMap:
                 break
             out.append(chunk)
             used += cost
+
+        defs_by_name: dict[str, list[dict[str, Any]]] = {}
+        for definition in self._defs:
+            if definition["kind"] == "method":
+                defs_by_name.setdefault(definition["name"], []).append(definition)
+        outgoing_seen: set[tuple[str, str, str]] = set()
+        outgoing: list[str] = []
+        for ref in sorted(
+            (r for r in self._refs if r["file"] in bset and r["kind"] == "method"),
+            key=lambda r: (-risk_by_file.get(r["file"], 0), r["file"], r["line"], r["name"]),
+        ):
+            targets = [d for d in defs_by_name.get(ref["name"], []) if d["file"] not in bset]
+            receiver_tail = ref.get("receiver", "").rsplit(".", 1)[-1]
+            if receiver_tail:
+                receiver_targets = [d for d in targets if d.get("owner") == receiver_tail]
+                if receiver_targets:
+                    targets = receiver_targets
+            if len(targets) != 1:
+                continue
+            target = targets[0]
+            key = (ref["file"], ref.get("enclosing_symbol", ""), target["fqn"])
+            if key in outgoing_seen:
+                continue
+            outgoing_seen.add(key)
+            outgoing.append(
+                f"- `{ref['file']}:{ref['line']}` / `{ref.get('enclosing_symbol') or '?'}` "
+                f"调用批外 `{target['fqn']}` → `{target['file']}:{target['line']}`"
+            )
+        if outgoing:
+            out.append("\n### 本批到批外的唯一目标调用")
+            for line in outgoing:
+                cost = len(line) // _CHARS_PER_TOKEN
+                if used + cost > budget_tokens:
+                    out.append(f"\n_（预算 {budget_tokens} tok 已用尽，批外被调关系部分截断）_")
+                    break
+                out.append(line)
+                used += cost
         return "\n".join(out)
 
 
@@ -486,6 +606,12 @@ def _load_batch_risk(repo: Path, batch_file: Path) -> dict[str, int]:
     return out
 
 
+def _load_batch_relations(batch_file: Path) -> list[dict[str, Any]]:
+    obj = json.loads(batch_file.read_text(encoding="utf-8"))
+    relations = obj.get("relation_edges", []) + obj.get("boundary_relations", [])
+    return [edge for edge in relations if isinstance(edge, dict)][:120]
+
+
 def _load_scope_files(repo: Path, scope_file: Path) -> list[str]:
     out: list[str] = []
     for ln in scope_file.read_text(encoding="utf-8").splitlines():
@@ -534,7 +660,8 @@ def main() -> int:
             rm = RepoMap(repo)
             if args.batch_file:
                 md = rm.focused_map(_load_batch_files(repo, Path(args.batch_file)), args.budget,
-                                    risk_by_file=_load_batch_risk(repo, Path(args.batch_file)))
+                                    risk_by_file=_load_batch_risk(repo, Path(args.batch_file)),
+                                    structural_relations=_load_batch_relations(Path(args.batch_file)))
             elif args.scope_files:
                 # 全局地图仍先建全量索引，再仅渲染 scope 内文件权重最高者
                 md = rm.global_map(args.budget)

@@ -24,12 +24,14 @@
 
 ## 扫描结构
 
-1. `prepare_scope.py` 生成变更 + 调用影响切片，纳入 Manifest、构建、安全 XML、JNI 与 Web 资源；默认排除 `.cxx`、生成物、IDE、本地属性和 docs 示例。
+1. `prepare_scope.py` 生成变更 + 影响切片：先沿 Manifest/component、资源、source set、import 与 Gradle module 关系扩展，再补 callers/callees；默认排除 `.cxx`、生成物、IDE、本地属性和 docs 示例。
 2. Semgrep、Detekt、PMD 高信号 profile，以及显式授权的 Android Lint 生成候选；被抑制的 PMD advisory 仍显式计数。
-3. AI hunter 对全部生产业务源码做确定性文件/token 分批、marker 门控多视角检查和默认双采样。
+3. `relation_graph.py` 构建 source-only Android 文件图；AI hunter 以风险为种子、按关系聚类分批，使用 LSP（宿主可用时）或 tree-sitter/source-nav 跨文件导航，做 marker 门控多视角检查和默认双采样。
 4. 独立 verifier 逐条取证，回传结构化 root cause、candidate IDs 与 provenance。
 5. Merge 按一次修复对应的根因跨文件/规则合并，并保留全部相关定位。
 6. 报告区分 complete、complete_with_skips、incomplete 与 not_applicable，并写当前 run manifest。
+
+每个 hunter 样本在单一结果文件中回传逐文件 sha256、行数和实际 Read ranges。覆盖检查逐样本核对全文范围与文件版本，不再依赖单独的 `hunt_attest` 自述文件。
 
 ## 结果
 
@@ -39,6 +41,7 @@
 .scan/reports/findings.md
 .scan/reports/needs-review.md
 .scan/tmp/run_manifest.json
+.scan/tmp/relation_graph.json
 ```
 
 `findings.json` 只含已确认问题；不确定项不会静默消失，而在 needs-review 中列出缺少的证据和复核建议。

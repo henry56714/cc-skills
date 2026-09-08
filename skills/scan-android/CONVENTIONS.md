@@ -14,6 +14,7 @@
   reports/findings.md
   reports/needs-review.md
   tmp/run_manifest.json       当前运行的可复现性事实；不跨扫描累计
+  tmp/relation_graph.json     source-only Android 文件关系及边证据
   tmp/                        可重建的作用域、候选、批次、地图与覆盖率文件
 ```
 
@@ -27,7 +28,7 @@
 - `semgrep_registry_packs`
 - `pmd_include_advisories`: 默认 false；低信号命中仍在 stats 中显式记账
 - `include_documentation`: 默认 false；仅影响工具 scope，AI 不审查 docs 示例
-- `nav_backend`: `auto|treesitter|source`
+- `nav_backend`: `auto|treesitter|source`，仅控制宿主 LSP 不可用时的脚本降级后端
 - `impact_depth`, `hunt_samples`, `hunt_batch_size`, `hunt_token_budget`
 - `modules`, `extra_excludes`, `lint_tasks`, `language`, `project_context`
 
@@ -131,6 +132,8 @@ needs-review schema v2 的数组键为 `needs_review`，条目 `status=needs_rev
 不要仅因规则默认值升级；升降级必须在 `why` 写出项目中的具体触发条件。
 
 ## 完整性语义
+
+AI hunter coverage schema v2 直接核对每个 `hunt_result`：每个独立 sample 必须覆盖本批全部 `expected_perspectives`，并以 `files_reviewed[{file,sha256,line_count,ranges}]` 精确覆盖批次全部文件。sha256/line_count 必须匹配当前文件，ranges 合并后覆盖全文；不同 sample 不得通过并集补齐彼此缺口。它是可校验的检查回执，不是模型理解质量证明。
 
 - `complete`: 所选作用域、全部选择能力、AI 文件/视角与 verifier 批次全部完成且无截断/跳过。
 - `complete_with_skips`: 执行成功，但存在显式排除或未授权 Lint 等覆盖缺口；`scan_complete=false`。

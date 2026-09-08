@@ -43,6 +43,7 @@ _DECL_ANY_RE = re.compile(
     r"(?:[\w.$<>\[\],?&]+\s+)?"                          # 可选返回类型
     r"([A-Za-z_]\w*)\s*\("                              # 方法名(
 )
+_TYPE_DECL_ANY_RE = re.compile(r"\b(?:class|interface|object|enum\s+class|enum)\s+([A-Za-z_]\w*)\b")
 
 
 def _method_hint(symbol: str) -> str | None:
@@ -54,6 +55,13 @@ def _method_hint(symbol: str) -> str | None:
 
 def _type_hint(symbol: str) -> str:
     return symbol.split("#", 1)[0].split(".")[-1].strip().strip("`")
+
+
+def _class_hint(symbol: str) -> str:
+    if "#" not in symbol:
+        return ""
+    hint = _type_hint(symbol)
+    return "" if hint.lower() in {"", "any", "unknown", "*"} else hint
 
 
 def _is_decl_of(line: str, method: str) -> bool:
@@ -121,16 +129,29 @@ class SourceNav:
                 return m.group(1)
         return ""
 
+    def _enclosing_type(self, lines: list[str], idx: int) -> str:
+        """Best-effort owning type for fallback disambiguation."""
+        for i in range(idx, -1, -1):
+            match = _TYPE_DECL_ANY_RE.search(lines[i])
+            if match and (i == idx or sum(line.count("{") - line.count("}") for line in lines[i:idx + 1]) > 0):
+                return match.group(1)
+        return ""
+
     # ---- 导航接口（与 tree-sitter 后端同形） ----
     def get_definition(self, symbol: str) -> list[dict[str, Any]]:
         method = _method_hint(symbol)
         out: list[dict[str, Any]] = []
         if method:
+            class_hint = _class_hint(symbol)
             for p in self._source_files():
                 rel, lines = self._lines_of(p)
                 for i, ln in enumerate(lines):
-                    if _is_decl_of(ln, method):
-                        out.append({"symbol": f"{rel}#{method}", "file": rel, "line": i + 1})
+                    owner = self._enclosing_type(lines, i)
+                    if _is_decl_of(ln, method) and (not class_hint or owner == class_hint):
+                        out.append({
+                            "symbol": f"{owner}#{method}" if owner else f"{rel}#{method}",
+                            "file": rel, "line": i + 1, "owner": owner,
+                        })
         else:
             t = _type_hint(symbol)
             decl = re.compile(r"\b(class|interface|object|enum)\s+" + re.escape(t) + r"\b")
@@ -143,17 +164,40 @@ class SourceNav:
 
     def get_callers(self, method: str, depth: int = 1) -> list[dict[str, Any]]:
         m = _method_hint(method) or method
+        class_hint = _class_hint(method)
         out: list[dict[str, Any]] = []
         for p in self._source_files():
             rel, lines = self._lines_of(p)
             for i, ln in enumerate(lines):
                 if _is_call_of(ln, m):
+                    owner = self._enclosing_type(lines, i)
+                    enclosing = self._enclosing(lines, i)
+                    receiver_match = re.search(
+                        r"(?:\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\.\s*)?"
+                        + re.escape(m) + r"\s*\(", ln,
+                    )
+                    receiver = receiver_match.group(1) if receiver_match and receiver_match.group(1) else ""
+                    receiver_tail = receiver.rsplit(".", 1)[-1]
+                    if not class_hint:
+                        confidence, matched_by = "nominal", "method-name"
+                    elif receiver_tail == class_hint:
+                        confidence, matched_by = "high", "explicit-receiver"
+                    elif owner == class_hint and receiver_tail in {"", "this", "super"}:
+                        confidence, matched_by = "high", "same-owner"
+                    else:
+                        confidence, matched_by = "ambiguous", "method-name-only"
                     out.append({
                         "file": rel, "line": i + 1,
                         "snippet": ln.strip()[:200],
-                        "enclosing_symbol": self._enclosing(lines, i),
+                        "enclosing_symbol": f"{owner}#{enclosing}" if owner and enclosing else enclosing,
+                        "receiver": receiver,
+                        "confidence": confidence,
+                        "matched_by": matched_by,
                     })
-        return out
+        return sorted(out, key=lambda item: (
+            {"high": 0, "nominal": 1, "ambiguous": 2}.get(item["confidence"], 3),
+            item["file"], item["line"],
+        ))
 
     def get_type_hierarchy(self, type_name: str) -> dict[str, Any]:
         t = _type_hint(type_name)

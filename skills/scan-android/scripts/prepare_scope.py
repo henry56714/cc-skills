@@ -7,7 +7,7 @@
   .scan/tmp/hunt_scope.txt  AI hunter 业务文件作用域
 
 diff 模式不是简单的 changed-files：它会加入受构建/Manifest 变更影响的模块，
-并对 Java/Kotlin 的变更方法做有界 callers/callees 扩展。
+沿 Android 文件关系图扩展，并对 Java/Kotlin 的变更方法做有界 callers/callees 扩展。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from detect_project import detect_project  # noqa: E402
 from lib_scan import atomic_write_json, now_iso  # noqa: E402
+from relation_graph import build_relation_graph, expand_from_files  # noqa: E402
 from source_nav import SourceNav  # noqa: E402
 
 
@@ -169,6 +170,13 @@ def _impact_expand(repo: Path, direct: set[str], all_files: set[str], modules: l
         }
         for mod in affected_modules:
             impacted.update(f for f in all_files if f == mod or f.startswith(mod + "/"))
+
+    if depth > 0 and direct:
+        # Add Android-aware structural neighbors before method-name expansion:
+        # Manifest/component, code/resource, source-set overlays, imports and
+        # Gradle project relations.  This is source-only and deterministic.
+        graph = build_relation_graph(repo, sorted(all_files))
+        impacted.update(expand_from_files(graph, direct, depth) & all_files)
 
     changed_code = [f for f in direct if Path(f).suffix.lower() in {".java", ".kt"}]
     if not changed_code or depth <= 0:

@@ -23,7 +23,7 @@
   "_documentation_note": "默认不扫描 docs 中的示例代码。true 仅将 docs 加入工具 scope，AI hunter 仍跳过。",
   "include_documentation": false,
 
-  "_nav_backend_note": "auto=优先 tree-sitter，失败回退 source-nav；两者均为名义级导航，需读源码消歧。可选 auto / treesitter / source。",
+  "_nav_backend_note": "宿主有 LSP 时由 hunter/verifier 优先使用；本项只控制降级脚本。auto=tree-sitter 后回退 source-nav。两者均需读源码消歧。可选 auto / treesitter / source。",
   "nav_backend": "auto",
 
   "_scope_note": "diff 影响切片默认深度。CLI --impact-depth 可覆盖。",

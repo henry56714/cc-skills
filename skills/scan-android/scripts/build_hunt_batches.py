@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_hunt_batches.py — AI 狩猎支线的确定性分批 + 覆盖率断言 + 风险排序 + 技术存在标记。
+build_hunt_batches.py — AI 狩猎支线的关系聚类分批 + 覆盖率断言 + 风险排序 + 技术存在标记。
 
 动机（见 SKILL.md 第 5.5 步）：
   旧流程把 hunt_scope.txt 直接交给编排 LLM「大作用域按文件分批并发」——分批是临时的、
@@ -9,7 +9,8 @@ build_hunt_batches.py — AI 狩猎支线的确定性分批 + 覆盖率断言 + 
     1. 读 hunt_scope.txt（降维后的业务文件清单，每行一相对路径）；
     2. 防御性剔除明显的生成码（即使降维漏了也不进批次），单独记账；
     3. 对每个文件做一次廉价正则扫描，标出【技术存在】（webview/aidl/db/...）与【风险信号】；
-    4. 按风险降序、文件数和估算 token 双上限切批，写 hunt_batch_{N}.json；
+    4. 构建 source-only Android 文件关系图，以风险作为种子、关系权重作为扩展顺序，
+       在文件数和估算 token 双上限内切批，写 hunt_batch_{N}.json；
     5. 写覆盖率清单 hunt_coverage.json，并【断言每个存在且非生成的输入文件恰好进了一个批次】
        ——不满足即非零退出（堵「漏文件」）。
 
@@ -26,10 +27,14 @@ WebView 视角），既不漏（有就扫）又不浪费（没有就跳）。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from relation_graph import build_relation_graph, cluster_items, edges_for_batch  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -111,8 +116,8 @@ _MAX_READ_BYTES = 400_000  # 单文件读取上限，避免极大文件拖慢扫
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 狩猎视角 → 门控技术（None = 始终过）。用于「多视角覆盖」事后断言：
-# 本脚本据每批 tech_present 算出 expected_perspectives，hunter 回执 perspectives_covered，
-# check_hunt_coverage.py 交叉核对——少过一个视角即报错（堵「漏视角」）。
+# 本脚本据每批 tech_present 算出 expected_perspectives；hunter 在结果中回传
+# perspectives_covered 与逐文件读取证据，check_hunt_coverage.py 交叉核对。
 # 视角 id 必须与 agents/hunter.md、check_hunt_coverage.py 三处保持一致。
 # ──────────────────────────────────────────────────────────────────────────────
 PERSPECTIVES: list[tuple[str, str | None]] = [
@@ -156,6 +161,23 @@ def _read_text(path: Path) -> tuple[str, bool] | None:
             return f.read(_MAX_READ_BYTES), size > _MAX_READ_BYTES
     except OSError:
         return None
+
+
+def _snapshot(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    line_count = 0
+    last = b""
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            line_count += chunk.count(b"\n")
+            last = chunk[-1:]
+    if path.stat().st_size and last != b"\n":
+        line_count += 1
+    return digest.hexdigest(), line_count
 
 
 def _analyze(text: str) -> tuple[int, list[str], int]:
@@ -217,6 +239,7 @@ def build_batches(
             continue
         text, content_truncated = read_result
         risk, tech, _ = _analyze(text)
+        sha256, line_count = _snapshot(p)
         # Batch sizing uses full byte size even though marker analysis is capped.
         estimated_tokens = max(64, (p.stat().st_size + 2) // 3)
         analyzed.append({
@@ -225,9 +248,11 @@ def build_batches(
             "tech": tech,
             "estimated_tokens": estimated_tokens,
             "marker_scan_truncated": content_truncated,
+            "sha256": sha256,
+            "line_count": line_count,
         })
 
-    # 风险降序、路径升序 → 确定性
+    # 风险降序、路径升序：决定每个关系子图的新种子，保证确定性。
     analyzed.sort(key=lambda d: (-d["risk_score"], d["file"]))
 
     # 确定性切批
@@ -237,39 +262,37 @@ def build_batches(
     for pattern in ("hunt_result_*.json", "hunt_attest_*.json", "repo_map_*.md"):
         for stale in out_dir.glob(pattern):
             stale.unlink()
-    for stale_name in ("hunt_perspective_coverage.json",):
+    for stale_name in ("hunt_perspective_coverage.json", "relation_graph.json"):
         stale = out_dir / stale_name
         if stale.exists():
             stale.unlink()
     batch_files: list[str] = []
     batches_detail: list[dict] = []
     batched_set: set[str] = set()
-    chunks: list[list[dict]] = []
-    current: list[dict] = []
-    current_tokens = 0
-    for item in analyzed:
-        item_tokens = int(item["estimated_tokens"])
-        if current and (len(current) >= batch_size or current_tokens + item_tokens > token_budget):
-            chunks.append(current)
-            current = []
-            current_tokens = 0
-        current.append(item)
-        current_tokens += item_tokens
-    if current:
-        chunks.append(current)
+    relation_graph = build_relation_graph(repo_root, [d["file"] for d in analyzed])
+    (out_dir / "relation_graph.json").write_text(
+        json.dumps(relation_graph, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    chunks = cluster_items(analyzed, relation_graph, batch_size, token_budget)
 
     for idx, chunk in enumerate(chunks):
         tech_union = sorted({t for d in chunk for t in d["tech"]})
         expected = _expected_perspectives(tech_union)
         batch_tokens = sum(int(d["estimated_tokens"]) for d in chunk)
+        chunk_names = [d["file"] for d in chunk]
+        internal_edges, boundary_edges = edges_for_batch(relation_graph, chunk_names)
         batch_obj = {
+            "schema_version": 2,
             "batch": idx,
             "file_count": len(chunk),
             "estimated_tokens": batch_tokens,
             "token_budget": token_budget,
+            "batching_strategy": "relation-clustered",
             "tech_present": tech_union,
             "expected_perspectives": expected,
             "files": chunk,
+            "relation_edges": internal_edges,
+            "boundary_relations": boundary_edges,
         }
         bf = out_dir / f"hunt_batch_{idx}.json"
         bf.write_text(json.dumps(batch_obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -280,6 +303,9 @@ def build_batches(
             "estimated_tokens": batch_tokens,
             "tech_present": tech_union,
             "expected_perspectives": expected,
+            "files": chunk_names,
+            "relation_edges": len(internal_edges),
+            "boundary_relations": len(boundary_edges),
         })
         batched_set.update(d["file"] for d in chunk)
     n_batches = len(chunks)
@@ -293,6 +319,7 @@ def build_batches(
     marker_scan_truncated = sorted(d["file"] for d in analyzed if d["marker_scan_truncated"])
 
     coverage = {
+        "schema_version": 2,
         "total_input": len(inputs),
         "analyzed": len(analyzed),
         "batched": len(batched_set),
@@ -303,6 +330,9 @@ def build_batches(
         "batches": n_batches,
         "batch_size": batch_size,
         "token_budget": token_budget,
+        "batching_strategy": "relation-clustered",
+        "relation_graph_path": str(out_dir / "relation_graph.json"),
+        "relation_graph_stats": relation_graph.get("stats", {}),
         "tech_present": tech_present_all,
         "marker_scan_truncated": marker_scan_truncated,
         "batch_files": batch_files,
@@ -367,12 +397,18 @@ def main() -> int:
     # stderr 人类可读小结
     print(
         f"[build_hunt_batches] 输入 {cov['total_input']} → 分析 {cov['analyzed']} 文件，"
-        f"切 {cov['batches']} 批（每批≤{cov['batch_size']} 文件 / 约 {cov['token_budget']} tokens）；"
+        f"关系聚类为 {cov['batches']} 批（每批≤{cov['batch_size']} 文件 / 约 {cov['token_budget']} tokens）；"
         f"生成码剔除 {len(cov['generated_excluded'])}，缺失 {len(cov['missing'])}。",
         file=sys.stderr,
     )
     if cov["tech_present"]:
         print(f"[build_hunt_batches] 技术存在: {', '.join(cov['tech_present'])}", file=sys.stderr)
+    graph_stats = cov.get("relation_graph_stats", {})
+    print(
+        f"[build_hunt_batches] 关系图: {graph_stats.get('files', 0)} 节点 / "
+        f"{graph_stats.get('edges', 0)} 边",
+        file=sys.stderr,
+    )
     if not cov["coverage_ok"]:
         print(
             f"[build_hunt_batches] ❌ 覆盖率断言失败：{len(cov['uncovered'])} 个文件未进任何批次，"

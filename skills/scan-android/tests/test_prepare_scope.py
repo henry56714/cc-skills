@@ -18,6 +18,11 @@ class PrepareScopeTests(unittest.TestCase):
         (root / "app/src/main/java/x/B.kt").write_text("fun use() { target() }\n")
         (root / "app/src/main/java/x/C.kt").write_text("fun top() { use() }\n")
         (root / "app/src/main/java/x/H.kt").write_text("fun helper() {}\n")
+        (root / "app/src/main/java/x/Screen.kt").write_text(
+            "class Screen { val content = R.layout.screen }\n"
+        )
+        (root / "app/src/main/res/layout").mkdir(parents=True)
+        (root / "app/src/main/res/layout/screen.xml").write_text("<LinearLayout />\n")
         (root / "shared-native").mkdir()
         (root / "shared-native/core.cpp").write_text("int parse() { return 0; }\n")
         (root / "sdk/.cxx/Debug/arm64-v8a/CMakeFiles/compiler-id").mkdir(parents=True)
@@ -77,7 +82,7 @@ class PrepareScopeTests(unittest.TestCase):
             manifest = json.loads((repo / ".scan/tmp/run_manifest.json").read_text())
             self.assertTrue(manifest["source_only"])
             self.assertEqual(manifest["language"], "zh")
-            self.assertEqual(manifest["scope"]["scope_files"], 8)
+            self.assertEqual(manifest["scope"]["scope_files"], 10)
             self.assertEqual(len(manifest["skill_fingerprint"]), 64)
 
     def test_impact_slice_adds_callee_and_recursive_callers(self):
@@ -105,6 +110,18 @@ class PrepareScopeTests(unittest.TestCase):
                 repo, {"app/src/main/AndroidManifest.xml"}, all_files, ["app"], depth=2
             )
             self.assertTrue(all_files <= impact)
+
+    def test_resource_change_adds_referencing_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._repo(repo)
+            all_files = set(ps._iter_source_files(
+                repo, ["app"], {".kt", ".xml", ".gradle"}, []
+            ))
+            impact = ps._impact_expand(
+                repo, {"app/src/main/res/layout/screen.xml"}, all_files, ["app"], depth=1
+            )
+            self.assertIn("app/src/main/java/x/Screen.kt", impact)
 
 
 if __name__ == "__main__":

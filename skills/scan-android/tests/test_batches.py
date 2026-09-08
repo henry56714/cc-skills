@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,6 +75,29 @@ class HuntBatchTests(unittest.TestCase):
         network = hb._expected_perspectives(["network"])
         self.assertIn("network_crypto", network)
         self.assertNotIn("platform_ipc", network)
+
+    def test_related_files_stay_together_before_unrelated_high_risk_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            src = repo / "app/src/main/java/p"
+            src.mkdir(parents=True)
+            (src / "Api.kt").write_text("package p\nclass Api { fun load() = WebView }\n")
+            (src / "Caller.kt").write_text("package p\nimport p.Api\nclass Caller { val api = Api() }\n")
+            (src / "Other.kt").write_text("package p\nclass Other { val view = WebView }\n")
+            scope = repo / "scope.txt"
+            scope.write_text(
+                "app/src/main/java/p/Api.kt\n"
+                "app/src/main/java/p/Caller.kt\n"
+                "app/src/main/java/p/Other.kt\n"
+            )
+            result = hb.build_batches(repo, scope, repo / "out", 2, token_budget=5000)
+            first = json.loads((repo / "out/hunt_batch_0.json").read_text())
+            self.assertEqual(first["batching_strategy"], "relation-clustered")
+            self.assertEqual(
+                {item["file"] for item in first["files"]},
+                {"app/src/main/java/p/Api.kt", "app/src/main/java/p/Caller.kt"},
+            )
+            self.assertGreater(result["relation_graph_stats"]["edges"], 0)
 
 
 class VerifyBatchTests(unittest.TestCase):
@@ -169,6 +193,102 @@ class HuntCoverageTests(unittest.TestCase):
             result = hc.check(out, coverage, 1)
             self.assertFalse(result["ok"])
             self.assertEqual(result["unparseable_attest"], ["hunt_attest_0_0.json"])
+
+
+class HuntCoverageV2Tests(unittest.TestCase):
+    def _coverage(self, root: Path) -> Path:
+        path = root / "out/hunt_coverage.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps({
+            "schema_version": 2,
+            "batches_detail": [{
+                "batch": 0,
+                "expected_perspectives": ["auth_dataflow", "free"],
+                "files": ["A.kt"],
+            }],
+        }))
+        return path
+
+    @staticmethod
+    def _receipt(path: Path, ranges=None) -> dict:
+        data = path.read_bytes()
+        return {
+            "file": path.name,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "line_count": len(data.decode("utf-8").splitlines()),
+            "ranges": ranges if ranges is not None else [{"start": 1, "end": 3}],
+        }
+
+    def test_v2_validates_file_hash_lines_and_full_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0,
+                "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "files_reviewed": [self._receipt(source)],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["coverage_evidence"], "file-hash-line-range-receipt")
+
+    def test_v2_rejects_partial_read_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0,
+                "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "files_reviewed": [self._receipt(source, [{"start": 1, "end": 2}])],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("读取范围未覆盖完整文件", " ".join(result["batches"][0]["problems"]))
+
+    def test_v2_rejects_stale_file_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            receipt = self._receipt(source)
+            source.write_text("one\nchanged\nthree\n")
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0,
+                "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "files_reviewed": [receipt],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("文件哈希不匹配", " ".join(result["batches"][0]["problems"]))
+
+    def test_v2_each_sample_must_cover_all_perspectives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            for sample, perspective in enumerate(("auth_dataflow", "free")):
+                (repo / f"out/hunt_result_0_{sample}.json").write_text(json.dumps({
+                    "batch": 0,
+                    "sample": sample,
+                    "perspectives_covered": [perspective],
+                    "files_reviewed": [self._receipt(source)],
+                    "candidates": [],
+                }))
+            result = hc.check(repo / "out", coverage, 2, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("漏视角", " ".join(result["batches"][0]["problems"]))
 
 
 if __name__ == "__main__":

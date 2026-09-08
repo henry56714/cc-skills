@@ -1,6 +1,6 @@
 # 狩猎代理提示词模板（AI 检测支线）
 
-当把 AI 狩猎任务派发给子代理时，将本文件正文作为提示词。调度方（`scan-android` 主工作流）在发送前填充 `{PROJECT_CONTEXT}`、`{LANGUAGE}`、`{HUNTING_RULES}`、`{BATCH_FILE}`（`build_hunt_batches.py` 产出的批次 JSON 绝对路径）、`{REPO_MAP}`（本批的「聚焦代码地图」文件绝对路径，见下）。
+当把 AI 狩猎任务派发给子代理时，将本文件正文作为提示词。调度方（`scan-android` 主工作流）在发送前填充 `{PROJECT_CONTEXT}`、`{LANGUAGE}`、`{HUNTING_RULES}`、`{BATCH_FILE}`（`build_hunt_batches.py` 产出的批次 JSON 绝对路径）、`{REPO_MAP}`（本批的「聚焦代码地图」文件绝对路径）和 `{SAMPLE}`（从 0 开始的独立样本编号）。
 
 > **角色边界（重要）：** 你是**检测者**，不是验证者。你只负责**产出候选**（带定位 + 缺陷假设），**不下最终结论**。所有候选随后会经一道**独立的验证闸**（`agents/verifier.md`，另一次调用）取证核实。所以这里的纪律是：**宁可多给有据可查的候选，也不要自己替验证器拍板。** 但也不要灌水——每条必须能指向具体 file:line + 可检验的假设。
 
@@ -25,8 +25,9 @@
 ## 输入
 
 - 批次文件：`{BATCH_FILE}`（`build_hunt_batches.py` 产出的 JSON）。**第一步用 Read 读它**，取：
-  - `files`：本批要狩猎的文件数组，每项 `{file, risk_score, tech}`（已降维到业务代码、按风险降序）；
+  - `files`：本批要狩猎的文件数组，每项含 `{file, risk_score, tech, sha256, line_count}`；文件已按关系聚类，数组第一项是高风险种子；
   - `tech_present`：本批涉及的技术集合（`webview`/`ipc_aidl`/`database`/…），用于**自门控狩猎视角**。
+  - `relation_edges` / `boundary_relations`：Manifest 组件、资源、source set overlay、import、唯一类型引用和 Gradle module 关系。它们是有来源的结构线索，不证明运行时可达。
 - **聚焦代码地图**：`{REPO_MAP}`（`repo_map.py` 产出的 Markdown）。**第二步用 Read 读它**。它给你**本批之外的跨文件视野**：
   - 「本批文件签名骨架」：本批各文件的类/方法/接口签名（函数体已折叠），供你快速建立结构印象；
   - 「跨文件关系」：本批定义的方法**被批外哪些代码调用**（含调用方文件:行、所在方法、调用点源码）。
@@ -35,14 +36,16 @@
 
 ## 如何用地图「顺藤摸瓜」（跨文件分析的关键）
 
-单看一个文件形不成跨文件漏洞假设。用聚焦地图把「本批某方法」与「批外调用它的代码」连起来：
+单看一个文件形不成跨文件漏洞假设。先使用宿主原生 LSP（若提供）查询 definition/references/implementation/call hierarchy；没有 LSP 或查询失败时，再使用聚焦地图与 `nav_tools.py`。无论来自哪种导航，每一跳都要回读调用点和定义源码。
+
+用聚焦地图把「本批某方法」与「批外调用它的代码」连起来：
 
 - **鉴权/越权数据流（R-AI-001/002/004/012）**：本批某敏感方法被批外调用时，顺地图给出的调用方 file:line 精读那一处，看调用方传入的实参是否外部可控（Intent/Uri/网络）、有没有校验——地图给线索，读源码证实。
 - **生命周期/注册注销成对（R-AI-006/014）**：本批的 `register*` 被批外调用后，用地图找对应 `unregister*` 的调用点，确认是否每条退出路径都成对。
 - **主线程阻塞（R-AI-009）**：本批某重活方法，顺地图回溯批外调用方，判断调用链起点是否在主线程（onClick/生命周期）。
 - **地图是线索，不是结论**：地图基于 tree-sitter **名义级**匹配（不解析重载/接收者类型），同名方法可能混入。**任何跨文件假设都必须回到调用点源码复核**后才写进候选的 `dataflow_path`。
 
-**⚠ 地图不替代通读：** 本批 `files` 里的**每个文件必须全部读到**（完整读，不是只读片段），不得只挑「核心类」或只看地图。分批已把规模控到可通读；`risk_score` 高的优先细读，但低分文件也要过一遍（漏读由上层覆盖率断言兜底，你这一批内不许跳过）。
+**⚠ 地图不替代通读：** 本批 `files` 里的**每个文件必须全部读到**。大文件可以分段 Read，但读取范围合并后必须覆盖 `1..line_count`。不得只挑核心类或只看地图。每次成功读取后记录实际范围；只记录真实 Read 结果，不能把批次清单直接当成读取回执。
 
 ## 处理流程（多视角分轮，逐轮过完整批）
 
@@ -70,7 +73,16 @@
 ```json
 {
   "batch": 0,
+  "sample": 0,
   "perspectives_covered": ["auth_dataflow", "platform_ipc", "lifecycle_concurrency", "storage_privacy", "network_crypto", "performance", "modern_runtime", "webview", "free"],
+  "files_reviewed": [
+    {
+      "file": "app/src/main/java/example/PayManager.java",
+      "sha256": "照抄批次文件中的 sha256",
+      "line_count": 120,
+      "ranges": [{"start": 1, "end": 120}]
+    }
+  ],
   "candidates": [
     {
       "file": "app/src/main/java/.../PayManager.java",
@@ -90,7 +102,9 @@
 ```
 
 - `batch`：**照抄 `{BATCH_FILE}` 里的 `batch` 值**（整数）。
+- `sample`：照抄调度方给出的 `{SAMPLE}`（整数）。每个样本必须独立完成整批，不得把两个半扫描样本合成一次覆盖。
 - `perspectives_covered`：本批实际完成的视角 id。必须覆盖批次 JSON 的全部 `expected_perspectives`；门控跳过的视角不列。漏列会触发机械覆盖率失败。
+- `files_reviewed`：必须与批次 `files` 精确一致。`sha256/line_count` 照抄批次快照；`ranges` 记录本样本真实成功的 Read 范围，合并后必须覆盖全文。文件在扫描中变化会导致哈希核对失败并要求重跑。
 - `candidates`：候选数组（无疑点为 `[]`）。每条：
   - `rule_id`：用清单里的 `R-AI-*`；自由检测用 `R-AI-FREE`。
   - `severity`：你的初判（critical/major/minor/info），验证闸可调整。

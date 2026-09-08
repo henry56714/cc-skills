@@ -9,7 +9,7 @@
 行为：
 1. 解析 settings.gradle / settings.gradle.kts 的 include(...) 得到 Gradle 模块列表；
    若无 settings 文件或解析为空，回退到「扫描含 build.gradle(.kts) 的目录」。
-2. 探测各模块 build.gradle 是否声明 productFlavors，尽力提取 flavor 名。
+2. 探测各模块 source set 与 build.gradle 中的 productFlavors。
 3. 据此推荐一组优先级排序的 L0 lint 任务（工作流逐个尝试，用第一个成功的）。
 4. 合并可选的项目级配置 .scan/config.json（覆盖/补充自动探测结果）。
 
@@ -20,6 +20,7 @@
       "modules": ["app", "sdk"],            # 相对仓库根的模块目录
       "has_flavors": false,
       "flavors": [],
+      "source_sets": {"app": ["main", "debug", "release"]},
       "suggested_lint_tasks": ["lintDebug", "lint"],
       "default_excludes": [...],            # 通用排除
       "extra_excludes": [...],              # 来自 config 的项目级额外排除
@@ -122,6 +123,7 @@ def detect_project(repo: Path, config_path: str = ".scan/config.json") -> dict:
         suggested = configured_lint_tasks
     elif config.get("lint_tasks") not in (None, []):
         notes.append("ignored invalid config.lint_tasks (expected array of strings)")
+    source_sets = _detect_source_sets(repo, modules)
 
     default_excludes = list(DEFAULT_EXCLUDES)
     if config.get("include_documentation") is True:
@@ -135,6 +137,7 @@ def detect_project(repo: Path, config_path: str = ".scan/config.json") -> dict:
         "modules": modules,
         "has_flavors": bool(flavors),
         "flavors": flavors,
+        "source_sets": source_sets,
         "suggested_lint_tasks": suggested,
         "default_excludes": default_excludes,
         "extra_excludes": _string_list(config.get("extra_excludes")),
@@ -216,6 +219,20 @@ def _detect_flavors(repo: Path, modules: list[str]) -> list[str]:
     # 去重保序
     seen: set[str] = set()
     return [f for f in flavors if not (f in seen or seen.add(f))]
+
+
+def _detect_source_sets(repo: Path, modules: list[str]) -> dict[str, list[str]]:
+    """List physical Android source-set directories for every detected module."""
+    result: dict[str, list[str]] = {}
+    candidates = modules or [""]
+    for module in candidates:
+        src = repo / module / "src"
+        if not src.is_dir():
+            continue
+        names = sorted(path.name for path in src.iterdir() if path.is_dir())
+        if names:
+            result[module or "."] = names
+    return result
 
 
 def _extract_block(text: str, keyword: str) -> str | None:

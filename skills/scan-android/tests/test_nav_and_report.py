@@ -10,6 +10,14 @@ from render_report import _coverage_status, _engine_stats_banner, _render, _rend
 
 
 class SourceNavTests(unittest.TestCase):
+    def test_class_method_definition_filters_same_named_method(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "A.kt").write_text("class Alpha {\n  fun save() {}\n}\n")
+            (repo / "B.kt").write_text("class Beta {\n  fun save() {}\n}\n")
+            result = SourceNav(repo).get_definition("Alpha#save")
+            self.assertEqual([item["file"] for item in result], ["A.kt"])
+
     def test_no_callers_is_not_automatically_an_entry_point(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

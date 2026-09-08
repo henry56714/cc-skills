@@ -43,7 +43,7 @@ description: 扫描 Android 源码仓库中的安全、稳定性、隐私、性�
 - 模块 Manifest、构建脚本、安全 XML 变化对应的整个模块；
 - 根级 settings/version catalog/wrapper 等全局构建变化对应的全仓。
 
-影响分析是保守名义级近似，不能替代 verifier 逐跳确认。
+影响分析先用 source-only Android 关系图扩展 Manifest/component、资源引用、source-set overlay、import、唯一类型引用和 Gradle module 邻居，再做保守的方法名 callers/callees 扩展；不能替代 verifier 逐跳确认。
 
 ## 工作流
 
@@ -107,13 +107,13 @@ PMD 默认使用高信号候选 profile：资源泄漏、非线程安全 formatt
 只要 `.scan/tmp/hunt_scope.txt` 非空且 `excluded_engines` 不含 `ai`，就运行 AI 支线；不再按文件数跳过。
 
 1. 读取 `rules/ai/hunting.md` 与 `agents/hunter.md`。
-2. 确定性分批：
+2. 构建关系图并确定性分批：
 
 ```text
 python3 <SKILL_DIR>/scripts/build_hunt_batches.py --repo-root . --scope-files .scan/tmp/hunt_scope.txt --batch-size <config.hunt_batch_size_or_15> --token-budget <config.hunt_token_budget_or_36000>
 ```
 
-`coverage_ok=false` 必须修复后重跑，不能漏文件继续。缺失/不可读文件也算覆盖失败。
+脚本写出 `.scan/tmp/relation_graph.json`，以风险文件作为种子、优先把强关系邻居放进同批，而不是把同一调用链按风险分开。`coverage_ok=false` 必须修复后重跑；缺失/不可读文件也算覆盖失败。
 
 3. 对每个 `hunt_batch_N.json` 生成聚焦地图：
 
@@ -121,17 +121,19 @@ python3 <SKILL_DIR>/scripts/build_hunt_batches.py --repo-root . --scope-files .s
 python3 <SKILL_DIR>/scripts/repo_map.py --repo . --action map --batch-file .scan/tmp/hunt_batch_N.json --out .scan/tmp/repo_map_N.md --budget 12000
 ```
 
-4. 对每批派发独立 hunter。可并行，但每个 hunter 必须完整读取批次全部文件，并真实完成批次 `expected_perspectives`。核心视角始终启用；IPC、存储、网络密码学、modern runtime、WebView、native 视角仅在批次 marker 命中时启用。把严格 JSON 输出写成 `.scan/tmp/hunt_result_N_SAMPLE.json`；同时把 `{batch,perspectives_covered}` 写为 `.scan/tmp/hunt_attest_N_SAMPLE.json`。
+地图同时包含 FQN 符号、批外 callers、唯一目标 callees，以及 Manifest/资源/source set 等结构关系。若宿主提供原生 LSP，hunter 和 verifier 必须先用 definition/references/implementation/call hierarchy，再用地图或 `nav_tools.py` 降级；任何导航边都要回读源码。
+
+4. 对每批派发独立 hunter。可并行，但每个 hunter 必须完整读取批次全部文件，并真实完成批次 `expected_perspectives`。核心视角始终启用；IPC、存储、网络密码学、modern runtime、WebView、native 视角仅在批次 marker 命中时启用。把严格 JSON 输出写成 `.scan/tmp/hunt_result_N_SAMPLE.json`。结果必须含 `{batch,sample,perspectives_covered,files_reviewed,candidates}`；`files_reviewed` 为每个批次文件记录批次快照中的 sha256/line_count 及实际 Read ranges。
 
 5. 每批采样次数为 `config.hunt_samples`（默认 2）。多次结果取并集，交给 verifier 去重，不能只保留第一次。若用户为了成本显式降为 1，交付时说明单样本召回可能波动。
 
-6. 机械核对视角覆盖：
+6. 机械核对文件证据与视角覆盖：
 
 ```text
 python3 <SKILL_DIR>/scripts/check_hunt_coverage.py --repo-root . --out-dir .scan/tmp --min-samples <hunt_samples>
 ```
 
-失败表示批次、结果文件、采样次数或视角漏扫，重跑缺失项。
+检查器逐样本要求所有视角完整、所有批次文件的读取范围覆盖全文，并核对文件哈希和行数；不允许两个半扫描样本通过取并集伪装完整。失败表示结果文件、采样次数、视角、文件读取或运行期间文件一致性有问题，重跑对应样本。该回执能机械验证文件版本和声明范围，但不能证明模型认知质量；最终结论仍由独立 verifier 取证。
 
 ### 5. 构造无损 verifier 批次
 
@@ -216,6 +218,6 @@ python3 <SKILL_DIR>/scripts/render_report.py --engine-stats '<engine_stats JSON>
 ## 维护规则
 
 - 新的浅层/数据流模式优先加到 `queries/semgrep/android.yaml`，同时给 metadata 的 `rule_id/category/severity`。
-- 新的跨文件/业务逻辑线索加到 `rules/ai/hunting.md`，并把新主题映射到 hunter perspective。
+- 新的跨文件/业务逻辑线索加到 `rules/ai/hunting.md`，并把新主题映射到 hunter perspective；Android 文件关系维护在 `scripts/relation_graph.py`，每条边必须保留 kind/evidence 且只作导航线索。
 - 新 adapter 必须输出统一 Candidate、明确 complete/partial/failed，并提供解析/超时/截断测试。
 - 不添加 APK/AAB/反编译路径或 hybrid 分支。

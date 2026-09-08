@@ -10,7 +10,9 @@
 - 扫描无状态；不恢复 ledger、first_seen/last_seen 或跨扫描关闭状态。
 - 不确定项进入 needs-review，不能静默丢弃；引擎失败保留部分结果并标 incomplete。
 - 无默认候选截断。任何显式截断必须可计数并令状态 partial。
-- tree-sitter 提供更好的语法级 def/ref 与 RepoMap，但仍不解析重载、接收者类型、动态分派或反射。不要称其为完整语义/精确调用图；verifier 必须逐跳读源码。
+- 宿主有 LSP 时优先用 definition/reference/implementation/call hierarchy；否则 tree-sitter/source-nav 降级。任何后端都可能受 Android Variant、生成代码、动态分派或反射影响，不得称为完整语义/精确调用图；verifier 必须逐跳读源码。
+- `relation_graph.py` 只使用源码可证的 Manifest/component、资源、source-set overlay、import、唯一类型和 Gradle module 关系。边必须带 kind/evidence，只用于作用域扩展与聚类，不作为漏洞证据。
+- hunter 覆盖率逐样本核对 result 内的文件 sha256、行数和 Read ranges。回执能验证文件版本与声明的读取范围，不能证明模型理解质量，仍需独立 verifier。
 
 ## 两个根目录
 
@@ -23,7 +25,8 @@
 - Detekt：Kotlin。
 - PMD：Java。
 - Android Lint：只有 `allow_gradle_execution=true` 或 CLI 显式授权才运行。
-- RepoMap/nav：tree-sitter 优先，source-nav 兜底；二者都需要源码复核。
+- 导航：宿主 LSP 优先；RepoMap tree-sitter 次之，source-nav 兜底。`Class#method` 按 owner 过滤定义，调用边标注置信度；所有关系都需要源码复核。
+- Android relation graph：关系聚类批次、diff 结构影响扩展和聚焦地图的结构边。
 - AI hunter + 独立 verifier：深层逻辑与跨文件判断。
 
 ## 规则维护

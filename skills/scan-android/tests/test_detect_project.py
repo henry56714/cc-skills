@@ -130,6 +130,18 @@ class DetectFlavors(unittest.TestCase):
             self.assertEqual(dp._detect_flavors(repo, ["app"]), [])
 
 
+class DetectSourceSets(unittest.TestCase):
+    def test_lists_physical_source_sets_per_module(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            for name in ("main", "debug", "paid"):
+                (repo / "app/src" / name).mkdir(parents=True)
+            self.assertEqual(
+                dp._detect_source_sets(repo, ["app"]),
+                {"app": ["debug", "main", "paid"]},
+            )
+
+
 class LoadConfig(unittest.TestCase):
     def test_missing_returns_empty(self):
         self.assertEqual(dp._load_config(Path("/no/such/config.json")), {})

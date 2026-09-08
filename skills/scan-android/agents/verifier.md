@@ -30,7 +30,7 @@
 
 ## 调用链与数据流取证
 
-用以下命令查询定义、调用方、类型关系或向上回溯：
+如果宿主提供原生 LSP，优先使用 definition、references、implementation 和 call hierarchy；它们比名称搜索更适合重载与跨文件跳转。LSP 缺失、项目未加载或结果不完整时，再用以下 source-only 命令降级：
 
 ```text
 python3 <SKILL_DIR>/scripts/nav_tools.py --repo <root> --action trace-origin --symbol <Class#method> --depth 6
@@ -39,7 +39,7 @@ python3 <SKILL_DIR>/scripts/nav_tools.py --repo <root> --action definition --sym
 python3 <SKILL_DIR>/scripts/nav_tools.py --repo <root> --action hierarchy --symbol <Type>
 ```
 
-tree-sitter 和 source-nav 都是名义级符号匹配，不解析接收者类型、重载、接口动态分派、反射或依赖注入。每一跳必须回到源码复核。`terminal_no_callers` 只表示索引没找到调用方，不能自动证明它是 Android 入口。
+LSP 和导航索引都只是取证入口：tree-sitter/source-nav 是名义级，LSP 也可能受 Android Variant、生成代码、接口动态分派、反射或依赖注入影响。每一跳必须回到源码复核。`confidence=ambiguous` 不得直接用于 confirmed；`terminal_no_callers` 只表示索引没找到调用方，不能自动证明它是 Android 入口。
 
 Semgrep taint 候选可能带 `dataflow_path`；它是追踪线索，不是最终证据。必须读取 source、sink 和中间净化/鉴权点。
 

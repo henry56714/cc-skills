@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-check_hunt_coverage.py — AI 狩猎支线「多视角覆盖」的事后断言。
+check_hunt_coverage.py — AI 狩猎支线「文件证据 + 多视角覆盖」的事后断言。
 
 `build_hunt_batches.py` 保证了【文件不漏分批】（确定性 + 覆盖率断言）；但「每批是否真的
 把每个该过的狩猎视角都过了」是 hunter 子代理的编排约定，脚本管不到。本脚本把它也变成
@@ -8,27 +8,26 @@ check_hunt_coverage.py — AI 狩猎支线「多视角覆盖」的事后断言�
 
   - 期望（expected）：`hunt_coverage.json` 的 `batches_detail[*].expected_perspectives`
     —— 由 build_hunt_batches 据每批 tech_present 确定性算出（无 WebView 就不期望 webview 视角）。
-  - 实际（covered）：每个 hunter 回执 `hunt_attest_*.json` 的 `perspectives_covered`
-    —— hunter 跑完一批后上报它实际过了哪些视角（多次采样则取各回执并集）。
+  - 实际（covered）：每个 `hunt_result_*.json` 自带 `perspectives_covered` 与
+    `files_reviewed`。后者记录每个实际读取文件的 sha256、行数和 Read 范围。
 
 断言（任一不满足 → 退出码 1）：
-  1. 每个批次都至少有一份回执（缺回执 = hunter 未上报 = 视为未覆盖，必须排查）；
-  2. 每个批次 expected ⊆ covered（少过任一期望视角即失败，列出缺哪个）；
-  3. 每份回执都有对应数量的合法 hunt_result，且每批结果/回执数均达到 --min-samples；
-  4. 不接受指向不存在批次的游离结果或回执。
+  1. 每个独立样本都必须覆盖本批全部视角和全部文件；不能靠多个不完整样本取并集；
+  2. `files_reviewed` 必须与批次文件精确一致，sha256/line_count 与当前文件一致，
+     ranges 合并后覆盖 1..line_count；
+  3. 每批合法独立样本达到 --min-samples，且不接受重复 sample 或游离结果。
 
-回执文件约定：out-dir 下任意 `hunt_attest_*.json`，每份至少含
-    {"batch": <int>, "perspectives_covered": [<str>, ...]}
-（一个 (batch,sample) 一份；命名随意，只要带 batch 字段。视角 id 见 build_hunt_batches.PERSPECTIVES。）
+schema v2 不再维护与结果重复的 `hunt_attest_*.json`。旧 schema v1 仍兼容原回执。
 
-仅用 Python 标准库。只读 .scan/tmp，产物写 hunt_perspective_coverage.json。
+仅用 Python 标准库。读取仓库文件并只在 .scan/tmp 写 hunt_perspective_coverage.json。
 
-退出码：0 = 全部视角已覆盖；1 = 有批次漏视角 / 缺回执 / 采样不足 / 输入缺失。
+退出码：0 = 文件证据与视角全部覆盖；1 = 文件/视角/采样/输入校验失败。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -41,10 +40,204 @@ def _load_json(p: Path):
         return {"__error__": str(e)}
 
 
-def check(out_dir: Path, coverage_path: Path, min_samples: int) -> dict:
+def _snapshot(repo_root: Path, rel: str) -> tuple[str, int] | None:
+    candidate = Path(rel)
+    if candidate.is_absolute():
+        return None
+    try:
+        path = (repo_root / candidate).resolve()
+        path.relative_to(repo_root.resolve())
+        data = path.read_bytes()
+    except (OSError, ValueError):
+        return None
+    line_count = data.count(b"\n")
+    if data and not data.endswith(b"\n"):
+        line_count += 1
+    return hashlib.sha256(data).hexdigest(), line_count
+
+
+def _ranges_cover(ranges: object, line_count: int) -> bool:
+    if not isinstance(ranges, list):
+        return False
+    if line_count == 0:
+        return ranges == []
+    normalized: list[tuple[int, int]] = []
+    for item in ranges:
+        if not isinstance(item, dict):
+            return False
+        start, end = item.get("start"), item.get("end")
+        if not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start:
+            return False
+        normalized.append((start, min(end, line_count)))
+    cursor = 1
+    for start, end in sorted(normalized):
+        if start > cursor:
+            return False
+        cursor = max(cursor, end + 1)
+    return cursor > line_count
+
+
+def _validate_file_reads(
+    reads: object, expected_files: set[str], repo_root: Path,
+) -> list[str]:
+    if not isinstance(reads, list):
+        return ["缺 files_reviewed 数组"]
+    problems: list[str] = []
+    by_file: dict[str, dict] = {}
+    for item in reads:
+        if not isinstance(item, dict) or not isinstance(item.get("file"), str):
+            problems.append("files_reviewed 含无效记录")
+            continue
+        rel = item["file"].replace("\\", "/")
+        if rel in by_file:
+            problems.append(f"重复文件回执: {rel}")
+        by_file[rel] = item
+    actual_files = set(by_file)
+    if expected_files - actual_files:
+        problems.append("漏读文件: " + ", ".join(sorted(expected_files - actual_files)))
+    if actual_files - expected_files:
+        problems.append("批外文件冒充覆盖: " + ", ".join(sorted(actual_files - expected_files)))
+    for rel in sorted(expected_files & actual_files):
+        current = _snapshot(repo_root, rel)
+        item = by_file[rel]
+        if current is None:
+            problems.append(f"文件不可读或越界: {rel}")
+            continue
+        digest, line_count = current
+        if item.get("sha256") != digest:
+            problems.append(f"文件哈希不匹配: {rel}")
+        if item.get("line_count") != line_count:
+            problems.append(f"文件行数不匹配: {rel}")
+        if not _ranges_cover(item.get("ranges"), line_count):
+            problems.append(f"读取范围未覆盖完整文件: {rel}")
+    return problems
+
+
+def _check_v2(
+    out_dir: Path, cov: dict, min_samples: int, repo_root: Path,
+) -> dict:
+    expected_by_batch: dict[int, set[str]] = {}
+    files_by_batch: dict[int, set[str]] = {}
+    try:
+        for detail in cov.get("batches_detail", []):
+            if not isinstance(detail, dict):
+                raise TypeError("batches_detail item must be an object")
+            batch = int(detail["batch"])
+            if batch in expected_by_batch:
+                raise ValueError(f"duplicate batch {batch}")
+            perspectives = detail.get("expected_perspectives", [])
+            files = detail.get("files", [])
+            if (
+                not isinstance(perspectives, list)
+                or not all(isinstance(item, str) for item in perspectives)
+                or not isinstance(files, list)
+                or not all(isinstance(item, str) for item in files)
+            ):
+                raise TypeError(f"batch {batch} perspectives/files must be string arrays")
+            expected_by_batch[batch] = set(perspectives)
+            files_by_batch[batch] = set(files)
+    except (TypeError, ValueError, KeyError) as exc:
+        return {"ok": False, "error": f"覆盖率清单批次字段无效: {exc}"}
+
+    samples_by_batch: dict[int, set[int]] = {}
+    covered_by_batch: dict[int, set[str]] = {}
+    sample_problems: dict[int, list[str]] = {}
+    bad_results: list[str] = []
+    duplicate_samples: list[str] = []
+    seen_samples: set[tuple[int, int]] = set()
+
+    for result_path in sorted(out_dir.glob("hunt_result_*.json")):
+        obj = _load_json(result_path)
+        candidates = obj.get("candidates") if isinstance(obj, dict) else None
+        perspectives = obj.get("perspectives_covered") if isinstance(obj, dict) else None
+        if (
+            not isinstance(obj, dict) or "batch" not in obj or "sample" not in obj
+            or "__error__" in obj or not isinstance(candidates, list)
+            or not all(isinstance(x, dict) for x in candidates)
+            or not isinstance(perspectives, list)
+            or not all(isinstance(x, str) for x in perspectives)
+        ):
+            bad_results.append(result_path.name)
+            continue
+        try:
+            batch, sample = int(obj["batch"]), int(obj["sample"])
+        except (TypeError, ValueError):
+            bad_results.append(result_path.name)
+            continue
+        key = (batch, sample)
+        if key in seen_samples:
+            duplicate_samples.append(f"batch={batch},sample={sample}")
+            continue
+        seen_samples.add(key)
+        samples_by_batch.setdefault(batch, set()).add(sample)
+        covered_by_batch.setdefault(batch, set()).update(perspectives)
+        if batch not in expected_by_batch:
+            continue
+        problems: list[str] = []
+        missing_perspectives = expected_by_batch[batch] - set(perspectives)
+        if missing_perspectives:
+            problems.append("漏视角: " + ", ".join(sorted(missing_perspectives)))
+        problems.extend(_validate_file_reads(
+            obj.get("files_reviewed"), files_by_batch.get(batch, set()), repo_root,
+        ))
+        if problems:
+            sample_problems.setdefault(batch, []).extend(
+                f"sample {sample}: {problem}" for problem in problems
+            )
+
+    batches: list[dict] = []
+    all_ok = True
+    for batch in sorted(expected_by_batch):
+        samples = samples_by_batch.get(batch, set())
+        problems = list(sample_problems.get(batch, []))
+        if len(samples) < min_samples:
+            problems.append(f"完整样本不足: {len(samples)} < {min_samples}")
+        ok = not problems
+        all_ok = all_ok and ok
+        expected = expected_by_batch[batch]
+        covered = covered_by_batch.get(batch, set())
+        batches.append({
+            "batch": batch,
+            "expected": sorted(expected),
+            "covered": sorted(covered),
+            "missing": sorted(expected - covered),
+            "files_expected": sorted(files_by_batch.get(batch, set())),
+            "samples": len(samples),
+            "results": len(samples),
+            "ok": ok,
+            "problems": problems,
+        })
+
+    stray_results = sorted(set(samples_by_batch) - set(expected_by_batch))
+    return {
+        "schema_version": 2,
+        "coverage_evidence": "file-hash-line-range-receipt",
+        "ok": all_ok and not bad_results and not stray_results and not duplicate_samples,
+        "min_samples": min_samples,
+        "batches_total": len(expected_by_batch),
+        "batches": batches,
+        "stray_attest_batches": [],
+        "stray_result_batches": stray_results,
+        "unparseable_attest": [],
+        "unparseable_results": bad_results,
+        "duplicate_samples": duplicate_samples,
+    }
+
+
+def check(
+    out_dir: Path, coverage_path: Path, min_samples: int, repo_root: Path | None = None,
+) -> dict:
     cov = _load_json(coverage_path)
     if not isinstance(cov, dict) or "batches_detail" not in cov:
         return {"ok": False, "error": f"覆盖率清单无效或缺 batches_detail: {coverage_path}"}
+
+    try:
+        schema_version = int(cov.get("schema_version", 1))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "覆盖率清单 schema_version 无效"}
+
+    if schema_version >= 2:
+        return _check_v2(out_dir, cov, min_samples, (repo_root or out_dir).resolve())
 
     try:
         expected_by_batch: dict[int, set[str]] = {
@@ -151,14 +344,14 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--repo-root", default=".", help="被扫描仓库根目录（默认 .）")
-    ap.add_argument("--out-dir", default=".scan/tmp", help="回执与清单目录（默认 .scan/tmp）")
+    ap.add_argument("--out-dir", default=".scan/tmp", help="结果与清单目录（默认 .scan/tmp）")
     ap.add_argument(
         "--coverage", default=None,
         help="覆盖率清单路径（默认 <out-dir>/hunt_coverage.json）",
     )
     ap.add_argument(
         "--min-samples", type=int, default=1,
-        help="每批期望回执数（= hunt_samples；>1 时核对多采样真的跑够次数）",
+        help="每批期望独立样本数（= hunt_samples；>1 时核对多采样真的跑够次数）",
     )
     args = ap.parse_args()
 
@@ -181,7 +374,7 @@ def main() -> int:
         ))
         return 1
 
-    result = check(out_dir, coverage_path, args.min_samples)
+    result = check(out_dir, coverage_path, args.min_samples, repo_root=repo_root)
     (out_dir / "hunt_perspective_coverage.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -193,12 +386,12 @@ def main() -> int:
         bad = [b for b in result["batches"] if not b["ok"]]
         if result["ok"]:
             print(
-                f"[check_hunt_coverage] ✅ {result['batches_total']} 批次视角全部覆盖",
+                f"[check_hunt_coverage] ✅ {result['batches_total']} 批次文件与视角全部覆盖",
                 file=sys.stderr,
             )
         else:
             print(
-                f"[check_hunt_coverage] ❌ {len(bad)}/{result['batches_total']} 批次视角覆盖不全：",
+                f"[check_hunt_coverage] ❌ {len(bad)}/{result['batches_total']} 批次文件或视角校验失败：",
                 file=sys.stderr,
             )
             for b in bad:
