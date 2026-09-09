@@ -1,7 +1,7 @@
 """PMD adapter —— P1 Java 专项静态分析（errorprone / 多线程 / 性能）。
 
 v3 新增：补强 Java 侧广度，尤其是 errorprone 类（如 CloseResource 资源未关闭）。
-自动探测/下载 PMD CLI，运行 PMD 内置 category 规则集，归一化为 Candidate 契约。
+自动探测 PMD CLI，只在显式授权时下载，运行 PMD 内置 category 规则集，归一化为 Candidate 契约。
 仅处理 .java 文件（Kotlin 由 Detekt 覆盖）。
 """
 
@@ -72,6 +72,8 @@ class PMDAdapter(EngineAdapter):
             from tools.installer import find_pmd, ensure_pmd
             if find_pmd():
                 return True, ""
+            if not ctx.allow_installation:
+                return False, "PMD 未安装；授权后使用 --install-missing"
             ensure_pmd()
             if find_pmd():
                 return True, ""
@@ -173,7 +175,9 @@ class PMDAdapter(EngineAdapter):
                 result.candidates.append(cand)
 
         result.rules_run = len(rules_seen)
-        result.rules_total = len(rules_seen)
+        # PMD's JSON report lists triggered rules, not the number configured in
+        # the five category rulesets. Zero means "unknown", not zero coverage.
+        result.rules_total = 0
         result.suppression_summary = dict(sorted(suppressed_by_rule.items()))
         if result.suppressed:
             result.notes.append({

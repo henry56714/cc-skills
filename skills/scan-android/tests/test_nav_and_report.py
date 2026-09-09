@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +7,10 @@ import sys
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from source_nav import SourceNav  # noqa: E402
-from render_report import _coverage_status, _engine_stats_banner, _render, _render_needs_review  # noqa: E402
+from render_report import (  # noqa: E402
+    _coverage_status, _engine_stats_banner, _load_engine_stats,
+    _pipeline_stats, _render, _render_needs_review,
+)
 
 
 class SourceNavTests(unittest.TestCase):
@@ -35,6 +39,36 @@ class SourceNavTests(unittest.TestCase):
             result = SourceNav(repo).trace_origin("A#target", max_depth=3)
             callers = result["chains"][0]["callers"]
             self.assertEqual({c.get("enclosing_symbol") for c in callers}, {"left", "right"})
+
+    def test_receiver_type_inference_and_ambiguous_edges_do_not_recurse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "WorkerPool.java").write_text(
+                "class WorkerPool {\n  void start() {}\n}\n"
+            )
+            (repo / "Caller.java").write_text(
+                "class Caller {\n"
+                "  WorkerPool networkPool;\n"
+                "  Thread cleanupThread;\n"
+                "  void launch() {\n"
+                "    networkPool.start();\n"
+                "    cleanupThread.start();\n"
+                "  }\n"
+                "}\n"
+            )
+            nav = SourceNav(repo)
+            callers = nav.get_callers("WorkerPool#start")
+            by_receiver = {item["receiver"]: item for item in callers}
+            self.assertEqual(by_receiver["networkPool"]["confidence"], "high")
+            self.assertEqual(by_receiver["networkPool"]["matched_by"], "inferred-receiver-type")
+            self.assertEqual(by_receiver["cleanupThread"]["confidence"], "ambiguous")
+            trace = nav.trace_origin("WorkerPool#start", max_depth=4)
+            ambiguous = next(
+                item for item in trace["chains"][0]["callers"]
+                if item.get("receiver") == "cleanupThread"
+            )
+            self.assertTrue(ambiguous["not_expanded"])
+            self.assertNotIn("callers", ambiguous)
 
 
 class ReportTests(unittest.TestCase):
@@ -76,6 +110,43 @@ class ReportTests(unittest.TestCase):
         self.assertIn("待复核项", md)
         self.assertIn("unknown dispatch", md)
         self.assertIn("implementation", md)
+
+    def test_missing_ai_coverage_forces_incomplete_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            scan_tmp = repo / ".scan/tmp"
+            scan_tmp.mkdir(parents=True)
+            (scan_tmp / "hunt_scope.txt").write_text("A.kt\n")
+            (scan_tmp / "verify_coverage.json").write_text(json.dumps({
+                "coverage_ok": True, "candidates_input": 0,
+                "candidates_batched": 0, "batches": 1,
+                "batch_files": [str(scan_tmp / "verify_batch_0.json")],
+            }))
+            (repo / ".scan/findings.json").write_text('{"findings": []}')
+            (repo / ".scan/needs-review.json").write_text('{"needs_review": []}')
+            (scan_tmp / "merge_receipt.json").write_text(json.dumps({
+                "ok": True, "run_id": "r1",
+                "results": {"confirmed": 0, "needs_review": 0},
+            }))
+            stats = _pipeline_stats(
+                repo=repo,
+                hunt_result=scan_tmp / "hunt_perspective_coverage.json",
+                verify_coverage=scan_tmp / "verify_coverage.json",
+                merge_receipt=scan_tmp / "merge_receipt.json",
+                findings_path=repo / ".scan/findings.json",
+                needs_review_path=repo / ".scan/needs-review.json",
+                findings_count=0, needs_review_count=0,
+                run_manifest={"run_id": "r1"},
+            )
+            self.assertEqual(next(s for s in stats if s["engine"] == "ai_hunter")["status"], "failed")
+            self.assertEqual(_coverage_status(stats), "incomplete")
+
+    def test_engine_stats_file_is_required_for_complete_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "missing.json"
+            stats, gate = _load_engine_stats(path, '[{"status":"complete"}]')
+            self.assertEqual(len(stats), 1)
+            self.assertEqual(gate["status"], "failed")
 
 
 if __name__ == "__main__":

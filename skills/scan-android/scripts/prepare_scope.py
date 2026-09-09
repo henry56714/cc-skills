@@ -240,6 +240,7 @@ def prepare_scope(
     language: str | None = None,
 ) -> dict:
     repo = repo.resolve()
+    _invalidate_previous_run(out_dir)
     info = detect_project(repo)
     if language in {"zh", "en"}:
         info["language"] = language
@@ -306,6 +307,29 @@ def prepare_scope(
     (out_dir / "scope_meta.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     atomic_write_json(out_dir / "run_manifest.json", _run_manifest(repo, info, result))
     return result
+
+
+def _invalidate_previous_run(out_dir: Path) -> None:
+    """Remove only known generated artifacts before assigning a new run id."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    generated_patterns = (
+        "engine-results.json", "hunt_batch_*.json", "hunt_result_*.json",
+        "repo_map_*.md", "verify_batch_*.json", "verified_batch_*.json",
+        "hunt_coverage.json", "hunt_perspective_coverage.json",
+        "verify_coverage.json", "relation_graph.json", "merge_receipt.json",
+    )
+    for pattern in generated_patterns:
+        for path in out_dir.glob(pattern):
+            if path.is_file():
+                path.unlink()
+    scan_root = out_dir.parent
+    for relative in (
+        "findings.json", "needs-review.json",
+        "reports/findings.md", "reports/needs-review.md",
+    ):
+        path = scan_root / relative
+        if path.is_file():
+            path.unlink()
 
 
 def _run_manifest(repo: Path, info: dict, scope: dict) -> dict:

@@ -48,6 +48,16 @@ class ScopeInputSafetyTests(unittest.TestCase):
 
 
 class EngineIsolationTests(unittest.TestCase):
+    def test_new_engine_run_invalidates_downstream_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            scan_tmp = repo / ".scan/tmp"
+            scan_tmp.mkdir(parents=True)
+            for name in ("verify_coverage.json", "merge_receipt.json", "verified_batch_0.json"):
+                (scan_tmp / name).write_text("{}")
+            run_engines._invalidate_downstream(repo)
+            self.assertEqual(list(scan_tmp.iterdir()), [])
+
     def test_non_object_engine_config_uses_safe_defaults_and_reports_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

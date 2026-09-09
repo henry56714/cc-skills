@@ -1,0 +1,6 @@
+{
+  "required_rule_ids": ["R-SG-060", "R-SG-061", "R-SG-062", "R-SG-063"],
+  "forbidden": [
+    {"rule_id": "R-SG-060", "file": "safe/AndroidManifest.xml"}
+  ]
+}

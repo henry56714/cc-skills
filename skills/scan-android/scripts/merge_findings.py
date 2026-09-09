@@ -35,6 +35,8 @@ _needs_origin）的 finding 必须带回溯源头链（非空 `dataflow_path` �
 from __future__ import annotations
 
 import argparse
+import glob
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -84,6 +86,7 @@ def _has_origin(cand: dict) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo-root", default=".")
     ap.add_argument("--findings", default=".scan/findings.json")
     ap.add_argument("--needs-review", default=".scan/needs-review.json")
     ap.add_argument(
@@ -94,9 +97,33 @@ def main() -> int:
         "--verify-coverage", default=".scan/tmp/verify_coverage.json",
         help="verified-glob 模式下用于断言所有 verifier 批次均返回的覆盖率清单",
     )
+    ap.add_argument("--engine-results", default=".scan/tmp/engine-results.json")
+    ap.add_argument(
+        "--hunt-coverage-result",
+        default=".scan/tmp/hunt_perspective_coverage.json",
+    )
+    ap.add_argument(
+        "--receipt", default=None,
+        help="成功合并回执；render_report 用它阻止缺失 verifier 的假完成报告",
+    )
+    ap.add_argument("--run-manifest", default=".scan/tmp/run_manifest.json")
     # --commit 仅为兼容旧调用而保留，已忽略（无 ledger 后报告不含 commit/时间）
     ap.add_argument("--commit", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    repo = Path(args.repo_root).resolve()
+    findings_path = _repo_path(repo, args.findings)
+    needs_review_path = _repo_path(repo, args.needs_review)
+    receipt_path = (
+        _repo_path(repo, args.receipt)
+        if args.receipt else findings_path.parent / "tmp/merge_receipt.json"
+    )
+    verify_coverage_path = _repo_path(repo, args.verify_coverage)
+    engine_results_path = _repo_path(repo, args.engine_results)
+    hunt_coverage_path = _repo_path(repo, args.hunt_coverage_result)
+    run_manifest_path = _repo_path(repo, args.run_manifest)
+    if receipt_path.exists():
+        receipt_path.unlink()
 
     raw = sys.stdin.read().strip()
     try:
@@ -104,7 +131,9 @@ def main() -> int:
             if raw:
                 print("--verified-glob 与 stdin 输入不能同时使用", file=sys.stderr)
                 return 2
-            payload = _load_verified_glob(args.verified_glob, args.verify_coverage)
+            payload = _load_verified_glob(
+                args.verified_glob, verify_coverage_path, repo,
+            )
         else:
             payload = json.loads(raw) if raw else {"confirmed": [], "needs_review": []}
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -195,8 +224,8 @@ def main() -> int:
 
     findings_list = list(records.values())
     needs_review_list = list(review_records.values())
-    atomic_write_json(args.findings, {"schema_version": 4, "findings": findings_list})
-    atomic_write_json(args.needs_review, {"schema_version": 2, "needs_review": needs_review_list})
+    atomic_write_json(findings_path, {"schema_version": 4, "findings": findings_list})
+    atomic_write_json(needs_review_path, {"schema_version": 2, "needs_review": needs_review_list})
 
     out = {
         "findings_total": len(findings_list),
@@ -208,8 +237,102 @@ def main() -> int:
         "records_without_root_cause": without_root_cause,
         "moved_to_review_no_origin": moved_no_origin,
     }
+    run_manifest: dict = {}
+    if run_manifest_path.is_file():
+        try:
+            loaded = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+            run_manifest = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            pass
+    verified_files = _verified_paths(args.verified_glob, repo) if args.verified_glob else []
+    artifact_paths = [findings_path, needs_review_path]
+    missing_inputs: list[str] = []
+    if args.verified_glob:
+        verify_inputs = _verify_input_paths(repo, verify_coverage_path)
+        required_paths = [
+            engine_results_path, verify_coverage_path,
+            *verify_inputs, *verified_files,
+        ]
+        if _ai_hunt_required(repo):
+            required_paths.append(hunt_coverage_path)
+            hunt_results = sorted((repo / ".scan/tmp").glob("hunt_result_*.json"))
+            if hunt_results:
+                required_paths.extend(hunt_results)
+            else:
+                missing_inputs.append(".scan/tmp/hunt_result_*.json")
+        missing_inputs.extend(
+            _display_path(repo, path) for path in required_paths if not path.is_file()
+        )
+        artifact_paths = [*required_paths, *artifact_paths]
+    artifact_paths = list(dict.fromkeys(path.resolve() for path in artifact_paths if path.is_file()))
+    receipt_ok = not missing_inputs
+    atomic_write_json(receipt_path, {
+        "ok": receipt_ok,
+        "reason": "" if receipt_ok else "missing pipeline inputs: " + ", ".join(missing_inputs),
+        "run_id": run_manifest.get("run_id", "unknown"),
+        "verified_glob": args.verified_glob or None,
+        "verify_coverage": args.verify_coverage if args.verified_glob else None,
+        "artifacts_sha256": [_artifact_digest(repo, path) for path in artifact_paths],
+        "results": {"confirmed": len(findings_list), "needs_review": len(needs_review_list)},
+        "stats": out,
+    })
     print(json.dumps(out, ensure_ascii=False))
     return 0
+
+
+def _repo_path(repo: Path, raw: str | Path) -> Path:
+    path = Path(raw)
+    return path if path.is_absolute() else repo / path
+
+
+def _verified_paths(pattern: str, repo: Path) -> list[Path]:
+    raw_pattern = pattern if Path(pattern).is_absolute() else str(repo / pattern)
+    return sorted(Path(raw).resolve() for raw in glob.glob(raw_pattern))
+
+
+def _artifact_digest(repo: Path, path: Path) -> dict:
+    resolved = path.resolve()
+    return {
+        "path": _display_path(repo, resolved),
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
+def _display_path(repo: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(repo).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def _verify_input_paths(repo: Path, coverage_path: Path) -> list[Path]:
+    try:
+        coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    batch_files = coverage.get("batch_files", []) if isinstance(coverage, dict) else []
+    if not isinstance(batch_files, list):
+        return []
+    return [
+        _repo_path(repo, raw).resolve()
+        for raw in batch_files if isinstance(raw, str)
+    ]
+
+
+def _ai_hunt_required(repo: Path) -> bool:
+    config_path = repo / ".scan/config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        config = {}
+    excluded = config.get("excluded_engines", []) if isinstance(config, dict) else []
+    if isinstance(excluded, list) and "ai" in excluded:
+        return False
+    hunt_scope = repo / ".scan/tmp/hunt_scope.txt"
+    try:
+        return bool(hunt_scope.read_text(encoding="utf-8").strip())
+    except OSError:
+        return False
 
 
 def _confirmed_record(cand: dict, fid: str, semantic: bool) -> dict:
@@ -340,11 +463,11 @@ def _dedup_dicts(items: list[dict], fields: tuple[str, ...] | None = None) -> li
     return result
 
 
-def _load_verified_glob(pattern: str, coverage_path: str) -> dict:
-    files = sorted(Path(".").glob(pattern))
+def _load_verified_glob(pattern: str, coverage_path: Path, repo: Path) -> dict:
+    files = _verified_paths(pattern, repo)
     if not files:
         raise ValueError(f"没有 verifier 输出匹配: {pattern}")
-    coverage_file = Path(coverage_path)
+    coverage_file = coverage_path
     if not coverage_file.is_file():
         raise ValueError(f"verifier 覆盖率清单不存在: {coverage_file}")
     coverage = json.loads(coverage_file.read_text(encoding="utf-8"))
@@ -361,7 +484,7 @@ def _load_verified_glob(pattern: str, coverage_path: str) -> dict:
     ):
         raise ValueError(f"verifier 覆盖率计数不守恒: {coverage_file}")
     expected = {
-        Path(raw).resolve().with_name(
+        _repo_path(repo, raw).resolve().with_name(
             Path(raw).name.replace("verify_batch_", "verified_batch_", 1)
         )
         for raw in batch_files

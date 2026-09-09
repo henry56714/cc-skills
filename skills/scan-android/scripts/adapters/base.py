@@ -30,6 +30,9 @@ class ScanContext:
     detect_info: dict = field(default_factory=dict)
     excluded_engines: list[str] = field(default_factory=list)
     allow_build_execution: bool = False
+    # Installation may use network access and write outside the scanned repo.
+    # It is therefore an explicit caller decision, never an adapter side effect.
+    allow_installation: bool = False
 
 
 @dataclass

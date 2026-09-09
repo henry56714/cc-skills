@@ -1,6 +1,6 @@
 """Detekt adapter —— P1 Kotlin 专项静态分析。
 
-自动探测/下载 detekt-cli JAR，扫描 Kotlin 源文件，
+自动探测 detekt-cli JAR；只在显式授权时下载，扫描 Kotlin 源文件，
 将结果归一化为 Candidate 契约。
 """
 
@@ -62,7 +62,8 @@ class DetektAdapter(EngineAdapter):
         jar = _find_detekt_jar()
         if jar:
             return True, ""
-        # 自动下载
+        if not ctx.allow_installation:
+            return False, "Detekt JAR 未安装；授权后使用 --install-missing"
         try:
             from tools.installer import ensure_detekt
             ensure_detekt()
@@ -135,7 +136,8 @@ class DetektAdapter(EngineAdapter):
                 candidates, rules_run = _parse_xml_report(report_xml, ctx.repo, ctx.scope_files)
                 result.candidates = candidates
                 result.rules_run = rules_run
-                result.rules_total = rules_run
+                # Detekt XML lists findings, not every configured rule.
+                result.rules_total = 0
             except Exception as e:
                 result.status = "failed"
                 result.notes.append({"engine": self.name, "note": f"XML 报告解析失败: {e}"})

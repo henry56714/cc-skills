@@ -351,7 +351,7 @@ def _try_install(name: str) -> tuple[bool, str]:
 # 主流程：检测 → 安装 → 再检测，循环直到 ready 或无可安装项
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_preflight(repo_root: Path) -> dict:
+def run_preflight(repo_root: Path, install_missing: bool = False) -> dict:
     config = dict(_read_scan_config(repo_root))
     config_error = str(config.pop("__config_error__", ""))
     raw_excluded = config.get("excluded_engines", [])
@@ -396,6 +396,7 @@ def run_preflight(repo_root: Path) -> dict:
             r for r in results
             if r.status == "missing"
             and r.can_auto_install
+            and install_missing
             and r.name not in attempted_installs
         ]
 
@@ -494,11 +495,15 @@ def main() -> int:
         "--repo-root", default=".",
         help="被扫描的仓库根目录（默认 .）",
     )
+    ap.add_argument(
+        "--install-missing", action="store_true",
+        help="显式允许联网并将缺失引擎安装到 ~/.scan-android",
+    )
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
 
-    result = run_preflight(repo_root)
+    result = run_preflight(repo_root, install_missing=args.install_missing)
 
     _print_summary(result)
 

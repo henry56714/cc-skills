@@ -13,6 +13,8 @@
 - 宿主有 LSP 时优先用 definition/reference/implementation/call hierarchy；否则 tree-sitter/source-nav 降级。任何后端都可能受 Android Variant、生成代码、动态分派或反射影响，不得称为完整语义/精确调用图；verifier 必须逐跳读源码。
 - `relation_graph.py` 只使用源码可证的 Manifest/component、资源、source-set overlay、import、唯一类型和 Gradle module 关系。边必须带 kind/evidence，只用于作用域扩展与聚类，不作为漏洞证据。
 - hunter 覆盖率逐样本核对 result 内的文件 sha256、行数和 Read ranges。回执能验证文件版本与声明的读取范围，不能证明模型理解质量，仍需独立 verifier。
+- hunter 还必须逐样本覆盖批次 `expected_case_ids`；最终渲染必须校验 engine/Hunter/verifier/merge 四段状态并 fail closed。
+- 工具安装是显式授权行为。preflight 和 adapter 默认都不得联网或写 `~/.scan-android`。
 
 ## 两个根目录
 

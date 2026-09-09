@@ -454,9 +454,12 @@ rules:
   - kotlin
   severity: WARNING
   message: 'R-SG-017: registerReceiver 调用，targetSdk>=34 需要明确传入 RECEIVER_EXPORTED 或 RECEIVER_NOT_EXPORTED'
-  pattern-either:
-  - pattern: $CTX.registerReceiver($R, $F)
-  - pattern: $CTX.registerReceiver($R, $F, $PERM, $H)
+  patterns:
+  - pattern-either:
+    - pattern: $CTX.registerReceiver($R, $F)
+    - pattern: $CTX.registerReceiver($R, $F, $PERM, $H)
+  - pattern-not: $CTX.registerReceiver(null, $F)
+  - pattern-not: $CTX.registerReceiver(null, $F, $PERM, $H)
   paths:
     include:
     - '**/*.java'
@@ -1399,4 +1402,68 @@ rules:
   metadata:
     rule_id: R-SG-059
     category: security/path-traversal-data-flow
+    severity: critical
+- id: scan-android-r-platform-060-fine-location-needs-coarse
+  languages:
+  - xml
+  severity: ERROR
+  message: 'R-SG-060: 声明 ACCESS_FINE_LOCATION 时 Android 12+ 还需要同时声明 ACCESS_COARSE_LOCATION；adapter 会排除已成对声明的 Manifest'
+  pattern-regex: android\.permission\.ACCESS_FINE_LOCATION
+  paths:
+    include:
+    - '**/AndroidManifest.xml'
+  metadata:
+    rule_id: R-SG-060
+    category: stability/location-permission-pair
+    severity: critical
+- id: scan-android-r-platform-061-hidden-inetaddress-impl
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SG-061: 反射访问 InetAddress.impl 属于 non-SDK 接口，在新 targetSdk/API 下可能被阻止并导致功能失效'
+  pattern-either:
+  - pattern: InetAddress.class.getDeclaredField("impl")
+  - pattern: $M.invoke(InetAddress.class, "impl")
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SG-061
+    category: stability/non-sdk-api-enforcement
+    severity: critical
+- id: scan-android-r-stb-062-wall-clock-duration
+  languages:
+  - java
+  - kotlin
+  severity: WARNING
+  message: 'R-SG-062: 用 currentTimeMillis 差值计算 elapsed/timeout 会受用户或 NTP 调时影响；需确认应使用单调时钟'
+  pattern-regex: System\.currentTimeMillis\s*\(\s*\)\s*-\s*[A-Za-z_$][A-Za-z0-9_.$]*
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SG-062
+    category: stability/non-monotonic-timeout
+    severity: major
+- id: scan-android-r-prf-063-unbounded-task-queue-capacity
+  languages:
+  - java
+  - kotlin
+  severity: ERROR
+  message: 'R-SG-063: 任务队列容量被设为 Integer.MAX_VALUE，生产速度超过消费速度时可能无界增长并 OOM'
+  patterns:
+  - pattern: $CAPACITY = Integer.MAX_VALUE
+  - metavariable-regex:
+      metavariable: $CAPACITY
+      regex: (?i).*(queue|capacity|max).*
+  paths:
+    include:
+    - '**/*.java'
+    - '**/*.kt'
+  metadata:
+    rule_id: R-SG-063
+    category: performance/unbounded-task-queue
     severity: critical

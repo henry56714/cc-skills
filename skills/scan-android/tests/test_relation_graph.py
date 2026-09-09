@@ -6,7 +6,7 @@ import sys
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from relation_graph import build_relation_graph, expand_from_files  # noqa: E402
-from repo_map import RepoMap  # noqa: E402
+from repo_map import RepoMap, _bounded_map  # noqa: E402
 
 
 class RelationGraphTests(unittest.TestCase):
@@ -134,6 +134,31 @@ class RepoMapSymbolTests(unittest.TestCase):
         self.assertEqual(result[0]["confidence"], "high")
         self.assertEqual(result[0]["matched_by"], "explicit-receiver")
         self.assertEqual(result[1]["confidence"], "ambiguous")
+
+    def test_unique_method_name_does_not_resolve_wrong_variable_receiver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "Caller.java").write_text(
+                "class Caller { Runnable worker; void go() { worker.run(); } }"
+            )
+            repo_map = RepoMap.__new__(RepoMap)
+            repo_map.repo = repo
+            repo_map._receiver_types = {}
+            repo_map._defs = [{
+                "name": "run", "kind": "method", "file": "WatchdogThread.java",
+                "line": 2, "owner": "WatchdogThread", "owner_fqn": "p.WatchdogThread",
+                "fqn": "p.WatchdogThread#run", "sig": "void run()",
+            }]
+            repo_map._refs = [{
+                "name": "run", "kind": "method", "file": "Caller.java", "line": 1,
+                "receiver": "worker", "enclosing_type": "Caller",
+                "enclosing_symbol": "Caller#go", "snippet": "worker.run();",
+            }]
+            rendered = repo_map.focused_map(["Caller.java"], 1000)
+            self.assertNotIn("p.WatchdogThread#run", rendered)
+
+    def test_total_map_budget_includes_unbounded_skeleton_prefix(self):
+        self.assertLessEqual(len(_bounded_map("x" * 1000, 10)), 40)
 
 
 if __name__ == "__main__":

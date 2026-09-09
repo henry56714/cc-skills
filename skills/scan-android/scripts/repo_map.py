@@ -108,6 +108,7 @@ class RepoMap:
         self._queries: dict[str, Any] = {}
         self._defs: list[dict[str, Any]] | None = None   # {name, kind, file, line, sig}
         self._refs: list[dict[str, Any]] | None = None    # {name, kind, file, line, enclosing, snippet}
+        self._receiver_types: dict[tuple[str, str], str] = {}
 
     # ---- tree-sitter 资源 ----
     def _parser(self, lang: str):
@@ -308,6 +309,36 @@ class RepoMap:
         hint = self._type_hint(symbol)
         return "" if hint.lower() in {"", "any", "unknown", "*"} else hint
 
+    def _inferred_receiver_type(self, ref: dict[str, Any]) -> str:
+        receiver = str(ref.get("receiver", "")).rsplit(".", 1)[-1]
+        if not receiver or receiver in {"this", "super"} or not hasattr(self, "repo"):
+            return ""
+        key = (str(ref.get("file", "")), receiver)
+        cache = getattr(self, "_receiver_types", None)
+        if cache is None:
+            cache = self._receiver_types = {}
+        if key in cache:
+            return cache[key]
+        try:
+            text = (self.repo / key[0]).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            cache[key] = ""
+            return ""
+        name = re.escape(receiver)
+        patterns = (
+            rf"\b([A-Z][A-Za-z0-9_$.]*)\s+{name}\s*(?:[=;,)]|$)",
+            rf"\b(?:val|var)\s+{name}\s*:\s*([A-Z][A-Za-z0-9_$.]*)",
+            rf"\b(?:val|var)\s+{name}\s*=\s*([A-Z][A-Za-z0-9_$.]*)\s*\(",
+        )
+        inferred = ""
+        for pattern in patterns:
+            match = re.search(pattern, text, re.MULTILINE)
+            if match:
+                inferred = match.group(1).rsplit(".", 1)[-1]
+                break
+        cache[key] = inferred
+        return inferred
+
     def get_definition(self, symbol: str) -> list[dict[str, Any]]:
         self.build_index()
         assert self._defs is not None
@@ -333,19 +364,29 @@ class RepoMap:
             if r["name"] != m or r["kind"] != "method":
                 continue
             receiver_tail = r.get("receiver", "").rsplit(".", 1)[-1]
+            inferred_type = self._inferred_receiver_type(r)
             if not class_hint:
                 confidence, matched_by = "nominal", "method-name"
             elif receiver_tail == class_hint:
                 confidence, matched_by = "high", "explicit-receiver"
-            elif r.get("enclosing_type") == class_hint and receiver_tail in {"", "this", "super"}:
+            elif inferred_type == class_hint:
+                confidence, matched_by = "high", "inferred-receiver-type"
+            elif re.search(
+                rf"\b{re.escape(class_hint)}\b[^;\n]*\.\s*{re.escape(m)}\s*\(",
+                r.get("snippet", ""),
+            ):
+                confidence, matched_by = "nominal", "type-reference-chain"
+            elif r.get("enclosing_type") == class_hint and receiver_tail in {"", "this"}:
                 confidence, matched_by = "high", "same-owner"
+            elif receiver_tail == "super":
+                confidence, matched_by = "ambiguous", "super-dispatch"
             else:
                 confidence, matched_by = "ambiguous", "method-name-only"
             results.append({
                 "file": r["file"], "line": r["line"], "snippet": r["snippet"],
                 "enclosing_symbol": r.get("enclosing_symbol") or r["enclosing"],
                 "receiver": r.get("receiver", ""), "confidence": confidence,
-                "matched_by": matched_by,
+                "receiver_type": inferred_type, "matched_by": matched_by,
             })
         return sorted(results, key=lambda item: (
             {"high": 0, "nominal": 1, "ambiguous": 2}.get(item["confidence"], 3),
@@ -375,7 +416,10 @@ class RepoMap:
             for c in callers[:max_callers]:
                 node = dict(c)
                 enc = c.get("enclosing_symbol") or ""
-                if enc and depth > 1:
+                if c.get("confidence") == "ambiguous":
+                    node["not_expanded"] = True
+                    node["note"] = "歧义名称匹配仅作线索，不参与递归调用链"
+                elif enc and depth > 1:
                     node["callers"] = expand(enc, depth - 1, next_path)
                 elif not enc:
                     node["note"] = "无法定位调用所在方法（lambda/匿名类/字段初始化，请 Read 复核）"
@@ -425,7 +469,7 @@ class RepoMap:
                 break
             out.append(chunk)
             used += cost
-        return "\n".join(out)
+        return _bounded_map("\n".join(out), budget_tokens)
 
     def focused_map(self, batch_files: list[str], budget_tokens: int,
                     risk_by_file: dict[str, int] | None = None,
@@ -500,10 +544,24 @@ class RepoMap:
         ):
             targets = [d for d in defs_by_name.get(ref["name"], []) if d["file"] not in bset]
             receiver_tail = ref.get("receiver", "").rsplit(".", 1)[-1]
-            if receiver_tail:
-                receiver_targets = [d for d in targets if d.get("owner") == receiver_tail]
-                if receiver_targets:
-                    targets = receiver_targets
+            inferred_type = self._inferred_receiver_type(ref)
+            owner_hint = receiver_tail if receiver_tail[:1].isupper() else inferred_type
+            if not owner_hint:
+                mentioned = [
+                    d for d in targets
+                    if re.search(rf"\b{re.escape(str(d.get('owner', '')))}\b", ref.get("snippet", ""))
+                ]
+                if len(mentioned) == 1:
+                    targets = mentioned
+                    owner_hint = str(mentioned[0].get("owner", ""))
+            if owner_hint:
+                targets = [d for d in targets if d.get("owner") == owner_hint]
+            elif receiver_tail not in {"", "this", "super"}:
+                # A unique method name is not sufficient evidence that a variable
+                # receiver has that type (for example Runnable.run()).
+                continue
+            elif receiver_tail in {"", "this", "super"}:
+                targets = [d for d in targets if d.get("owner") == ref.get("enclosing_type")]
             if len(targets) != 1:
                 continue
             target = targets[0]
@@ -524,7 +582,18 @@ class RepoMap:
                     break
                 out.append(line)
                 used += cost
-        return "\n".join(out)
+        return _bounded_map("\n".join(out), budget_tokens)
+
+
+def _bounded_map(text: str, budget_tokens: int) -> str:
+    """Apply the budget to the entire map, including skeleton/structure blocks."""
+    limit = max(0, budget_tokens * _CHARS_PER_TOKEN)
+    if len(text) <= limit:
+        return text
+    marker = "\n\n_（聚焦地图达到总 token 预算，后续内容已截断）_\n"
+    if limit <= len(marker):
+        return marker[:limit]
+    return text[:limit - len(marker)].rstrip() + marker
 
 
 # ──────────────────────────────────────────────────────────────────────────────

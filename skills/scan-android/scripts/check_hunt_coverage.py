@@ -9,10 +9,10 @@ check_hunt_coverage.py — AI 狩猎支线「文件证据 + 多视角覆盖」�
   - 期望（expected）：`hunt_coverage.json` 的 `batches_detail[*].expected_perspectives`
     —— 由 build_hunt_batches 据每批 tech_present 确定性算出（无 WebView 就不期望 webview 视角）。
   - 实际（covered）：每个 `hunt_result_*.json` 自带 `perspectives_covered` 与
-    `files_reviewed`。后者记录每个实际读取文件的 sha256、行数和 Read 范围。
+    `case_ids_checked`、`files_reviewed`。后者记录每个实际读取文件的 sha256、行数和 Read 范围。
 
 断言（任一不满足 → 退出码 1）：
-  1. 每个独立样本都必须覆盖本批全部视角和全部文件；不能靠多个不完整样本取并集；
+  1. 每个独立样本都必须覆盖本批全部视角、case 和文件；不能靠多个不完整样本取并集；
   2. `files_reviewed` 必须与批次文件精确一致，sha256/line_count 与当前文件一致，
      ranges 合并后覆盖 1..line_count；
   3. 每批合法独立样本达到 --min-samples，且不接受重复 sample 或游离结果。
@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -117,6 +118,7 @@ def _check_v2(
     out_dir: Path, cov: dict, min_samples: int, repo_root: Path,
 ) -> dict:
     expected_by_batch: dict[int, set[str]] = {}
+    expected_cases_by_batch: dict[int, set[str]] = {}
     files_by_batch: dict[int, set[str]] = {}
     try:
         for detail in cov.get("batches_detail", []):
@@ -126,15 +128,19 @@ def _check_v2(
             if batch in expected_by_batch:
                 raise ValueError(f"duplicate batch {batch}")
             perspectives = detail.get("expected_perspectives", [])
+            expected_cases = detail.get("expected_case_ids", [])
             files = detail.get("files", [])
             if (
                 not isinstance(perspectives, list)
                 or not all(isinstance(item, str) for item in perspectives)
                 or not isinstance(files, list)
                 or not all(isinstance(item, str) for item in files)
+                or not isinstance(expected_cases, list)
+                or not all(isinstance(item, str) for item in expected_cases)
             ):
-                raise TypeError(f"batch {batch} perspectives/files must be string arrays")
+                raise TypeError(f"batch {batch} perspectives/files/cases must be string arrays")
             expected_by_batch[batch] = set(perspectives)
+            expected_cases_by_batch[batch] = set(expected_cases)
             files_by_batch[batch] = set(files)
     except (TypeError, ValueError, KeyError) as exc:
         return {"ok": False, "error": f"覆盖率清单批次字段无效: {exc}"}
@@ -150,18 +156,25 @@ def _check_v2(
         obj = _load_json(result_path)
         candidates = obj.get("candidates") if isinstance(obj, dict) else None
         perspectives = obj.get("perspectives_covered") if isinstance(obj, dict) else None
+        cases_checked = obj.get("case_ids_checked", []) if isinstance(obj, dict) else None
         if (
             not isinstance(obj, dict) or "batch" not in obj or "sample" not in obj
             or "__error__" in obj or not isinstance(candidates, list)
             or not all(isinstance(x, dict) for x in candidates)
             or not isinstance(perspectives, list)
             or not all(isinstance(x, str) for x in perspectives)
+            or not isinstance(cases_checked, list)
+            or not all(isinstance(x, str) for x in cases_checked)
         ):
             bad_results.append(result_path.name)
             continue
         try:
             batch, sample = int(obj["batch"]), int(obj["sample"])
         except (TypeError, ValueError):
+            bad_results.append(result_path.name)
+            continue
+        filename_match = re.fullmatch(r"hunt_result_(\d+)_(\d+)\.json", result_path.name)
+        if not filename_match or (batch, sample) != tuple(map(int, filename_match.groups())):
             bad_results.append(result_path.name)
             continue
         key = (batch, sample)
@@ -177,6 +190,9 @@ def _check_v2(
         missing_perspectives = expected_by_batch[batch] - set(perspectives)
         if missing_perspectives:
             problems.append("漏视角: " + ", ".join(sorted(missing_perspectives)))
+        missing_cases = expected_cases_by_batch.get(batch, set()) - set(cases_checked)
+        if missing_cases:
+            problems.append("漏 case: " + ", ".join(sorted(missing_cases)))
         problems.extend(_validate_file_reads(
             obj.get("files_reviewed"), files_by_batch.get(batch, set()), repo_root,
         ))
@@ -201,6 +217,7 @@ def _check_v2(
             "expected": sorted(expected),
             "covered": sorted(covered),
             "missing": sorted(expected - covered),
+            "cases_expected": sorted(expected_cases_by_batch.get(batch, set())),
             "files_expected": sorted(files_by_batch.get(batch, set())),
             "samples": len(samples),
             "results": len(samples),

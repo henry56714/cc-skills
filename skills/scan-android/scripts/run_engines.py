@@ -46,6 +46,7 @@ from adapters.detekt_adapter import DetektAdapter
 from adapters.pmd_adapter import PMDAdapter
 from adapters.lint_adapter import LintAdapter
 from detect_project import detect_project
+from lib_scan import atomic_write_json
 
 # 已注册引擎，按"广度→深度"优先级排列。规则全部来自社区库/引擎自带。
 # - P1: semgrep（社区 registry + 本地补充，含 taint 模式）、detekt（Kotlin）、pmd（Java）、lint（Android）
@@ -72,9 +73,14 @@ def main() -> int:
                     help="单规则候选上限；0=不截断（默认）")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--engines", default="auto", help='auto 或 CSV，如 semgrep,pmd')
+    ap.add_argument("--output", default=None, help="同时将完整 JSON 原子写入此路径")
     ap.add_argument(
         "--allow-build-execution", action="store_true",
         help="允许执行仓库的 Gradle/Lint 构建逻辑；仅对可信仓库使用",
+    )
+    ap.add_argument(
+        "--install-missing", action="store_true",
+        help="显式允许联网并将缺失引擎安装到 ~/.scan-android",
     )
     args = ap.parse_args()
 
@@ -82,8 +88,7 @@ def main() -> int:
     try:
         scope_files = _read_scope(args.scope_files, repo)
     except (OSError, ValueError) as exc:
-        json.dump({"status": "incomplete", "scan_complete": False, "error": str(exc)}, sys.stdout, ensure_ascii=False)
-        sys.stdout.write("\n")
+        _emit({"status": "incomplete", "scan_complete": False, "error": str(exc)}, args.output)
         return 2
 
     excluded, config = _load_engine_config(repo)
@@ -96,24 +101,24 @@ def main() -> int:
         detect_info=detect_info,
         excluded_engines=excluded,
         allow_build_execution=args.allow_build_execution or config.get("allow_gradle_execution", False) is True,
+        allow_installation=args.install_missing,
     )
+    _invalidate_downstream(repo)
 
     requested = [s.strip() for s in args.engines.split(",") if s.strip()]
     known = {a.name for a in _REGISTRY}
     if args.engines.strip().lower() != "auto" and not requested:
-        json.dump({
+        _emit({
             "status": "incomplete", "scan_complete": False,
             "error": "--engines 不能为空", "available_engines": sorted(known),
-        }, sys.stdout, ensure_ascii=False)
-        sys.stdout.write("\n")
+        }, args.output)
         return 2
     unknown = [] if args.engines.strip().lower() == "auto" else [n for n in requested if n not in known]
     if unknown:
-        json.dump({
+        _emit({
             "status": "incomplete", "scan_complete": False,
             "error": f"未知引擎: {', '.join(unknown)}", "available_engines": sorted(known),
-        }, sys.stdout, ensure_ascii=False)
-        sys.stdout.write("\n")
+        }, args.output)
         return 2
     selected = _select_engines(args.engines)
 
@@ -137,12 +142,6 @@ def main() -> int:
                                  "candidates": 0, "truncated": 0,
                                  "reason": "excluded_engines 配置排除"})
             continue
-        if adapter.name == "lint" and not ctx.allow_build_execution:
-            reason = "安全默认：未获授权，不执行目标仓库 Gradle/Lint 逻辑"
-            engines_skipped.append({"engine": adapter.name, "reason": reason})
-            engine_stats.append({"engine": adapter.name, "status": "skipped", "rules_run": 0,
-                                 "candidates": 0, "truncated": 0, "reason": reason})
-            continue
         try:
             available, reason = adapter.is_available(ctx)
         except InstallationError as e:
@@ -160,6 +159,14 @@ def main() -> int:
             all_notes.append({"engine": adapter.name, "note": reason})
             continue
         if not available:
+            if adapter.name == "lint" and not ctx.allow_build_execution:
+                engines_skipped.append({"engine": adapter.name, "reason": reason})
+                engine_stats.append({
+                    "engine": adapter.name, "status": "skipped", "rules_run": 0,
+                    "rules_triggered": 0, "rules_configured": None,
+                    "candidates": 0, "truncated": 0, "reason": reason,
+                })
+                continue
             engines_skipped.append({"engine": adapter.name, "reason": reason})
             engine_stats.append({"engine": adapter.name, "status": "failed", "rules_run": 0,
                                  "candidates": 0, "truncated": 0, "reason": reason})
@@ -195,6 +202,7 @@ def main() -> int:
             "status": res.status,
             "rules_run": res.rules_run,      # 兼容字段：本次触发的规则种类数
             "rules_triggered": res.rules_run,
+            "rules_configured": res.rules_total or None,
             "candidates": len(res.candidates),
             "truncated": res.truncated,
             "suppressed": res.suppressed,
@@ -241,9 +249,27 @@ def main() -> int:
     }
     if all_notes:
         out["notes"] = all_notes
-    json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
+    _emit(out, args.output)
     return 0
+
+
+def _emit(payload: dict, output: str | None) -> None:
+    if output:
+        atomic_write_json(output, payload)
+    json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+
+
+def _invalidate_downstream(repo: Path) -> None:
+    """A new engine run makes previous verifier/merge receipts stale."""
+    tmp = repo / ".scan" / "tmp"
+    for pattern in ("verify_batch_*.json", "verified_batch_*.json"):
+        for path in tmp.glob(pattern):
+            path.unlink()
+    for name in ("verify_coverage.json", "merge_receipt.json"):
+        path = tmp / name
+        if path.exists():
+            path.unlink()
 
 
 def _select_engines(spec: str) -> list[EngineAdapter]:

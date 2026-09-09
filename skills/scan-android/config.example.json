@@ -29,10 +29,10 @@
   "_scope_note": "diff 影响切片默认深度。CLI --impact-depth 可覆盖。",
   "impact_depth": 2,
 
-  "_hunt_note": "AI 对每批的独立采样次数、文件上限和估算 token 上限。",
+  "_hunt_note": "AI 对每批的独立采样次数、文件上限和估算 token 上限。批次还会携带必须逐项检查的 case id。",
   "hunt_samples": 2,
-  "hunt_batch_size": 15,
-  "hunt_token_budget": 36000,
+  "hunt_batch_size": 10,
+  "hunt_token_budget": 24000,
 
   "_modules_note": "可覆盖 settings.gradle 自动探测；留空自动探测。",
   "modules": [],
@@ -42,6 +42,8 @@
 
   "_lint_tasks_note": "授权 Lint 后按顺序尝试，采用第一个产生有效报告的任务。",
   "lint_tasks": [],
+  "_lint_report_paths_note": "未授权执行 Gradle 时可只读解析这些仓库内 Lint XML；留空会自动发现 lint-results*.xml，结果标 partial 以提示变体/新鲜度未知。",
+  "lint_report_paths": [],
 
   "_language_note": "zh / en；留空按 locale 推断。",
   "language": "",

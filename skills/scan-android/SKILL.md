@@ -57,7 +57,7 @@ python3 <SKILL_DIR>/scripts/preflight.py --repo-root .
 
 只有 Python 版本是硬阻塞。Semgrep、Detekt、PMD、tree-sitter、Java、Gradle wrapper 缺失会成为 warning；继续处理可用引擎并最终如实标记 incomplete。不要绕过或隐藏 warning。
 
-首次安装会联网和写 `~/.scan-android`；若执行环境要求权限，先取得用户授权。依赖版本固定在 installer/requirements 中。
+预检默认只检测，绝不安装。首次安装会联网和写 `~/.scan-android`；取得用户明确授权后才重跑 `preflight.py --install-missing`，并在 `run_engines.py` 同样传 `--install-missing`。adapter 不得自行安装。依赖版本固定在 installer/requirements 中。
 
 ### 2. 生成工程事实与确定性作用域
 
@@ -80,7 +80,7 @@ python3 <SKILL_DIR>/scripts/prepare_scope.py --repo-root . [--diff REF|--full] [
 ### 3. 工具候选
 
 ```text
-python3 <SKILL_DIR>/scripts/run_engines.py --repo-root . --scope-files .scan/tmp/scope.txt
+python3 <SKILL_DIR>/scripts/run_engines.py --repo-root . --scope-files .scan/tmp/scope.txt --output .scan/tmp/engine-results.json
 ```
 
 把完整 stdout 保存为 `.scan/tmp/engine-results.json`。默认引擎：
@@ -88,7 +88,7 @@ python3 <SKILL_DIR>/scripts/run_engines.py --repo-root . --scope-files .scan/tmp
 - Semgrep：固定版本、本地 Android 规则与 taint 候选；verifier 读取 source/sink 重建并核实路径。在线 registry 默认关闭，需配置显式开启。
 - Detekt：Kotlin。
 - PMD：Java。
-- Android Lint：默认**不运行**，因为它会执行目标仓库 Gradle 逻辑。只有用户信任仓库并显式授权时才加 `--allow-build-execution`，或设置 `allow_gradle_execution=true`。
+- Android Lint：默认不执行 Gradle；若仓库已有 `lint-results*.xml`，只读解析候选并把 Lint 标为 partial（无法证明新鲜度/变体）。只有用户信任仓库并显式授权时才加 `--allow-build-execution`，或设置 `allow_gradle_execution=true` 生成新报告。
 
 PMD 默认使用高信号候选 profile：资源泄漏、非线程安全 formatter、硬编码密码学密钥进入漏洞 verifier；style/advisory 命中以 `suppressed/suppression_summary` 明确记账，不静默消失。只有用户显式设置 `pmd_include_advisories=true` 才把全部 PMD 命中送入 verifier。
 
@@ -110,7 +110,7 @@ PMD 默认使用高信号候选 profile：资源泄漏、非线程安全 formatt
 2. 构建关系图并确定性分批：
 
 ```text
-python3 <SKILL_DIR>/scripts/build_hunt_batches.py --repo-root . --scope-files .scan/tmp/hunt_scope.txt --batch-size <config.hunt_batch_size_or_15> --token-budget <config.hunt_token_budget_or_36000>
+python3 <SKILL_DIR>/scripts/build_hunt_batches.py --repo-root . --scope-files .scan/tmp/hunt_scope.txt --batch-size <config.hunt_batch_size_or_10> --token-budget <config.hunt_token_budget_or_24000>
 ```
 
 脚本写出 `.scan/tmp/relation_graph.json`，以风险文件作为种子、优先把强关系邻居放进同批，而不是把同一调用链按风险分开。`coverage_ok=false` 必须修复后重跑；缺失/不可读文件也算覆盖失败。
@@ -123,7 +123,7 @@ python3 <SKILL_DIR>/scripts/repo_map.py --repo . --action map --batch-file .scan
 
 地图同时包含 FQN 符号、批外 callers、唯一目标 callees，以及 Manifest/资源/source set 等结构关系。若宿主提供原生 LSP，hunter 和 verifier 必须先用 definition/references/implementation/call hierarchy，再用地图或 `nav_tools.py` 降级；任何导航边都要回读源码。
 
-4. 对每批派发独立 hunter。可并行，但每个 hunter 必须完整读取批次全部文件，并真实完成批次 `expected_perspectives`。核心视角始终启用；IPC、存储、网络密码学、modern runtime、WebView、native 视角仅在批次 marker 命中时启用。把严格 JSON 输出写成 `.scan/tmp/hunt_result_N_SAMPLE.json`。结果必须含 `{batch,sample,perspectives_covered,files_reviewed,candidates}`；`files_reviewed` 为每个批次文件记录批次快照中的 sha256/line_count 及实际 Read ranges。
+4. 对每批派发独立 hunter。可并行，但每个 hunter 必须完整读取批次全部文件，真实完成 `expected_perspectives` 并逐项判断 `expected_case_ids`。把严格 JSON 输出写成 `.scan/tmp/hunt_result_N_SAMPLE.json`。结果必须含 `{batch,sample,perspectives_covered,case_ids_checked,files_reviewed,candidates}`；`files_reviewed` 为每个批次文件记录批次快照中的 sha256/line_count 及实际 Read ranges。
 
 5. 每批采样次数为 `config.hunt_samples`（默认 2）。多次结果取并集，交给 verifier 去重，不能只保留第一次。若用户为了成本显式降为 1，交付时说明单样本召回可能波动。
 
@@ -143,7 +143,7 @@ python3 <SKILL_DIR>/scripts/build_verify_batches.py --repo-root . --input .scan/
 
 若 AI 被配置关闭，则省略 `--input-glob`。检查 `verify_coverage.json` 的 `coverage_ok=true` 和 input/batched 数相等。批次数量不限，不得只处理前几批。
 
-脚本为每条输入加入稳定 `candidate_id` 与 provenance（工具引擎或 hunter batch/sample），并按同规则/同定位聚拢，减少重复候选跨批边界。Verifier 必须回传这些字段。
+脚本为每条输入加入稳定 `candidate_id` 与 provenance（工具引擎或 hunter batch/sample），并优先按 hunter 的 `root_cause_hint` 聚拢跨规则/跨文件疑似同根因候选，再按同规则/同定位聚拢。Verifier 必须回传这些字段，并独立核实 hint。
 
 ### 6. 独立验证
 
@@ -167,7 +167,13 @@ Verifier 输出必须带完整性回执：
 - `source_candidate_ids`: 本记录吸收的全部输入 ID；
 - `provenance`: 对应工具/AI 样本来源的去重并集。
 
-Verifier 进程失败、输出无法解析或某批未返回时，不能丢掉该批。为该批所有候选生成 `needs_review` 条目，`review_reason` 写明验证失败原因，保留 candidate_id/provenance；无法判断根因时使用候选定位作为唯一 `root_cause.primary_file/symbol`，`failure_mode=verifier-failed-unresolved`，然后继续其他批。
+Verifier 进程失败、输出无法解析或某批未返回时，不能丢掉该批。确定失败原因后运行：
+
+```text
+python3 <SKILL_DIR>/scripts/fallback_verify.py --input .scan/tmp/verify_batch_N.json --output .scan/tmp/verified_batch_N.json --reason '<失败原因>' --language <zh|en>
+```
+
+脚本会把该批所有候选无损转入 `needs_review`，保留 candidate_id/provenance，并使用 `verifier-failed-unresolved` 根因；然后继续其他批。
 
 条件触发类（外部数据流、主线程、Context 生命周期、组件导出/IPC）confirmed 必须带 `dataflow_path` 或 `origin_trace`。导航结果只作线索，每跳回读源码确认。
 
@@ -175,7 +181,7 @@ Verifier 进程失败、输出无法解析或某批未返回时，不能丢掉�
 
 ```text
 python3 <SKILL_DIR>/scripts/merge_findings.py --verified-glob '.scan/tmp/verified_batch_*.json'
-python3 <SKILL_DIR>/scripts/render_report.py --engine-stats '<engine_stats JSON>' --models '<运行时实际模型 ID CSV>' --language <zh|en>
+python3 <SKILL_DIR>/scripts/render_report.py --engine-results .scan/tmp/engine-results.json --models '<运行时实际模型 ID CSV>' --language <zh|en>
 ```
 
 `merge_findings.py` 会：
@@ -187,9 +193,9 @@ python3 <SKILL_DIR>/scripts/render_report.py --engine-stats '<engine_stats JSON>
 - 将缺 origin 的条件触发 confirmed 移入 needs-review，而不是丢弃；
 - 原子覆盖两个机器可读结果。
 
-它还会对照 `verify_coverage.json` 拒绝缺失或额外的 verifier 批次；不得绕过该检查。
+它还会对照 `verify_coverage.json` 拒绝缺失或额外的 verifier 批次，并在成功回执中绑定 engine、Hunter、verifier 输入/输出和最终 JSON 的 SHA-256；不得绕过该检查。合并后任一产物发生变化，都必须重新验证和合并。
 
-检查四个最终产物都存在。报告头必须保留 complete/partial/failed/skipped/not_applicable、suppressed、截断和 coverage gap；`run_manifest.json` 必须由渲染步骤写入实际模型、引擎统计、结束时间和结果计数。模型 ID 不可得时写 `unknown`，不要写泛化品牌名冒充精确版本。
+渲染步骤会强制读取 engine-results、Hunter coverage、verify coverage 与带同一 run ID 的 merge receipt；任一缺失/无效都会把最终状态标为 incomplete，禁止产生“AI 未运行但 complete”的假完成报告。检查四个最终产物都存在。报告头必须保留 complete/partial/failed/skipped/not_applicable、suppressed、截断和 coverage gap；`run_manifest.json` 必须由渲染步骤写入实际模型、引擎统计、阶段状态、结束时间和结果计数。模型 ID 不可得时自动写 `unknown`。
 
 ### 8. 交付
 
@@ -210,7 +216,8 @@ python3 <SKILL_DIR>/scripts/render_report.py --engine-stats '<engine_stats JSON>
 - `excluded_engines`: `semgrep|detekt|pmd|lint|ai`
 - `allow_gradle_execution`: 默认 false
 - `semgrep_use_registry`: 默认 false；true 会联网且规则可能随 registry 更新
-- `hunt_samples`, `hunt_batch_size`, `hunt_token_budget`, `impact_depth`
+- `hunt_samples`, `hunt_batch_size`（默认 10）, `hunt_token_budget`（默认 24000）, `impact_depth`
+- `lint_report_paths`：可选只读 Lint XML；未设置时自动发现已有报告
 - `pmd_include_advisories`: 默认 false；true 将 PMD style/advisory 一并送入 verifier
 - `include_documentation`: 默认 false；true 只把 docs 加入工具 scope
 - `modules`, `extra_excludes`, `lint_tasks`, `language`, `project_context`

@@ -1,6 +1,6 @@
 """Android Lint adapter —— P1 Android 感知扫描。
 
-通过项目的 Gradle wrapper 运行 lint 任务，解析 lint-results.xml。
+解析已有 lint-results XML；仅在显式授权后通过 Gradle 生成新报告。
 Android Lint 对 manifest / 资源 / API 使用有最精准的感知能力。
 """
 
@@ -48,6 +48,9 @@ _LINT_RULE_MAP: dict[str, tuple[str, str, str]] = {
     "DiscouragedApi": ("R-LT-015", "stability/deprecated-asynctask", "minor"),
     "CommitTransaction": ("R-LT-016", "stability/fragment-state-loss", "major"),
     "StaticFieldLeak": ("R-LT-017", "stability/static-context-leak", "critical"),
+    "CoarseFineLocation": ("R-LT-022", "stability/location-permission-pair", "critical"),
+    "SoonBlockedPrivateApi": ("R-LT-023", "stability/non-sdk-api-enforcement", "critical"),
+    "PrivateApi": ("R-LT-023", "stability/non-sdk-api-enforcement", "major"),
     # Performance
     "WrongThread": ("R-LT-018", "perf/main-thread-io", "major"),
     "ViewHolder": ("R-LT-019", "perf/rv-findviewbyid", "major"),
@@ -73,9 +76,12 @@ class LintAdapter(EngineAdapter):
 
     def is_available(self, ctx: ScanContext) -> tuple[bool, str]:
         if not ctx.allow_build_execution:
+            reports = _existing_reports(ctx)
+            if reports:
+                return True, ""
             return False, (
-                "Lint 需要执行仓库 Gradle 构建逻辑；默认禁用。确认仓库可信后传 "
-                "--allow-build-execution 或配置 allow_gradle_execution=true"
+                "未发现已有 lint-results XML，且未获授权执行 Gradle/Lint；确认仓库可信后传 "
+                "--allow-build-execution"
             )
         gradlew = ctx.repo / "gradlew"
         if not gradlew.exists():
@@ -84,6 +90,24 @@ class LintAdapter(EngineAdapter):
 
     def run(self, ctx: ScanContext) -> AdapterResult:
         result = AdapterResult(engine=self.name)
+        if not ctx.allow_build_execution:
+            reports = _existing_reports(ctx)
+            if not reports:
+                result.available = False
+                result.status = "failed"
+                result.unavailable_reason = "没有可只读解析的 Lint XML"
+                return result
+            _populate_from_reports(result, reports, ctx)
+            # Existing reports may represent a different variant or stale source.
+            # Retain their high-value findings but never claim complete coverage.
+            result.status = "partial"
+            result.notes.append({
+                "engine": self.name,
+                "note": "只读解析已有 Lint XML；未执行 Gradle，无法证明报告对应当前源码和目标变体",
+                "reports": [str(path.relative_to(ctx.repo.resolve())) for path in reports],
+            })
+            return result
+
         gradlew = ctx.repo / "gradlew"
         if not gradlew.exists():
             result.available = False
@@ -149,27 +173,50 @@ class LintAdapter(EngineAdapter):
             )
             return result
 
-        scope_set = set(ctx.scope_files)
-        all_candidates: list[Candidate] = []
-        rules_seen: set[str] = set()
-
-        for report_path in xml_reports:
-            try:
-                candidates, issues = _parse_lint_xml(report_path, ctx.repo, scope_set)
-                all_candidates.extend(candidates)
-                rules_seen.update(issues)
-            except Exception as e:
-                result.status = "partial"
-                result.notes.append({
-                    "engine": self.name,
-                    "note": f"lint 报告 {report_path.name} 解析失败: {e}",
-                })
-
-        result.candidates = all_candidates
-        result.rules_run = len(rules_seen)
-        result.rules_total = len(rules_seen)
+        _populate_from_reports(result, xml_reports, ctx)
         result.notes.append({"engine": self.name, "note": f"已运行 lint 任务: {ran_task}"})
         return result
+
+
+def _existing_reports(ctx: ScanContext) -> list[Path]:
+    """Return explicit or discovered reports without executing project code."""
+    config = ctx.detect_info.get("config", {}) if isinstance(ctx.detect_info, dict) else {}
+    configured = config.get("lint_report_paths", []) if isinstance(config, dict) else []
+    reports: list[Path] = []
+    if isinstance(configured, list):
+        for raw in configured:
+            if not isinstance(raw, str):
+                continue
+            path = Path(raw)
+            path = path if path.is_absolute() else ctx.repo / path
+            try:
+                path.resolve().relative_to(ctx.repo.resolve())
+            except ValueError:
+                continue
+            if path.is_file() and path.suffix.lower() == ".xml":
+                reports.append(path)
+    if not reports:
+        reports = [path for path in ctx.repo.rglob("lint-results*.xml") if path.is_file()]
+    return sorted(dict.fromkeys(path.resolve() for path in reports))
+
+
+def _populate_from_reports(result: AdapterResult, reports: list[Path], ctx: ScanContext) -> None:
+    scope_set = set(ctx.scope_files)
+    rules_seen: set[str] = set()
+    for report_path in reports:
+        try:
+            candidates, issues = _parse_lint_xml(report_path, ctx.repo, scope_set)
+            result.candidates.extend(candidates)
+            rules_seen.update(issues)
+        except Exception as exc:
+            result.status = "partial"
+            result.notes.append({
+                "engine": "lint",
+                "note": f"lint 报告 {report_path.name} 解析失败: {exc}",
+            })
+    result.rules_run = len(rules_seen)
+    # Lint XML contains triggered issue ids only, not the configured registry.
+    result.rules_total = 0
 
 
 def _parse_lint_xml(
@@ -202,10 +249,7 @@ def _parse_lint_xml(
 
         for location in issue.findall("location"):
             file_str = location.get("file", "")
-            try:
-                rel = Path(file_str).resolve().relative_to(repo).as_posix()
-            except ValueError:
-                rel = file_str
+            rel = _normalize_lint_location(file_str, repo, scope_set)
             if scope_set and rel not in scope_set:
                 continue
 
@@ -222,3 +266,14 @@ def _parse_lint_xml(
             ))
 
     return candidates, issues_seen
+
+
+def _normalize_lint_location(file_str: str, repo: Path, scope_set: set[str]) -> str:
+    """Normalize absolute report paths, including reports copied with a repo."""
+    normalized = file_str.replace("\\", "/")
+    try:
+        return Path(file_str).resolve().relative_to(repo).as_posix()
+    except ValueError:
+        pass
+    suffix_matches = [rel for rel in scope_set if normalized.endswith("/" + rel) or normalized == rel]
+    return min(suffix_matches, key=len) if suffix_matches else normalized

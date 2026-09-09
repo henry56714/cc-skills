@@ -12,15 +12,15 @@ A collection of Claude Code **skills**. Currently one skill: `skills/scan-androi
 
 ## Scripts (`skills/scan-android/scripts/`)
 
-- **Python standard library only.** The repo has no dependencies of its own. Scan engines (semgrep, detekt, pmd, joern) are auto-installed at runtime to `~/.scan-android/` (venv + tools) by `scripts/tools/installer.py` — never add them as repo deps.
-- **No test framework.** Validate edits with `python3 -m py_compile <file>` (or ast-parse). Real end-to-end testing = run the skill on an actual Android project (e.g. via `preflight.py` → `run_engines.py` → subagents → `merge_findings.py` → `render_report.py`).
+- **Python standard library only.** The repo has no runtime dependencies of its own. Scan engines (semgrep, detekt, pmd, joern) are detected by default; installation to `~/.scan-android/` is allowed only when the caller explicitly passes `--install-missing`. Never add them as repo dependencies.
+- Tests use the standard-library `unittest` runner. Validate scripts with both `unittest discover` and `py_compile`; real forward testing additionally runs the deterministic pipeline on an Android project.
 
 ## scan-android architecture facts (don't regress these)
 
 - **Dimensionless:** every scan runs ALL rules. There is no `--checks` flag and no security/stability/perf selection — scope (`--diff`/`--module`/`--files`/`--full`) is the only scan parameter.
 - **Stateless:** no ledger, no cross-scan state machine. `merge_findings.py` overwrites `findings.json` each run; reports show only the current scan (no commit/time, no first/last-seen).
-- **Rules come from engines/community,** not in-repo: Semgrep loads community registry packs + `queries/semgrep/android.yaml`; the only hand-maintained rule files are `queries/` and `rules/ai/hunting.md` (AI-branch hunting heuristics, neutral `R-AI-NNN` ids).
-- Strict preflight: required engines auto-install or the scan aborts (no degraded mode).
+- **Rules come from engines/community and pinned in-repo additions:** Semgrep registry is opt-in; `queries/` and `rules/ai/hunting.md` contain maintained Android gaps.
+- Preflight is detection-only by default. Installation requires explicit `--install-missing`; missing optional engines make the final scan incomplete instead of aborting all retained results.
 
 ## Conventions
 

@@ -31,6 +31,7 @@
 - `nav_backend`: `auto|treesitter|source`，仅控制宿主 LSP 不可用时的脚本降级后端
 - `impact_depth`, `hunt_samples`, `hunt_batch_size`, `hunt_token_budget`
 - `modules`, `extra_excludes`, `lint_tasks`, `language`, `project_context`
+- `lint_report_paths`: 可选的仓库内 Lint XML；未授权 Gradle 时只读解析并标 partial
 
 未知字段忽略。配置解析失败不得猜测；使用安全默认并在 notes/warnings 中显示。
 
@@ -133,9 +134,9 @@ needs-review schema v2 的数组键为 `needs_review`，条目 `status=needs_rev
 
 ## 完整性语义
 
-AI hunter coverage schema v2 直接核对每个 `hunt_result`：每个独立 sample 必须覆盖本批全部 `expected_perspectives`，并以 `files_reviewed[{file,sha256,line_count,ranges}]` 精确覆盖批次全部文件。sha256/line_count 必须匹配当前文件，ranges 合并后覆盖全文；不同 sample 不得通过并集补齐彼此缺口。它是可校验的检查回执，不是模型理解质量证明。
+AI hunter coverage schema v2 直接核对每个 `hunt_result`：每个独立 sample 必须覆盖本批全部 `expected_perspectives` 和 `expected_case_ids`，并以 `files_reviewed[{file,sha256,line_count,ranges}]` 精确覆盖批次全部文件。sha256/line_count 必须匹配当前文件，ranges 合并后覆盖全文；不同 sample 不得通过并集补齐彼此缺口。它是可校验的检查回执，不是模型理解质量证明。
 
-- `complete`: 所选作用域、全部选择能力、AI 文件/视角与 verifier 批次全部完成且无截断/跳过。
+- `complete`: 所选作用域、全部选择能力、AI 文件/视角/case、verifier 批次和 merge receipt 全部完成且无截断/跳过。
 - `complete_with_skips`: 执行成功，但存在显式排除或未授权 Lint 等覆盖缺口；`scan_complete=false`。
 - `incomplete`: 任一启用引擎 partial/failed、文件不可读、覆盖率不通过、verifier 批缺失或输出不可解析。
 - `not_applicable`: 作用域无该引擎支持的语言；不是覆盖缺口。

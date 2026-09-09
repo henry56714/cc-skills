@@ -51,14 +51,26 @@ def build(
         stale.unlink()
     for stale in out_dir.glob("verified_batch_*.json"):
         stale.unlink()
+    merge_receipt = out_dir / "merge_receipt.json"
+    if merge_receipt.exists():
+        merge_receipt.unlink()
 
     # 先按同规则/同定位聚拢，避免双样本重复刚好被批次边界拆开。
     groups: dict[tuple, list[dict]] = {}
     for cand in all_candidates:
-        key = (
-            cand.get("rule_id", ""), cand.get("file", ""),
-            int(cand.get("line", 0) or 0),
-        )
+        hint = cand.get("root_cause_hint")
+        if isinstance(hint, dict) and all(
+            isinstance(hint.get(field), str) and hint.get(field).strip()
+            for field in ("primary_file", "symbol", "failure_mode")
+        ):
+            key = (
+                "root-hint", hint["primary_file"], hint["symbol"], hint["failure_mode"],
+            )
+        else:
+            key = (
+                "location", cand.get("rule_id", ""), cand.get("file", ""),
+                int(cand.get("line", 0) or 0),
+            )
         groups.setdefault(key, []).append(cand)
 
     batches: list[list[dict]] = []

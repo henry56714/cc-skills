@@ -27,6 +27,7 @@
 - 批次文件：`{BATCH_FILE}`（`build_hunt_batches.py` 产出的 JSON）。**第一步用 Read 读它**，取：
   - `files`：本批要狩猎的文件数组，每项含 `{file, risk_score, tech, sha256, line_count}`；文件已按关系聚类，数组第一项是高风险种子；
   - `tech_present`：本批涉及的技术集合（`webview`/`ipc_aidl`/`database`/…），用于**自门控狩猎视角**。
+  - `expected_case_ids`：本批必须逐项判断的 AI case；输出回执必须完整覆盖。
   - `relation_edges` / `boundary_relations`：Manifest 组件、资源、source set overlay、import、唯一类型引用和 Gradle module 关系。它们是有来源的结构线索，不证明运行时可达。
 - **聚焦代码地图**：`{REPO_MAP}`（`repo_map.py` 产出的 Markdown）。**第二步用 Read 读它**。它给你**本批之外的跨文件视野**：
   - 「本批文件签名骨架」：本批各文件的类/方法/接口签名（函数体已折叠），供你快速建立结构印象；
@@ -52,15 +53,22 @@
 > 不要只做一次「泛泛找 bug」——那会漏。严格以批次 JSON 的 `expected_perspectives` 为准逐轮检查。`auth_dataflow`、`lifecycle_concurrency`、`performance`、`free` 是核心视角；其余视角只有相关技术 marker 存在时才进入列表。不要执行未列出的专项轮，也不能漏掉已列出的轮。
 
 1. `auth_dataflow`：鉴权、外部输入、敏感 sink 与业务不变量。
-2. `platform_ipc`：批次列出时检查 Manifest、组件导出、Intent/URI grant、Binder/AIDL/Provider、PendingIntent、动态 receiver。
-3. `lifecycle_concurrency`：生命周期、协程/Flow、线程、重试、状态一致性与资源释放。
-4. `storage_privacy`：批次列出时检查本地存储、备份、日志/剪贴板/截图、权限与数据最小化。
-5. `network_crypto`：批次列出时检查 TLS/网络安全配置、证书固定、token 刷新、密钥/nonce/Keystore。
-6. `performance`：主线程、N+1、唤醒、内存、电量与后台限制。
-7. `modern_runtime`：批次列出时检查 Compose、Room、WorkManager、前台服务、精确闹钟及新 Android 行为变化。
-8. `webview`：仅当 `tech_present` 含 `webview`。
-9. `native_dependency`：仅当 `tech_present` 含 `native`，检查 JNI/动态加载/依赖边界。
-10. `free`：规则外但可检验的深层问题。
+2. `platform_ipc`：Manifest、组件导出、Intent/URI grant、Binder/AIDL/Provider、PendingIntent、Binder 载荷。
+3. `permissions_platform`：运行时权限版本矩阵、AppOps、targetSdk 行为和 hidden/non-SDK API。
+4. `lifecycle_concurrency`：生命周期、协程/Flow、线程、重试与资源释放。
+5. `state_consistency`：跨字段快照、TOCTOU、shutdown/init race、generation ownership 和时间源。
+6. `failure_reliability`：异步失败传播、队列拒绝、背压、持久化、重试和幂等。
+7. `storage_privacy`：本地存储、备份、日志/剪贴板/截图。
+8. `privacy_consent`：同意、撤销、数据最小化、稳定标识符和保留策略。
+9. `network_crypto`：TLS、网络配置、token、密钥/nonce/AEAD/重放。
+10. `performance`：主线程、N+1、唤醒、内存、电量与后台限制。
+11. `modern_runtime`：Compose、Room、WorkManager、前台服务、精确闹钟及新 Android 行为。
+12. `webview`：仅当 `tech_present` 含 `webview`。
+13. `native_dependency`：JNI/动态加载/依赖边界。
+14. `sdk_integration`：AAR consumer rules、ABI、JNI 名称、manifest merge 和 SDK 初始化契约。
+15. `free`：规则外但可检验的深层问题。
+
+逐项处理 `expected_case_ids`。某 case 在本批没有触发信号也必须完成判断；只需把 id 记入 `case_ids_checked`，不要为“无信号”制造候选。sample 0 侧重完整 source→sink/生命周期链，sample 1 及以后侧重反例、失败路径、并发交错和跨文件状态不变量，避免重复同一遍泛扫。
 
 批次 JSON 的 `expected_perspectives` 是本批最低覆盖集合。每项都必须真实完成并写入回执；不能仅抄列表。
 
@@ -75,6 +83,7 @@
   "batch": 0,
   "sample": 0,
   "perspectives_covered": ["auth_dataflow", "platform_ipc", "lifecycle_concurrency", "storage_privacy", "network_crypto", "performance", "modern_runtime", "webview", "free"],
+  "case_ids_checked": ["R-AI-001", "R-AI-002"],
   "files_reviewed": [
     {
       "file": "app/src/main/java/example/PayManager.java",
@@ -92,6 +101,7 @@
       "severity": "major",
       "snippet": "for (int i=0;i<3;i++) { submitOrder(req); ... }",
       "why": "假设：submitOrder 非幂等，重试 3 次在网络抖动下会重复下单/扣费。需确认服务端无幂等键、且该路径确实会触发重试。",
+      "root_cause_hint": {"primary_file": "app/.../PayManager.java", "symbol": "PayManager.submit", "failure_mode": "non-idempotent-retry"},
       "dataflow_path": [
         {"file": "app/.../PayManager.java", "line": 88, "message": "重试循环"},
         {"file": "app/.../OrderApi.java", "line": 40, "message": "submitOrder 无幂等键"}
@@ -104,11 +114,13 @@
 - `batch`：**照抄 `{BATCH_FILE}` 里的 `batch` 值**（整数）。
 - `sample`：照抄调度方给出的 `{SAMPLE}`（整数）。每个样本必须独立完成整批，不得把两个半扫描样本合成一次覆盖。
 - `perspectives_covered`：本批实际完成的视角 id。必须覆盖批次 JSON 的全部 `expected_perspectives`；门控跳过的视角不列。漏列会触发机械覆盖率失败。
+- `case_ids_checked`：本批实际逐项判断的 case id，必须覆盖 `expected_case_ids`；不得仅复制清单而不检查相应不变量。
 - `files_reviewed`：必须与批次 `files` 精确一致。`sha256/line_count` 照抄批次快照；`ranges` 记录本样本真实成功的 Read 范围，合并后必须覆盖全文。文件在扫描中变化会导致哈希核对失败并要求重跑。
 - `candidates`：候选数组（无疑点为 `[]`）。每条：
   - `rule_id`：用清单里的 `R-AI-*`；自由检测用 `R-AI-FREE`。
   - `severity`：你的初判（critical/major/minor/info），验证闸可调整。
   - `why`：**以"假设："开头**，写清推测缺陷 + 需要验证的条件——这是给验证闸的线索。
+  - `root_cause_hint`：尽可能给出候选根因三元组，供 verifier 批次聚类；它只是提示，验证器必须独立重建。
   - `dataflow_path`：可选；跨文件疑点尽量给出关键节点，帮助验证闸取证。
 
 ## 约束

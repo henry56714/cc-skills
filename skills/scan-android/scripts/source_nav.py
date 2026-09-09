@@ -137,6 +137,22 @@ class SourceNav:
                 return match.group(1)
         return ""
 
+    @staticmethod
+    def _inferred_receiver_type(lines: list[str], receiver: str) -> str:
+        if not receiver or receiver in {"this", "super"}:
+            return ""
+        text = "\n".join(lines)
+        name = re.escape(receiver.rsplit(".", 1)[-1])
+        for pattern in (
+            rf"\b([A-Z][A-Za-z0-9_$.]*)\s+{name}\s*(?:[=;,)]|$)",
+            rf"\b(?:val|var)\s+{name}\s*:\s*([A-Z][A-Za-z0-9_$.]*)",
+            rf"\b(?:val|var)\s+{name}\s*=\s*([A-Z][A-Za-z0-9_$.]*)\s*\(",
+        ):
+            match = re.search(pattern, text, re.MULTILINE)
+            if match:
+                return match.group(1).rsplit(".", 1)[-1]
+        return ""
+
     # ---- 导航接口（与 tree-sitter 后端同形） ----
     def get_definition(self, symbol: str) -> list[dict[str, Any]]:
         method = _method_hint(symbol)
@@ -178,12 +194,21 @@ class SourceNav:
                     )
                     receiver = receiver_match.group(1) if receiver_match and receiver_match.group(1) else ""
                     receiver_tail = receiver.rsplit(".", 1)[-1]
+                    inferred_type = self._inferred_receiver_type(lines, receiver)
                     if not class_hint:
                         confidence, matched_by = "nominal", "method-name"
                     elif receiver_tail == class_hint:
                         confidence, matched_by = "high", "explicit-receiver"
-                    elif owner == class_hint and receiver_tail in {"", "this", "super"}:
+                    elif inferred_type == class_hint:
+                        confidence, matched_by = "high", "inferred-receiver-type"
+                    elif re.search(
+                        rf"\b{re.escape(class_hint)}\b[^;\n]*\.\s*{re.escape(m)}\s*\(", ln,
+                    ):
+                        confidence, matched_by = "nominal", "type-reference-chain"
+                    elif owner == class_hint and receiver_tail in {"", "this"}:
                         confidence, matched_by = "high", "same-owner"
+                    elif receiver_tail == "super":
+                        confidence, matched_by = "ambiguous", "super-dispatch"
                     else:
                         confidence, matched_by = "ambiguous", "method-name-only"
                     out.append({
@@ -191,6 +216,7 @@ class SourceNav:
                         "snippet": ln.strip()[:200],
                         "enclosing_symbol": f"{owner}#{enclosing}" if owner and enclosing else enclosing,
                         "receiver": receiver,
+                        "receiver_type": inferred_type,
                         "confidence": confidence,
                         "matched_by": matched_by,
                     })
@@ -212,7 +238,6 @@ class SourceNav:
         return {"definitions": defs, "references": refs}
 
     def trace_origin(self, symbol: str, max_depth: int = 6, max_callers: int = 25) -> dict[str, Any]:
-        method = _method_hint(symbol) or symbol
         defs = self.get_definition(symbol)
         def expand(name: str, depth: int, path: frozenset[str]) -> list[dict[str, Any]]:
             # Cycle detection must be path-local.  A global visited set silently
@@ -225,7 +250,10 @@ class SourceNav:
             for c in callers[:max_callers]:
                 node: dict[str, Any] = dict(c)
                 enc = c.get("enclosing_symbol") or ""
-                if enc and depth > 1:
+                if c.get("confidence") == "ambiguous":
+                    node["not_expanded"] = True
+                    node["note"] = "歧义名称匹配仅作线索，不参与递归调用链"
+                elif enc and depth > 1:
                     node["callers"] = expand(enc, depth - 1, next_path)
                 elif not enc:
                     node["note"] = "无法定位调用所在方法（lambda/匿名类/字段初始化，请 Read 复核）"
@@ -246,7 +274,7 @@ class SourceNav:
             chains.append({
                 "symbol": d["symbol"],
                 "definition": {"file": d["file"], "line": d["line"]},
-                "callers": expand(method, max_depth, frozenset()),
+                "callers": expand(d["symbol"] if defs else symbol, max_depth, frozenset()),
             })
         return {"target": symbol, "chains": chains, "backend": "source-nav"}
 

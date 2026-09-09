@@ -87,6 +87,27 @@ TECH_MARKERS = {
     "room": re.compile(r"@Database\b|@Dao\b|RoomDatabase|@Transaction\b|Migration\b"),
     "compose": re.compile(r"@Composable\b|rememberSaveable|LaunchedEffect|collectAsStateWithLifecycle"),
     "deeplink": re.compile(r"autoVerify|intent-filter|ACTION_VIEW|getDataString|getQueryParameter"),
+    "permissions": re.compile(
+        r"<uses-permission|requestPermissions|checkSelfPermission|AppOpsManager|"
+        r"ACCESS_(?:FINE|COARSE|BACKGROUND)_LOCATION|NEARBY_WIFI_DEVICES|POST_NOTIFICATIONS"
+    ),
+    "hidden_api": re.compile(
+        r"getDeclaredField|getDeclaredMethod|setAccessible\s*\(\s*true|dalvik\.system|VMRuntime"
+    ),
+    "sdk_library": re.compile(
+        r"com\.android\.library|consumerProguardFiles|externalNativeBuild|System\.loadLibrary|"
+        r"api\s+project|implementation\s+project"
+    ),
+    "privacy_identity": re.compile(
+        r"ANDROID_ID|Build\.getSerial|TelephonyManager|getImei|getDeviceId|AdvertisingId|"
+        r"SSID|BSSID|LocationManager|ACCESS_FINE_LOCATION"
+    ),
+    "failure_contract": re.compile(
+        r"ThreadPoolExecutor|RejectedExecution|execute\s*\(|enqueue\s*\(|retry|backoff|shutdown"
+    ),
+    "state_snapshot": re.compile(
+        r"System\.currentTimeMillis|elapsedRealtime|synchronized|volatile|Atomic|snapshot|generation"
+    ),
 }
 
 
@@ -123,24 +144,53 @@ _MAX_READ_BYTES = 400_000  # 单文件读取上限，避免极大文件拖慢扫
 PERSPECTIVES: list[tuple[str, str | None]] = [
     ("auth_dataflow", None),
     ("platform_ipc", "platform_ipc"),
+    ("permissions_platform", "permissions_platform"),
     ("lifecycle_concurrency", None),
+    ("state_consistency", "state_consistency"),
+    ("failure_reliability", None),
     ("storage_privacy", "storage_privacy"),
+    ("privacy_consent", "privacy_consent"),
     ("network_crypto", "network_crypto"),
     ("performance", None),
     ("modern_runtime", "modern_runtime"),
     ("webview", "webview"),
     ("native_dependency", "native"),
+    ("sdk_integration", "sdk_integration"),
     ("free", None),
 ]
+
+# Every batch carries a deterministic case checklist.  Hunter receipts must
+# cover these ids, so "perspective covered" is no longer a single coarse flag.
+PERSPECTIVE_CASES: dict[str, tuple[str, ...]] = {
+    "auth_dataflow": ("R-AI-001", "R-AI-002", "R-AI-003", "R-AI-004", "R-AI-012", "R-AI-013"),
+    "platform_ipc": ("R-AI-026", "R-AI-027", "R-AI-028", "R-AI-029", "R-AI-030", "R-AI-044", "R-AI-047", "R-AI-049", "R-AI-060"),
+    "permissions_platform": ("R-AI-046", "R-AI-051", "R-AI-052"),
+    "lifecycle_concurrency": ("R-AI-005", "R-AI-006", "R-AI-007", "R-AI-008", "R-AI-014", "R-AI-015", "R-AI-016", "R-AI-017", "R-AI-039", "R-AI-040"),
+    "state_consistency": ("R-AI-054", "R-AI-056", "R-AI-057"),
+    "failure_reliability": ("R-AI-041", "R-AI-043", "R-AI-055"),
+    "storage_privacy": ("R-AI-031", "R-AI-032", "R-AI-035", "R-AI-036"),
+    "privacy_consent": ("R-AI-046", "R-AI-059"),
+    "network_crypto": ("R-AI-003", "R-AI-033", "R-AI-034", "R-AI-050", "R-AI-058"),
+    "performance": ("R-AI-009", "R-AI-010", "R-AI-011"),
+    "modern_runtime": ("R-AI-041", "R-AI-042", "R-AI-043", "R-AI-045"),
+    "webview": tuple(f"R-AI-{n:03d}" for n in range(18, 26)) + ("R-AI-048",),
+    "native_dependency": ("R-AI-037", "R-AI-038", "R-AI-058"),
+    "sdk_integration": ("R-AI-038", "R-AI-053", "R-AI-054"),
+    "free": (),
+}
 
 
 def _expected_perspectives(tech_present: list[str]) -> list[str]:
     tp = set(tech_present)
     capability_gates = {
         "platform_ipc": {"ipc_aidl", "content_provider", "exported", "deeplink"},
+        "permissions_platform": {"permissions", "hidden_api"},
         "storage_privacy": {"storage_privacy", "content_provider"},
+        "privacy_consent": {"privacy_identity", "permissions"},
         "network_crypto": {"network", "crypto", "long_conn"},
         "modern_runtime": {"compose", "room", "work_background"},
+        "state_consistency": {"state_snapshot", "concurrency"},
+        "sdk_integration": {"sdk_library", "native"},
     }
     return [
         name for name, gate in PERSPECTIVES
@@ -217,7 +267,7 @@ def _read_scope(scope_path: Path, repo_root: Path) -> list[str]:
 
 def build_batches(
     repo_root: Path, scope_path: Path, out_dir: Path, batch_size: int,
-    token_budget: int = 36_000,
+    token_budget: int = 24_000,
 ) -> dict:
     inputs = _read_scope(scope_path, repo_root)
 
@@ -266,6 +316,14 @@ def build_batches(
         stale = out_dir / stale_name
         if stale.exists():
             stale.unlink()
+    # Rebuilding hunter inputs invalidates every downstream adjudication receipt.
+    for pattern in ("verify_batch_*.json", "verified_batch_*.json"):
+        for stale in out_dir.glob(pattern):
+            stale.unlink()
+    for stale_name in ("verify_coverage.json", "merge_receipt.json"):
+        stale = out_dir / stale_name
+        if stale.exists():
+            stale.unlink()
     batch_files: list[str] = []
     batches_detail: list[dict] = []
     batched_set: set[str] = set()
@@ -278,6 +336,10 @@ def build_batches(
     for idx, chunk in enumerate(chunks):
         tech_union = sorted({t for d in chunk for t in d["tech"]})
         expected = _expected_perspectives(tech_union)
+        expected_cases = sorted({
+            case for perspective in expected
+            for case in PERSPECTIVE_CASES.get(perspective, ())
+        })
         batch_tokens = sum(int(d["estimated_tokens"]) for d in chunk)
         chunk_names = [d["file"] for d in chunk]
         internal_edges, boundary_edges = edges_for_batch(relation_graph, chunk_names)
@@ -290,6 +352,7 @@ def build_batches(
             "batching_strategy": "relation-clustered",
             "tech_present": tech_union,
             "expected_perspectives": expected,
+            "expected_case_ids": expected_cases,
             "files": chunk,
             "relation_edges": internal_edges,
             "boundary_relations": boundary_edges,
@@ -303,6 +366,7 @@ def build_batches(
             "estimated_tokens": batch_tokens,
             "tech_present": tech_union,
             "expected_perspectives": expected,
+            "expected_case_ids": expected_cases,
             "files": chunk_names,
             "relation_edges": len(internal_edges),
             "boundary_relations": len(boundary_edges),
@@ -358,12 +422,12 @@ def main() -> int:
         help="批次与覆盖率清单输出目录（默认 .scan/tmp）",
     )
     ap.add_argument(
-        "--batch-size", type=int, default=15,
-        help="每批文件数上限（默认 15；hunter 子代理逐文件通读，宜小于候选批次）",
+        "--batch-size", type=int, default=10,
+        help="每批文件数上限（默认 10；hunter 子代理逐文件通读）",
     )
     ap.add_argument(
-        "--token-budget", type=int, default=36_000,
-        help="每批源码估算 token 上限（默认 36000；单个超大文件允许独占一批并超限）",
+        "--token-budget", type=int, default=24_000,
+        help="每批源码估算 token 上限（默认 24000；单个超大文件允许独占一批并超限）",
     )
     args = ap.parse_args()
 

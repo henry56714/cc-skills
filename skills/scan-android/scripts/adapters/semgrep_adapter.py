@@ -1,6 +1,6 @@
 """Semgrep adapter —— P1 广度扫描引擎（AST 感知，比纯正则精确）。
 
-自动探测 semgrep 是否可用；未安装则通过 pip 自动安装。
+自动探测 semgrep 是否可用；只在调用方显式允许安装时才通过 pip 安装。
 规则来源（v3）：
 - **社区 registry 规则包**（广度主力，数千条）：按 check 类别挂 `p/...` 包；
 - **本地自写规则** `queries/semgrep/`：只补社区库未覆盖的 Android/项目特定缺口。
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -70,7 +71,8 @@ class SemgrepAdapter(EngineAdapter):
         semgrep = _find_semgrep()
         if semgrep:
             return True, ""
-        # 尝试自动安装
+        if not ctx.allow_installation:
+            return False, "semgrep 未安装；授权后使用 --install-missing 安装固定版本"
         try:
             from tools.installer import ensure_semgrep
             path, _ = ensure_semgrep()
@@ -188,6 +190,11 @@ class SemgrepAdapter(EngineAdapter):
                 continue
             if candidate is None:
                 continue
+            suppression = _contextual_suppression(candidate, ctx.repo)
+            if suppression:
+                result.suppressed += 1
+                result.suppression_summary[suppression] = result.suppression_summary.get(suppression, 0) + 1
+                continue
             rule_id = candidate.rule_id
             rule_hit_count[rule_id] = rule_hit_count.get(rule_id, 0) + 1
             if ctx.max_per_rule > 0 and rule_hit_count[rule_id] > ctx.max_per_rule:
@@ -202,9 +209,12 @@ class SemgrepAdapter(EngineAdapter):
             result.candidates.append(candidate)
 
         # 统计规则数
-        check_ids = {item.get("check_id", "") for item in data.get("results", [])}
+        check_ids = {item.get("check_id", "") for item in data.get("results", []) if item.get("check_id")}
         result.rules_run = len(check_ids)
-        result.rules_total = len(check_ids)
+        # Semgrep JSON only reports triggered checks. Count configured local
+        # rules separately so a clean run does not claim that zero rules ran.
+        local_rule_total = sum(_count_yaml_rule_ids(path) for path in rule_files)
+        result.rules_total = max(local_rule_total, len(check_ids))
 
         # 记录 semgrep 的错误/警告
         for err in data.get("errors", []):
@@ -215,6 +225,56 @@ class SemgrepAdapter(EngineAdapter):
             result.notes.append({"engine": self.name, "note": f"{parse_failures} 条 Semgrep 结果解析失败"})
 
         return result
+
+
+def _count_yaml_rule_ids(path: Path) -> int:
+    """Count top-level Semgrep rule ids without adding a YAML dependency."""
+    try:
+        return sum(
+            1 for line in path.read_text(encoding="utf-8").splitlines()
+            if line.startswith("- id:")
+        )
+    except OSError:
+        return 0
+
+
+def _contextual_suppression(candidate: Candidate, repo: Path) -> str:
+    """Drop only locally provable false positives before expensive verification."""
+    snippet = candidate.snippet or ""
+    compact = re.sub(r"\s+", "", snippet)
+    if candidate.rule_id == "R-SG-060":
+        try:
+            manifest = (repo / candidate.file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        if "android.permission.ACCESS_COARSE_LOCATION" in manifest:
+            return "fine-coarse-permission-pair-present"
+    if candidate.rule_id in {"R-SG-017", "R-SG-023"} and re.search(
+        r"registerReceiver\(null,", compact,
+    ):
+        return "sticky-broadcast-null-receiver"
+    if candidate.rule_id != "R-SG-023":
+        return ""
+    match = re.search(
+        r"\b(registerListener|registerContentObserver|addCallback|addListener)\s*\(\s*([A-Za-z_]\w*)",
+        snippet,
+    )
+    if not match:
+        return ""
+    inverse = {
+        "registerListener": "unregisterListener",
+        "registerContentObserver": "unregisterContentObserver",
+        "addCallback": "removeCallback",
+        "addListener": "removeListener",
+    }[match.group(1)]
+    try:
+        text = (repo / candidate.file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    arg = re.escape(match.group(2))
+    if re.search(rf"\bfinally\s*\{{[\s\S]*?\b{inverse}\s*\(\s*{arg}\b", text):
+        return "paired-release-in-finally"
+    return ""
 
 
 def _find_semgrep() -> str | None:

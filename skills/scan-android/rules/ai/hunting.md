@@ -103,6 +103,23 @@
 | `R-AI-037` | **JNI/动态代码边界**：native 方法接收长度/路径/ByteBuffer 未验证；JNI 引用或线程 attach 泄漏；动态加载 dex/so 的来源、签名、路径权限可被替换。 |
 | `R-AI-038` | **依赖与构建逻辑风险**：动态版本、非可信仓库、未固定插件/依赖校验、release 错用 debug implementation、manifest placeholder/资源覆盖使安全配置漂移。仅凭版本号猜 CVE 不确认，需可核实的锁定版本/调用面。 |
 
+## Android SDK、权限演进与可靠性契约
+
+| id | 触发条件与必须验证的不变量 |
+|---|---|
+| `R-AI-051` | **权限版本矩阵不完整**：出现定位、Wi-Fi、蓝牙、通知、媒体或后台能力时，联合检查 `minSdk/targetSdk`、Manifest 声明和运行时请求。重点验证 Android 12 定位需 FINE+COARSE、Android 13 `NEARBY_WIFI_DEVICES`/通知、后台定位分步授权、近似/仅本次/撤销后的降级路径；只看到单个 permission 字符串不能直接确认。 |
+| `R-AI-052` | **hidden/non-SDK API enforcement**：反射访问 framework 私有字段/方法、`setAccessible(true)` 或 hidden API 绕过时，按 targetSdk/API 检查是否会被拒绝、抛异常或静默失效；继续初始化或标记成功必须检查失败传播。公开 API 或仅反射本应用类型是反例。 |
+| `R-AI-053` | **SDK/AAR 集成边界**：library module 的 `consumerProguardFiles`、R8 keep、JNI 方法/类名、ABI 打包、依赖暴露、manifest merge 与 release/debug 变体是否一致；`System.loadLibrary` 失败是否使公共 API 崩溃。必须同时读取 build、consumer rules、Manifest 和 native/public facade 中适用的文件。 |
+| `R-AI-054` | **SDK 初始化、销毁与多进程状态机**：`init` 部分失败后是否仍标记 initialized；重复 init/shutdown、并发调用、进程级单例、headless/Application context 拉起 UI、hook/listener/thread 是否完整撤销；检查 public API 在 shutdown race 中是否 check-then-use。 |
+| `R-AI-055` | **异步失败契约与背压**：fire-and-forget API 是否丢掉 queue rejection、序列化/网络失败；队列是否实际无界；失败数据是否持久化、有限重试并有退避；shutdown 时任务是 drain、cancel 还是静默丢失。仅看到 `execute()` 不足以确认，必须追 public caller 与 executor 配置。 |
+| `R-AI-056` | **持续时间使用墙上时钟**：超时、watchdog、退避、租约或耗时统计用 `System.currentTimeMillis()` 相减会被用户/NTP 调时影响；应验证是否需要单调时间并改用 `elapsedRealtime()`/`nanoTime()`。用于展示绝对时间是反例。 |
+| `R-AI-057` | **跨字段快照与 generation 一致性**：多个 synchronized getter 逐个读取并不构成原子快照；采集、序列化、网络切换或 worker replacement 之间是否混入不同 generation 的状态；检查锁边界、不可变 snapshot、取消 fencing 和旧 worker 是否仍可提交结果。 |
+| `R-AI-058` | **客户端共享秘密、AEAD 与重放**：APK/so 中可恢复的固定密钥不能充当服务端秘密；CBC/CTR 加密若无 MAC/AEAD 可被篡改；请求若无 nonce/timestamp/服务端去重可重放。必须区分仅混淆常量与真正安全边界，并追到协议使用点。 |
+| `R-AI-059` | **同意、最小化、标识符与保留期**：采集 ANDROID_ID、IMEI、SSID/BSSID、定位、安装包列表等数据时，确认目的、用户同意/撤销、权限降级、字段最小化、落盘/上传和删除/保留路径；有权限不等于有隐私授权。无法取得产品政策时进入 needs-review。 |
+| `R-AI-060` | **跨进程载荷与序列化容量**：Intent/Bundle/Parcelable/Binder 传大集合、Bitmap、深层对象或不可信序列化数据时，检查 classloader、类型、长度和约 1MB Binder 事务上限；失败后状态不能部分提交。纯进程内 Bundle 使用是反例。 |
+
+每条 case 的判断至少包含：是否存在触发信号、跨文件终端条件、已发现的缓解/反例以及对应源码位置。无触发信号记为已检查，不制造候选；缺少关键变体、协议或产品契约时进入 needs-review。
+
 ## 通用 FP 提示（压假阳性，对所有条目适用）
 
 - **条件触发型缺陷必须回溯到源头（不是一跳）**：缺陷只有在上游源头成立时才发生的（静态单例持有 Context、主线程阻塞、越权数据流…），**仅凭 sink 处的模式不算成立**。关键值常**层层透传**，必须用 `nav_tools.py --action trace-origin` 沿**整条调用链**把它追到终端源头——例如静态 Context 泄漏要把 `init()` 的 Context 实参一路追到 `Application`（不泄漏）还是 `Activity/Service/View`（真泄漏）。验证阶段对这类缺陷以 nav_tools（默认 tree-sitter AST 精确调用导航，source-nav 兜底）逐跳回溯取证为准（数据流类辅以 Semgrep taint + 人工追源；见 `agents/verifier.md`「条件触发型规则」「调用链取证工具」两节）。

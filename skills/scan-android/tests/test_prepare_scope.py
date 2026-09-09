@@ -85,6 +85,36 @@ class PrepareScopeTests(unittest.TestCase):
             self.assertEqual(manifest["scope"]["scope_files"], 10)
             self.assertEqual(len(manifest["skill_fingerprint"]), 64)
 
+    def test_new_scope_run_removes_only_known_stale_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._repo(repo)
+            scan_tmp = repo / ".scan/tmp"
+            reports = repo / ".scan/reports"
+            reports.mkdir(parents=True)
+            scan_tmp.mkdir(parents=True)
+            stale = [
+                scan_tmp / "engine-results.json",
+                scan_tmp / "hunt_result_0_0.json",
+                scan_tmp / "verified_batch_0.json",
+                scan_tmp / "merge_receipt.json",
+                repo / ".scan/findings.json",
+                reports / "findings.md",
+            ]
+            for path in stale:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("stale")
+            keep = scan_tmp / "user-note.txt"
+            keep.write_text("keep")
+
+            ps.prepare_scope(
+                repo, diff_ref=None, full=True, module=None, globs=[], impact_depth=2,
+                impact=True, out_dir=scan_tmp,
+            )
+
+            self.assertTrue(all(not path.exists() for path in stale))
+            self.assertEqual(keep.read_text(), "keep")
+
     def test_impact_slice_adds_callee_and_recursive_callers(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
