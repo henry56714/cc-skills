@@ -1,7 +1,9 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
@@ -10,7 +12,7 @@ from adapters.semgrep_adapter import SemgrepAdapter, _contextual_suppression, _e
 from adapters.base import ScanContext  # noqa: E402
 from adapters.lint_adapter import LintAdapter, _parse_lint_xml  # noqa: E402
 from adapters.pmd_adapter import _parse_violation, _should_emit  # noqa: E402
-from run_engines import _overall_status  # noqa: E402
+from run_engines import _overall_status, _select_engines, _unselected_engine_gaps  # noqa: E402
 from lib_scan import Candidate  # noqa: E402
 
 
@@ -38,6 +40,35 @@ class SemgrepDataflowTests(unittest.TestCase):
             self.assertEqual([p["file"] for p in path], ["A.kt", "B.kt", "C.kt"])
             self.assertEqual([p["line"] for p in path], [2, 5, 8])
 
+    def test_repository_registry_config_cannot_enable_or_inject_network_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".scan").mkdir()
+            (repo / ".scan/config.json").write_text(json.dumps({
+                "semgrep_use_registry": True,
+                "semgrep_registry_packs": ["p/attacker-controlled"],
+            }))
+            rules = repo / "rules"
+            rules.mkdir()
+            (rules / "local.yaml").write_text("rules:\n  - id: local-rule\n")
+            ctx = ScanContext(
+                repo=repo, scope_files=[], rules_dir=rules,
+                allow_network_rules=False, trust_project_config=True,
+            )
+            completed = SimpleNamespace(
+                returncode=0, stdout='{"results": [], "errors": []}', stderr="",
+            )
+            with mock.patch("adapters.semgrep_adapter._find_semgrep", return_value="semgrep"):
+                with mock.patch("adapters.semgrep_adapter._QUERIES_DIR", rules):
+                    with mock.patch(
+                        "adapters.semgrep_adapter.subprocess.run", return_value=completed,
+                    ) as run:
+                        result = SemgrepAdapter().run(ctx)
+            command = run.call_args.args[0]
+            self.assertNotIn("p/attacker-controlled", command)
+            self.assertFalse(any(arg.startswith("p/") for arg in command))
+            self.assertTrue(any("未获调用方" in note.get("note", "") for note in result.notes))
+
     def test_sticky_broadcast_and_finally_release_are_suppressed(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -61,6 +92,24 @@ class SemgrepDataflowTests(unittest.TestCase):
 
 
 class LintParserTests(unittest.TestCase):
+    def test_discovered_report_symlink_outside_repo_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            outside = root / "lint-results-outside.xml"
+            outside.write_text("<issues/>")
+            try:
+                (repo / "lint-results.xml").symlink_to(outside)
+            except OSError:
+                self.skipTest("file symlinks are unavailable")
+            ctx = ScanContext(
+                repo=repo, scope_files=[], rules_dir=repo,
+                detect_info={"config": {}}, allow_build_execution=False,
+            )
+            available, _reason = LintAdapter().is_available(ctx)
+            self.assertFalse(available)
+
     def test_unmapped_warning_is_not_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -121,6 +170,47 @@ class LintParserTests(unittest.TestCase):
             self.assertEqual(len(result.candidates), 1)
             self.assertEqual(result.candidates[0].native_rule_id, "SoonBlockedPrivateApi")
 
+    def test_every_shipping_lint_task_is_run_and_accounted_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "app/src/main/Foo.kt"
+            source.parent.mkdir(parents=True)
+            source.write_text("fun x() = Unit\n")
+            gradlew = repo / "gradlew"
+            gradlew.write_text("#!/bin/sh\nexit 0\n")
+            ctx = ScanContext(
+                repo=repo,
+                scope_files=["app/src/main/Foo.kt"],
+                rules_dir=repo,
+                detect_info={
+                    "suggested_lint_tasks": ["lintPaidRelease", "lintFreeRelease"],
+                },
+                allow_build_execution=True,
+            )
+            calls = []
+
+            def run_lint(command, **_kwargs):
+                calls.append(command[2])
+                index = len(calls)
+                report = repo / f"app/build/reports/lint-results-{index}.xml"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(
+                    f'<issues><issue id="VariantRule{index}" severity="Warning" message="m">'
+                    f'<location file="{source}" line="1"/></issue></issues>'
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch("adapters.lint_adapter.subprocess.run", side_effect=run_lint):
+                result = LintAdapter().run(ctx)
+            self.assertEqual(calls, ["lintPaidRelease", "lintFreeRelease"])
+            self.assertEqual(result.status, "complete")
+            self.assertEqual(len(result.candidates), 2)
+            coverage_note = result.notes[-1]
+            self.assertEqual(
+                coverage_note["tasks_with_fresh_reports"],
+                ["lintPaidRelease", "lintFreeRelease"],
+            )
+
 
 class PMDParserTests(unittest.TestCase):
     def test_generic_priority_one_is_not_critical(self):
@@ -147,15 +237,26 @@ class PMDParserTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.severity, "minor")
 
-    def test_default_profile_only_emits_high_signal_rules(self):
+    def test_default_profile_emits_correctness_and_concurrency_rules(self):
         self.assertTrue(_should_emit("CloseResource"))
         self.assertTrue(_should_emit("HardCodedCryptoKey"))
         self.assertFalse(_should_emit("AvoidSynchronizedAtMethodLevel"))
         self.assertFalse(_should_emit("DoNotUseThreads"))
+        self.assertTrue(_should_emit("BrokenNullCheck", ruleset="Error Prone"))
+        self.assertTrue(_should_emit("DoubleCheckedLocking", ruleset="Multithreading"))
         self.assertTrue(_should_emit("AvoidSynchronizedAtMethodLevel", include_advisories=True))
 
 
 class EngineStatusTests(unittest.TestCase):
+    def test_duplicate_explicit_engine_name_is_run_once(self):
+        selected = _select_engines("semgrep,semgrep,pmd,semgrep")
+        self.assertEqual([adapter.name for adapter in selected], ["semgrep", "pmd"])
+
+    def test_explicit_engine_subset_records_every_omitted_engine_as_skipped(self):
+        gaps = dict(_unselected_engine_gaps({"semgrep"}, set()))
+        self.assertEqual(set(gaps), {"detekt", "pmd", "lint"})
+        self.assertTrue(all("--engines" in reason for reason in gaps.values()))
+
     def test_skipped_is_not_reported_as_complete(self):
         self.assertEqual(_overall_status([
             {"status": "complete"}, {"status": "skipped"},
@@ -165,6 +266,9 @@ class EngineStatusTests(unittest.TestCase):
         self.assertEqual(_overall_status([
             {"status": "complete"}, {"status": "not_applicable"},
         ]), "complete")
+
+    def test_unknown_adapter_status_fails_closed(self):
+        self.assertEqual(_overall_status([{"status": "invented"}]), "incomplete")
 
 
 if __name__ == "__main__":

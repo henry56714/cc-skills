@@ -1,30 +1,18 @@
 {
-  "_usage": "复制到目标源码仓库 .scan/config.json；删除 _ 开头说明字段后按需修改。仅支持 source 扫描。",
+  "_usage": "复制到目标源码仓库 .scan/config.json；删除 _ 开头说明字段后按需修改。默认不采用仓库配置；调用方审阅后须对 preflight/scope/engine 都传 --trust-project-config。仅支持 source 扫描。",
+  "_capability_note": "本文件永远不能授权执行 Gradle、联网规则或安装工具；这些能力只能由调用方分别传 --allow-build-execution、--allow-network-rules、--install-missing。",
 
   "_excluded_engines_note": "可选：semgrep / detekt / pmd / lint / ai。排除会降低覆盖率，并在报告中显示 skipped。",
   "excluded_engines": [],
 
-  "_build_execution_note": "Lint 会执行目标仓库 Gradle 代码。默认 false；仅在信任仓库并明确授权后开启。",
-  "allow_gradle_execution": false,
+  "_semgrep_pack_note": "只在调用方同时传 --trust-project-config 与 --allow-network-rules 时选择 registry pack；本字段本身不能开启联网，且只接受 p/... ID。留空使用扫描器固定 pack。",
+  "semgrep_registry_packs": [],
 
-  "_semgrep_registry_note": "默认只跑版本库内固定规则。true 会联网加载 registry 规则，覆盖更广但规则内容会随上游变化。",
-  "semgrep_use_registry": false,
-  "semgrep_registry_packs": [
-    "p/security-audit",
-    "p/owasp-top-ten",
-    "p/secrets",
-    "p/java",
-    "p/kotlin"
-  ],
-
-  "_pmd_note": "默认只把高信号 PMD 缺陷送入 verifier；style/advisory 仍在 engine_stats.suppressed 中计数。true 会显著增加候选与成本。",
+  "_pmd_note": "默认只把 PMD Error Prone、Multithreading、Security 等正确性缺陷送入 verifier；style/advisory 仍在 engine_stats.suppressed 中计数。true 会显著增加候选与成本。",
   "pmd_include_advisories": false,
 
   "_documentation_note": "默认不扫描 docs 中的示例代码。true 仅将 docs 加入工具 scope，AI hunter 仍跳过。",
   "include_documentation": false,
-
-  "_nav_backend_note": "宿主有 LSP 时由 hunter/verifier 优先使用；本项只控制降级脚本。auto=tree-sitter 后回退 source-nav。两者均需读源码消歧。可选 auto / treesitter / source。",
-  "nav_backend": "auto",
 
   "_scope_note": "diff 影响切片默认深度。CLI --impact-depth 可覆盖。",
   "impact_depth": 2,
@@ -40,14 +28,11 @@
   "_extra_excludes_note": "额外排除 glob，叠加默认 build/generated/test 等目录。",
   "extra_excludes": [],
 
-  "_lint_tasks_note": "授权 Lint 后按顺序尝试，采用第一个产生有效报告的任务。",
+  "_lint_tasks_note": "授权 Lint 后逐项运行并记账；留空自动探测 release/shipping 变体。这里只选择任务，不能授权执行。",
   "lint_tasks": [],
   "_lint_report_paths_note": "未授权执行 Gradle 时可只读解析这些仓库内 Lint XML；留空会自动发现 lint-results*.xml，结果标 partial 以提示变体/新鲜度未知。",
   "lint_report_paths": [],
 
   "_language_note": "zh / en；留空按 locale 推断。",
-  "language": "",
-
-  "_project_context_note": "给 hunter/verifier 的真实业务约束，例如受信调用方或数据敏感度；不得写未经验证的假设。",
-  "project_context": ""
+  "language": ""
 }

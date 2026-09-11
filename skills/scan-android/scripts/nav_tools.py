@@ -5,7 +5,8 @@ LLM source-only 导航工具 —— 宿主 LSP 缺失或不完整时的跨文件
 若 coding agent 宿主提供 LSP，应先使用 definition/references/implementation/call hierarchy；
 本脚本作为确定性降级和 trace-origin 补充，不尝试从 Python 进程控制宿主工具。
 
-后端按 `nav_backend`（config 或 env `SCAN_ANDROID_NAV_BACKEND`，取值 auto|treesitter|source）选择：
+后端只按调用方 env `SCAN_ANDROID_NAV_BACKEND`（取值 auto|treesitter|source）选择；
+目标仓库配置不能令扫描器主动降级：
   - treesitter（auto 首选）—— tree-sitter 语法级识别 def/ref，不误命中注释/字符串；
     `Class#method` 会按定义所属类过滤，并给调用边标记 high/ambiguous 置信度；
     重载、变量接收者类型与动态分派仍须由 verifier 逐跳 Read 复核。
@@ -43,18 +44,12 @@ def _log(msg: str) -> None:
 
 
 def _nav_backend_pref(repo: Path) -> str:
-    """读取导航后端偏好：env `SCAN_ANDROID_NAV_BACKEND` 优先，其次 `.scan/config.json` 的
-    `nav_backend`。取值 auto|treesitter|source，默认 auto。
+    """读取调用方环境中的导航后端偏好。
+
+    目标仓库 `.scan/config.json` 是不可信数据，不能令扫描器主动降级到 source-nav。
+    env `SCAN_ANDROID_NAV_BACKEND` 取值 auto|treesitter|source，默认 auto。
     `auto` = treesitter（语法级索引）→ source（纯标准库兜底）。"""
     val = (os.environ.get("SCAN_ANDROID_NAV_BACKEND") or "").strip().lower()
-    if not val:
-        try:
-            cfg_path = repo / ".scan" / "config.json"
-            if cfg_path.exists():
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                val = str(cfg.get("nav_backend", "")).strip().lower()
-        except Exception:
-            val = ""
     return val if val in ("auto", "treesitter", "source") else "auto"
 
 
@@ -75,7 +70,7 @@ class NavTools:
     def start(self) -> bool:
         """就绪导航后端（幂等）。后端选择（默认 auto）：
 
-        - `nav_backend=treesitter`（auto 首选）：tree-sitter 解析 Java/Kotlin，
+        - `treesitter`（auto 首选）：tree-sitter 解析 Java/Kotlin，
           语法级识别 def/ref（不误命中注释/字符串，enclosing scope 较可靠）。同名重载、
           接收者类型与动态分派不消歧——必须由 verifier 逐跳 Read 复核。
           需 tree-sitter（本进程可导入或 repomap venv 就绪）；不可用则**告警并回退 source-nav**。

@@ -6,7 +6,12 @@ import sys
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from relation_graph import build_relation_graph, expand_from_files  # noqa: E402
-from repo_map import RepoMap, _bounded_map  # noqa: E402
+from repo_map import (  # noqa: E402
+    DEFAULT_MAP_TOKEN_BUDGET,
+    RepoMap,
+    _bounded_map,
+    _mark_unsupported_navigation_files,
+)
 
 
 class RelationGraphTests(unittest.TestCase):
@@ -107,6 +112,28 @@ class RelationGraphTests(unittest.TestCase):
 
 
 class RepoMapSymbolTests(unittest.TestCase):
+    def test_default_map_budget_matches_default_hunter_budget(self):
+        self.assertEqual(DEFAULT_MAP_TOKEN_BUDGET, 24_000)
+        skill = (SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "--budget <run_manifest.effective_hunt_policy.token_budget>",
+            skill,
+        )
+
+    def test_native_and_web_sources_are_explicitly_unindexed(self):
+        repo_map = RepoMap.__new__(RepoMap)
+        repo_map._files_not_indexed = {}
+        _mark_unsupported_navigation_files(
+            repo_map, ["bridge.cpp", "page.js", "AndroidManifest.xml", "Main.kt"],
+        )
+        self.assertEqual(
+            repo_map._files_not_indexed,
+            {
+                "bridge.cpp": "unsupported-navigation-language",
+                "page.js": "unsupported-navigation-language",
+            },
+        )
+
     def _map(self) -> RepoMap:
         repo_map = RepoMap.__new__(RepoMap)
         repo_map._defs = [

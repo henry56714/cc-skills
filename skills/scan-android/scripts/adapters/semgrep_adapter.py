@@ -5,7 +5,8 @@
 - **社区 registry 规则包**（广度主力，数千条）：按 check 类别挂 `p/...` 包；
 - **本地自写规则** `queries/semgrep/`：只补社区库未覆盖的 Android/项目特定缺口。
 两者结果统一归一化为 Candidate 契约。为保证可复现并避免扫描时隐式联网，registry
-默认关闭；需要时在 `.scan/config.json` 显式设置 `semgrep_use_registry:true`。
+默认关闭；仓库配置只能声明所需规则包，调用方还必须显式传
+`--allow-network-rules`，避免被审仓库自行授予扫描器联网能力。
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lib_scan import Candidate
+from lib_scan import Candidate, resolve_cli_path
 
 from .base import AdapterResult, EngineAdapter, ScanContext
 
@@ -45,11 +46,14 @@ def _load_semgrep_config(repo: Path) -> tuple[bool, list[str] | None]:
     """读取 .scan/config.json 的 semgrep 配置。
 
     返回 (use_registry, packs_override)：
-    - use_registry: 默认 False；显式授权联网拉取规则包时设 true。
+    - use_registry: 仓库是否请求 registry；它不是联网授权。
     - packs_override: 显式覆盖默认 registry 包清单；None = 用默认全集。
     """
     cfg: dict = {}
-    p = repo / ".scan" / "config.json"
+    try:
+        p = resolve_cli_path(repo, ".scan/config.json", label="scan config")
+    except ValueError:
+        return False, None
     if p.exists():
         try:
             with open(p, "r", encoding="utf-8") as f:
@@ -99,8 +103,36 @@ class SemgrepAdapter(EngineAdapter):
         rule_files = sorted(_QUERIES_DIR.glob("*.yaml"))
 
         # 社区 registry 规则包需显式开启，避免隐式联网与规则漂移。
-        use_registry, packs_override = _load_semgrep_config(ctx.repo)
-        registry_packs = (packs_override if packs_override is not None else _DEFAULT_REGISTRY_PACKS) if use_registry else []
+        registry_requested, packs_override = _load_semgrep_config(ctx.repo)
+        # The caller flag enables a fixed, reviewed registry set.  A target
+        # repository may override that set only when its policy was separately
+        # trusted; pack values are still restricted to Semgrep registry ids.
+        use_registry = ctx.allow_network_rules
+        if use_registry and ctx.trust_project_config and packs_override is not None:
+            invalid = [pack for pack in packs_override if not re.fullmatch(r"p/[A-Za-z0-9_.@/-]+", pack)]
+            if invalid:
+                result.status = "partial"
+                result.notes.append({
+                    "engine": self.name,
+                    "note": "忽略非 registry-id 的 semgrep_registry_packs",
+                    "invalid_packs": invalid,
+                })
+            registry_packs = [
+                pack for pack in packs_override
+                if re.fullmatch(r"p/[A-Za-z0-9_.@/-]+", pack)
+            ]
+        else:
+            registry_packs = list(_DEFAULT_REGISTRY_PACKS) if use_registry else []
+        if registry_requested and not ctx.allow_network_rules:
+            result.notes.append({
+                "engine": self.name,
+                "note": "仓库请求 Semgrep registry，但未获调用方 --allow-network-rules 授权；未联网",
+            })
+        elif registry_requested and not ctx.trust_project_config:
+            result.notes.append({
+                "engine": self.name,
+                "note": "未信任仓库配置中的 registry pack 覆盖；使用扫描器固定规则包",
+            })
 
         if not rule_files and not registry_packs:
             result.notes.append({"engine": self.name, "note": "没有匹配的 semgrep 规则（本地 + registry 均为空）"})

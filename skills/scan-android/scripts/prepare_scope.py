@@ -25,7 +25,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from detect_project import detect_project  # noqa: E402
-from lib_scan import atomic_write_json, now_iso  # noqa: E402
+from lib_scan import (  # noqa: E402
+    atomic_write_json, current_skill_fingerprint, effective_excluded_engines,
+    effective_hunt_policy, now_iso, resolve_cli_path, resolve_repo_path,
+)
 from relation_graph import build_relation_graph, expand_from_files  # noqa: E402
 from source_nav import SourceNav  # noqa: E402
 
@@ -42,9 +45,16 @@ HUNT_SKIP_DIRS = {
 SKIP_FILES = {"local.properties", "CMakeCache.txt", "compile_commands.json"}
 HUNT_EXTENSIONS = {
     ".java", ".kt", ".kts", ".xml", ".aidl",
-    ".js", ".ts", ".dart", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".js", ".ts", ".dart", ".c", ".cc", ".cpp", ".h", ".hpp", ".rs",
     ".gradle", ".properties", ".toml", ".pro", ".cfg", ".json",
+    ".html", ".htm", ".sql", ".proto", ".mk", ".yaml", ".yml",
 }
+SOURCE_FILENAMES = {"CMakeLists.txt", "Android.mk", "Application.mk", "Android.bp"}
+CONTEXT_EXTENSIONS = {
+    ".java", ".kt", ".kts", ".xml", ".json", ".yaml", ".yml",
+    ".md", ".txt", ".feature", ".proto",
+}
+CONTEXT_DIRS = {"test", "tests", "androidTest", "integrationTest", "docs", "doc"}
 GLOBAL_BUILD_FILES = {
     "settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts",
     "gradle.properties", "gradle/libs.versions.toml", "gradle/verification-metadata.xml",
@@ -64,6 +74,9 @@ CALL_STOP = {
     "if", "for", "while", "when", "switch", "catch", "return", "throw", "new",
     "super", "this", "synchronized", "require", "check", "assert",
 }
+TYPE_DECL_RE = re.compile(
+    r"\b(?:class|interface|object|record|enum\s+class|enum)\s+([A-Za-z_$][\w$]*)"
+)
 
 
 def _matches_any(rel: str, patterns: list[str]) -> bool:
@@ -95,7 +108,7 @@ def _iter_source_files(repo: Path, roots: list[str], extensions: set[str], exclu
                 dns[:] = [d for d in dns if d not in SKIP_DIRS]
                 candidates.extend(Path(dp) / fn for fn in fns)
         for p in candidates:
-            if p.suffix.lower() not in extensions:
+            if p.suffix.lower() not in extensions and p.name not in SOURCE_FILENAMES:
                 continue
             try:
                 rel = p.resolve().relative_to(repo).as_posix()
@@ -107,6 +120,36 @@ def _iter_source_files(repo: Path, roots: list[str], extensions: set[str], exclu
             yield rel
 
 
+def _iter_context_files(repo: Path) -> list[str]:
+    """Return tests/spec/docs as read-only invariant clues, never finding scope."""
+    candidates = _iter_source_files(repo, [], CONTEXT_EXTENSIONS, [])
+    result: list[str] = []
+    for rel in candidates:
+        path = Path(rel)
+        parts = set(path.parts)
+        if parts & CONTEXT_DIRS or path.name.lower().startswith(("readme", "architecture", "security")):
+            result.append(rel)
+    return sorted(set(result))
+
+
+def _parse_git_name_status(text: str) -> list[tuple[str, bool]]:
+    """Return (path, known_deleted) entries for Git name-status output."""
+    names: list[tuple[str, bool]] = []
+    for raw in text.splitlines():
+        fields = raw.split("\t")
+        if len(fields) < 2:
+            continue
+        status = fields[0]
+        if status.startswith(("R", "C")) and len(fields) >= 3:
+            # Rename removes the old identity; copy keeps it. Keep both paths
+            # without inventing a deletion for Git's C status.
+            names.append((fields[1], status.startswith("R")))
+            names.append((fields[2], False))
+        else:
+            names.append((fields[1], status.startswith("D")))
+    return names
+
+
 def _git_changed(repo: Path, ref: str) -> tuple[list[str], list[str]]:
     check = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", ref],
@@ -115,24 +158,30 @@ def _git_changed(repo: Path, ref: str) -> tuple[list[str], list[str]]:
     if check.returncode != 0:
         raise ValueError(f"git ref 不存在或浅克隆中不可用: {ref}")
     diff = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--name-only", "--diff-filter=ACMRTUXB", ref, "--"],
+        ["git", "-C", str(repo), "diff", "--name-status", "--find-renames", ref, "--"],
         capture_output=True, text=True, check=True,
     )
     untracked = subprocess.run(
         ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"],
         capture_output=True, text=True, check=True,
     )
-    names = diff.stdout.splitlines() + untracked.stdout.splitlines()
+    names = _parse_git_name_status(diff.stdout)
+    names.extend((raw, False) for raw in untracked.stdout.splitlines())
     seen: set[str] = set()
     existing: list[str] = []
     missing: list[str] = []
-    for raw in names:
+    for raw, known_deleted in names:
         rel = raw.strip().replace("\\", "/")
         if not rel or rel in seen:
             continue
         seen.add(rel)
-        if (repo / rel).is_file():
-            existing.append(rel)
+        source_path = repo / rel
+        if not known_deleted and source_path.is_file():
+            try:
+                resolved = resolve_repo_path(repo, source_path, label="git changed path")
+            except ValueError as exc:
+                raise ValueError(f"git 变更路径不安全: {rel}: {exc}") from exc
+            existing.append(resolved.relative_to(repo.resolve()).as_posix())
         else:
             missing.append(rel)
     return existing, missing
@@ -143,31 +192,66 @@ def _module_for(rel: str, modules: list[str]) -> str | None:
     return max(matches, key=len) if matches else None
 
 
-def _extract_symbols(path: Path) -> tuple[set[str], set[str]]:
-    try:
-        if path.stat().st_size > 800_000:
-            return set(), set()
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return set(), set()
+def _extract_symbols_text(text: str) -> tuple[set[str], set[str]]:
     declarations = {m.group(1) for m in DECL_RE.finditer(text)} - CALL_STOP
     calls = {m.group(1) for m in CALL_RE.finditer(text)} - CALL_STOP
     return declarations, calls
 
 
-def _impact_expand(repo: Path, direct: set[str], all_files: set[str], modules: list[str], depth: int) -> set[str]:
+def _extract_types_text(text: str) -> set[str]:
+    return {match.group(1) for match in TYPE_DECL_RE.finditer(text)}
+
+
+def _extract_symbols(path: Path) -> tuple[set[str], set[str]]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set(), set()
+    return _extract_symbols_text(text)
+
+
+def _git_file_text(repo: Path, ref: str, rel: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{ref}:{rel}"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _impact_expand(
+    repo: Path,
+    direct: set[str],
+    all_files: set[str],
+    modules: list[str],
+    depth: int,
+    *,
+    deleted: set[str] | None = None,
+    diff_ref: str = "HEAD~1",
+    diagnostics: list[dict] | None = None,
+) -> set[str]:
     repo = repo.resolve()
     impacted = set(direct)
+    deleted = deleted or set()
+    changed_paths = direct | deleted
 
     # 全局构建配置影响所有变体；模块 Manifest/构建/安全 XML 影响模块内所有代码和资源。
-    if any(rel in GLOBAL_BUILD_FILES for rel in direct):
+    # 任意删除也保守扩到所在模块：删除的资源、consumer rules、source-set
+    # overlay 或声明可能无法再从当前工作树的关系图恢复。
+    if any(rel in GLOBAL_BUILD_FILES for rel in changed_paths):
         impacted.update(all_files)
     else:
         affected_modules = {
-            mod for rel in direct
-            if Path(rel).name in MODULE_WIDE_NAMES
+            mod for rel in changed_paths
+            if Path(rel).name in MODULE_WIDE_NAMES or rel in deleted
             for mod in [_module_for(rel, modules)] if mod
         }
+        if any(_module_for(rel, modules) is None for rel in deleted):
+            # A deleted root/unmapped resource or config has no current node to
+            # recover relationships from.  Full expansion is safer than
+            # silently treating it as having no consumers.
+            impacted.update(all_files)
         for mod in affected_modules:
             impacted.update(f for f in all_files if f == mod or f.startswith(mod + "/"))
 
@@ -176,10 +260,14 @@ def _impact_expand(repo: Path, direct: set[str], all_files: set[str], modules: l
         # Manifest/component, code/resource, source-set overlays, imports and
         # Gradle project relations.  This is source-only and deterministic.
         graph = build_relation_graph(repo, sorted(all_files))
+        graph_gaps = graph.get("stats", {}).get("files_not_fully_indexed", [])
+        if graph_gaps and diagnostics is not None:
+            diagnostics.append({"backend": "relation_graph", "files": graph_gaps})
         impacted.update(expand_from_files(graph, direct, depth) & all_files)
 
     changed_code = [f for f in direct if Path(f).suffix.lower() in {".java", ".kt"}]
-    if not changed_code or depth <= 0:
+    deleted_code = [f for f in deleted if Path(f).suffix.lower() in {".java", ".kt"}]
+    if not (changed_code or deleted_code) or depth <= 0:
         return impacted
 
     nav = SourceNav(repo)
@@ -189,10 +277,34 @@ def _impact_expand(repo: Path, direct: set[str], all_files: set[str], modules: l
         ds, cs = _extract_symbols(repo / rel)
         declarations.update(ds)
         calls.update(cs)
+    for rel in deleted_code:
+        ds, cs = _extract_symbols_text(_git_file_text(repo, diff_ref, rel))
+        declarations.update(ds)
+        calls.update(cs)
+
+    # A deleted type with no methods can still break callers/importers. Scan
+    # current Java/Kotlin sources for exact type-name references instead of
+    # depending only on method-name navigation.
+    deleted_types: set[str] = set()
+    for rel in deleted_code:
+        deleted_types.update(_extract_types_text(_git_file_text(repo, diff_ref, rel)))
+    if deleted_types:
+        type_ref = re.compile(
+            r"\b(?:" + "|".join(re.escape(name) for name in sorted(deleted_types)) + r")\b"
+        )
+        for rel in sorted(all_files):
+            if Path(rel).suffix.lower() not in {".java", ".kt", ".kts"}:
+                continue
+            try:
+                if type_ref.search((repo / rel).read_text(encoding="utf-8", errors="replace")):
+                    impacted.add(rel)
+            except OSError:
+                if diagnostics is not None:
+                    diagnostics.append({"backend": "deleted_type_reference", "files": [rel]})
 
     # Callees：把变更文件直接调用的方法定义加入作用域。
-    for name in sorted(calls)[:250]:
-        for d in nav.get_definition(f"Any#{name}")[:25]:
+    for name in sorted(calls):
+        for d in nav.get_definition(f"Any#{name}"):
             if d.get("file") in all_files:
                 impacted.add(d["file"])
 
@@ -201,9 +313,9 @@ def _impact_expand(repo: Path, direct: set[str], all_files: set[str], modules: l
     seen_names: set[str] = set()
     for _ in range(depth):
         next_frontier: set[str] = set()
-        for name in sorted(frontier - seen_names)[:250]:
+        for name in sorted(frontier - seen_names):
             seen_names.add(name)
-            for caller in nav.get_callers(name)[:100]:
+            for caller in nav.get_callers(name):
                 rel = caller.get("file", "")
                 if rel in all_files:
                     impacted.add(rel)
@@ -213,6 +325,8 @@ def _impact_expand(repo: Path, direct: set[str], all_files: set[str], modules: l
         frontier = next_frontier
         if not frontier:
             break
+    if nav.files_not_indexed and diagnostics is not None:
+        diagnostics.append({"backend": "source_nav", "files": nav.files_not_indexed})
     return impacted
 
 
@@ -238,10 +352,11 @@ def prepare_scope(
     impact: bool,
     out_dir: Path,
     language: str | None = None,
+    trust_project_config: bool = False,
 ) -> dict:
     repo = repo.resolve()
     _invalidate_previous_run(out_dir)
-    info = detect_project(repo)
+    info = detect_project(repo, trust_project_config=trust_project_config)
     if language in {"zh", "en"}:
         info["language"] = language
         info["notes"].append(f"output language overridden by invocation: {language}")
@@ -254,10 +369,16 @@ def prepare_scope(
 
     # 根级构建/版本目录不一定落在某个模块下，显式补入。
     for rel in GLOBAL_BUILD_FILES:
-        if (repo / rel).is_file() and not _excluded(rel, excludes):
-            all_files.add(rel)
+        candidate = repo / rel
+        try:
+            safe_candidate = resolve_repo_path(repo, candidate, label="global build file")
+        except ValueError:
+            continue
+        if safe_candidate.is_file() and not _excluded(rel, excludes):
+            all_files.add(safe_candidate.relative_to(repo).as_posix())
 
     missing_changed: list[str] = []
+    deleted_relevant: set[str] = set()
     mode = "full" if full or (module or globs) and diff_ref is None else "diff"
     if mode == "diff":
         if not info["is_git"]:
@@ -265,9 +386,34 @@ def prepare_scope(
         direct_list, missing_changed = _git_changed(repo, diff_ref or "HEAD~1")
         direct = {
             f for f in direct_list
-            if Path(f).suffix.lower() in extensions and not _excluded(f, excludes)
+            if (Path(f).suffix.lower() in extensions or Path(f).name in SOURCE_FILENAMES)
+            and not _excluded(f, excludes)
         }
-        selected = _impact_expand(repo, direct, all_files, modules, impact_depth) if impact else direct
+        deleted_relevant = {
+            f for f in missing_changed
+            if (Path(f).suffix.lower() in extensions or Path(f).name in SOURCE_FILENAMES)
+            and not _excluded(f, excludes)
+        }
+        if deleted_relevant and not impact:
+            raise ValueError(
+                "diff 含已删除源码/配置，--no-impact 无法审查删除造成的调用方或模块影响；请启用 impact"
+            )
+        impact_diagnostics: list[dict] = []
+        selected = _impact_expand(
+            repo,
+            direct,
+            all_files,
+            modules,
+            impact_depth,
+            deleted=deleted_relevant,
+            diff_ref=diff_ref or "HEAD~1",
+            diagnostics=impact_diagnostics,
+        ) if impact else direct
+        if impact_diagnostics:
+            raise ValueError(
+                "diff 影响切片存在未索引源码，不能宣称完整: "
+                + json.dumps(impact_diagnostics, ensure_ascii=False)
+            )
     else:
         direct = set(all_files)
         selected = set(all_files)
@@ -277,13 +423,13 @@ def prepare_scope(
     scope = sorted(selected)
     hunt_scope = sorted(
         f for f in selected
-        if Path(f).suffix.lower() in HUNT_EXTENSIONS
+        if (Path(f).suffix.lower() in HUNT_EXTENSIONS or Path(f).name in SOURCE_FILENAMES)
         and not (set(Path(f).parts) & HUNT_SKIP_DIRS)
     )
+    context_scope = _iter_context_files(repo)
 
     cfg = info.get("config", {})
-    raw_excluded = cfg.get("excluded_engines", [])
-    excluded = [str(x) for x in raw_excluded] if isinstance(raw_excluded, list) else []
+    excluded = effective_excluded_engines(cfg)
     ai_enabled = "ai" not in excluded
     result = {
         "mode": mode,
@@ -292,17 +438,22 @@ def prepare_scope(
         "impact_added": len(selected - direct),
         "scope_files": len(scope),
         "hunt_files": len(hunt_scope),
+        "context_files": len(context_scope),
         "should_hunt": ai_enabled and bool(hunt_scope),
         "impact_depth": impact_depth if impact else 0,
         "missing_changed": missing_changed,
+        "deleted_files": sorted(deleted_relevant),
+        "direct_paths_total": len(direct) + len(deleted_relevant),
         "modules": modules,
         "scope_path": str(out_dir / "scope.txt"),
         "hunt_scope_path": str(out_dir / "hunt_scope.txt"),
+        "context_scope_path": str(out_dir / "context_scope.txt"),
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "scope.txt").write_text("".join(f"{f}\n" for f in scope), encoding="utf-8")
     (out_dir / "hunt_scope.txt").write_text("".join(f"{f}\n" for f in hunt_scope), encoding="utf-8")
+    (out_dir / "context_scope.txt").write_text("".join(f"{f}\n" for f in context_scope), encoding="utf-8")
     (out_dir / "project.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (out_dir / "scope_meta.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     atomic_write_json(out_dir / "run_manifest.json", _run_manifest(repo, info, result))
@@ -314,8 +465,11 @@ def _invalidate_previous_run(out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     generated_patterns = (
         "engine-results.json", "hunt_batch_*.json", "hunt_result_*.json",
-        "repo_map_*.md", "verify_batch_*.json", "verified_batch_*.json",
+        "repo_map_*.md", "repo_map_*.meta.json",
+        "gap_audit_batch_*.json", "gap_prior_*.json", "hunt_gap_result_*.json",
+        "verify_batch_*.json", "verified_batch_*.json",
         "hunt_coverage.json", "hunt_perspective_coverage.json",
+        "gap_audit_plan.json", "gap_audit_coverage.json", "context_scope.txt",
         "verify_coverage.json", "relation_graph.json", "merge_receipt.json",
     )
     for pattern in generated_patterns:
@@ -356,7 +510,7 @@ def _run_manifest(repo: Path, info: dict, scope: dict) -> dict:
         "source_only": True,
         "repo_revision": revision,
         "repo_dirty": dirty,
-        "skill_fingerprint": _skill_fingerprint(),
+        "skill_fingerprint": current_skill_fingerprint(),
         "config_fingerprint": hashlib.sha256(config_bytes).hexdigest(),
         "language": info.get("language", "zh"),
         "scan_mode": scope.get("mode"),
@@ -365,25 +519,13 @@ def _run_manifest(repo: Path, info: dict, scope: dict) -> dict:
             "impact_added": scope.get("impact_added", 0),
             "scope_files": scope.get("scope_files", 0),
             "hunt_files": scope.get("hunt_files", 0),
+            "context_files": scope.get("context_files", 0),
+            "deleted_files": len(scope.get("deleted_files", [])),
         },
+        "config_trusted": bool(info.get("config_trusted")),
+        "effective_hunt_policy": effective_hunt_policy(info.get("config")),
+        "effective_excluded_engines": effective_excluded_engines(info.get("config")),
     }
-
-
-def _skill_fingerprint() -> str:
-    skill_dir = Path(__file__).resolve().parent.parent
-    digest = hashlib.sha256()
-    roots = [skill_dir / "SKILL.md", skill_dir / "CONVENTIONS.md"]
-    roots.extend(sorted((skill_dir / "scripts").rglob("*.py")))
-    roots.extend(sorted((skill_dir / "agents").glob("*.md")))
-    roots.extend(sorted((skill_dir / "queries").rglob("*")))
-    for path in roots:
-        if not path.is_file():
-            continue
-        digest.update(path.relative_to(skill_dir).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
 
 
 def main() -> int:
@@ -396,6 +538,10 @@ def main() -> int:
     ap.add_argument("--impact-depth", type=int, default=None)
     ap.add_argument("--no-impact", action="store_true")
     ap.add_argument("--language", choices=("zh", "en"), help="覆盖本次报告语言")
+    ap.add_argument(
+        "--trust-project-config", action="store_true",
+        help="允许已审阅的目标仓库配置改变作用域；不授予代码执行或联网能力",
+    )
     ap.add_argument("--out-dir", default=".scan/tmp")
     args = ap.parse_args()
 
@@ -403,7 +549,7 @@ def main() -> int:
         print(json.dumps({"error": "--full 与 --diff 不能同时使用"}, ensure_ascii=False))
         return 2
     repo = Path(args.repo_root).resolve()
-    info = detect_project(repo)
+    info = detect_project(repo, trust_project_config=args.trust_project_config)
     cfg = info.get("config", {})
     try:
         depth = args.impact_depth if args.impact_depth is not None else int(cfg.get("impact_depth", 2))
@@ -417,9 +563,11 @@ def main() -> int:
     diff_ref = args.diff
     if not args.full and args.diff is None and not args.module and not args.files:
         diff_ref = "HEAD~1"
-    out_dir = Path(args.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = repo / out_dir
+    try:
+        out_dir = resolve_cli_path(repo, args.out_dir, label="scope output directory")
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        return 2
     try:
         result = prepare_scope(
             repo,
@@ -431,6 +579,7 @@ def main() -> int:
             impact=not args.no_impact,
             out_dir=out_dir,
             language=args.language,
+            trust_project_config=args.trust_project_config,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         print(json.dumps({"error": str(e)}, ensure_ascii=False))

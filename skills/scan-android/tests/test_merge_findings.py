@@ -11,6 +11,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import merge_findings as mf  # noqa: E402
+import build_verify_batches as vb  # noqa: E402
 
 MERGE_SCRIPT = SCRIPTS / "merge_findings.py"
 
@@ -47,22 +48,79 @@ def _run(payload):
         return proc, found_obj, review_obj
 
 
-def _run_verified_glob(batch_count: int, verified_indices: list[int]):
+def _run_verified_glob(
+    batch_count: int, verified_indices: list[int], *, skill_fingerprint=None,
+):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         out = root / ".scan/tmp"
         out.mkdir(parents=True)
+        (out / "project.json").write_text('{"config": {}}')
+        (out / "scope.txt").write_text("")
+        (out / "hunt_scope.txt").write_text("")
+        (out / "context_scope.txt").write_text("")
+        (out / "scope_meta.json").write_text("{}")
+        (out / "run_manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "source_only": True,
+            "run_id": "merge-test",
+            "skill_fingerprint": (
+                mf.current_skill_fingerprint() if skill_fingerprint is None else skill_fingerprint
+            ),
+            "config_trusted": False,
+            "config_fingerprint": hashlib.sha256(b"{}").hexdigest(),
+            "effective_hunt_policy": {
+                "samples": 2, "batch_size": 10, "token_budget": 24000,
+            },
+            "effective_excluded_engines": [],
+        }))
+        engine_results = out / "engine-results.json"
+        engine_results.write_text(json.dumps({
+            "status": "complete",
+            "scan_complete": True,
+            "configured_complete": True,
+            "coverage_complete": True,
+            "incomplete_engines": [],
+            "coverage_gaps": [],
+            "engines_used": ["semgrep"],
+            "candidates": [],
+            "engine_stats": [
+                {"engine": "semgrep", "status": "complete"},
+                {"engine": "detekt", "status": "not_applicable"},
+                {"engine": "pmd", "status": "not_applicable"},
+                {"engine": "lint", "status": "not_applicable"},
+            ],
+            "scope_snapshot": [],
+            "scope_changed_during_scan": False,
+            "config_fingerprint": hashlib.sha256(b"{}").hexdigest(),
+            "config_trusted": False,
+            "effective_excluded_engines": [],
+        }))
         batch_files = []
+        batch_receipts = []
         for index in range(batch_count):
             batch = out / f"verify_batch_{index}.json"
             batch.write_text("[]")
             batch_files.append(str(batch))
+            batch_receipts.append({
+                "file": str(batch),
+                "candidates": 0,
+                "sha256": hashlib.sha256(batch.read_bytes()).hexdigest(),
+            })
         (out / "verify_coverage.json").write_text(json.dumps({
+            "schema_version": 2,
             "coverage_ok": True,
             "candidates_input": 0,
             "candidates_batched": 0,
             "batches": batch_count,
             "batch_files": batch_files,
+            "batch_receipts": batch_receipts,
+            "candidate_ids_unique": 0,
+            "inputs": [{
+                "file": ".scan/tmp/engine-results.json",
+                "candidates": 0,
+                "sha256": hashlib.sha256(engine_results.read_bytes()).hexdigest(),
+            }],
         }))
         for index in verified_indices:
             (out / f"verified_batch_{index}.json").write_text(
@@ -71,6 +129,7 @@ def _run_verified_glob(batch_count: int, verified_indices: list[int]):
                     "candidates_input": 0,
                     "candidates_adjudicated": 0,
                     "false_positive_count": 0,
+                    "false_positive_ids": [],
                     "duplicates_merged_count": 0,
                     "confirmed": [],
                     "needs_review": [],
@@ -96,6 +155,38 @@ class Predicates(unittest.TestCase):
         self.assertTrue(mf._has_origin({"dataflow_path": [{"line": 1}]}))
         self.assertFalse(mf._has_origin({"dataflow_path": []}))
 
+    def test_engine_integrity_rejects_silently_omitted_adapters(self):
+        problems = mf._engine_integrity_problems({
+            "status": "complete",
+            "scan_complete": True,
+            "engine_stats": [{"engine": "semgrep", "status": "complete"}],
+        })
+        self.assertTrue(any("omitted engines" in problem for problem in problems))
+
+    def test_engine_integrity_recomputes_summary_fields(self):
+        stats = [
+            {"engine": "semgrep", "status": "complete"},
+            {"engine": "detekt", "status": "not_applicable"},
+            {"engine": "pmd", "status": "partial"},
+            {"engine": "lint", "status": "skipped", "reason": "not authorized"},
+        ]
+        problems = mf._engine_integrity_problems({
+            "status": "complete",
+            "scan_complete": True,
+            "configured_complete": True,
+            "coverage_complete": True,
+            "incomplete_engines": [],
+            "coverage_gaps": [],
+            "engines_used": ["semgrep"],
+            "engine_stats": stats,
+        })
+        self.assertTrue(any("overall status" in problem for problem in problems))
+        self.assertTrue(any("configured_complete" in problem for problem in problems))
+        self.assertTrue(any("coverage_complete" in problem for problem in problems))
+        self.assertTrue(any("incomplete_engines" in problem for problem in problems))
+        self.assertTrue(any("coverage_gaps" in problem for problem in problems))
+        self.assertTrue(any("engines_used" in problem for problem in problems))
+
 
 class MergeEndToEnd(unittest.TestCase):
     def test_verified_glob_rejects_missing_batch(self):
@@ -110,6 +201,15 @@ class MergeEndToEnd(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertTrue(findings_exists)
         self.assertTrue(review_exists)
+
+    def test_verified_glob_rejects_skill_or_rule_drift(self):
+        proc, findings_exists, review_exists = _run_verified_glob(
+            1, [0], skill_fingerprint="stale-skill",
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("skill/rules changed", proc.stderr)
+        self.assertFalse(findings_exists)
+        self.assertFalse(review_exists)
 
     def test_adjudication_receipt_rejects_unaccounted_candidates(self):
         with self.assertRaises(ValueError):
@@ -224,6 +324,7 @@ class MergeEndToEnd(unittest.TestCase):
             mf._validate_adjudication({
                 "batch": 0, "candidates_input": 1, "candidates_adjudicated": 1,
                 "false_positive_count": 0, "duplicates_merged_count": 0,
+                "false_positive_ids": [],
                 "confirmed": [_candidate()], "needs_review": [],
             }, Path("verified_batch_0.json"), 0, input_items)
 
@@ -234,9 +335,38 @@ class MergeEndToEnd(unittest.TestCase):
         )
         mf._validate_adjudication({
             "batch": 0, "candidates_input": 2, "candidates_adjudicated": 2,
-            "false_positive_count": 0, "duplicates_merged_count": 1,
+            "false_positive_count": 0, "false_positive_ids": [],
+            "duplicates_merged_count": 1,
             "confirmed": [item], "needs_review": [],
-        }, Path("verified_batch_0.json"), 0, [{"candidate_id": "c1"}, {"candidate_id": "c2"}])
+        }, Path("verified_batch_0.json"), 0, [
+            {"candidate_id": "c1", "provenance": [{"source_kind": "ai_hunter"}]},
+            {"candidate_id": "c2", "provenance": [{"source_kind": "ai_hunter"}]},
+        ])
+
+    def test_false_positive_ids_must_exactly_partition_input(self):
+        inputs = [
+            {"candidate_id": "c1", "provenance": [{"source_kind": "tool_engine"}]},
+            {"candidate_id": "c2", "provenance": [{"source_kind": "tool_engine"}]},
+        ]
+        with self.assertRaisesRegex(ValueError, "false_positive_ids"):
+            mf._validate_adjudication({
+                "batch": 0, "candidates_input": 2, "candidates_adjudicated": 2,
+                "false_positive_count": 2, "false_positive_ids": ["c1"],
+                "duplicates_merged_count": 0, "confirmed": [], "needs_review": [],
+            }, Path("verified_batch_0.json"), 0, inputs)
+
+    def test_verify_batch_mutation_after_build_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            engine = repo / "engine-results.json"
+            engine.write_text('{"candidates": []}')
+            coverage = vb.build(repo, [engine], repo / ".scan/tmp")
+            coverage_path = repo / ".scan/tmp/verify_coverage.json"
+            mf._validate_verify_coverage_artifacts(coverage, repo, coverage_path)
+            batch = repo / ".scan/tmp/verify_batch_0.json"
+            batch.write_text(batch.read_text() + "\n")
+            with self.assertRaisesRegex(ValueError, "分批后发生变化|生成后发生变化"):
+                mf._validate_verify_coverage_artifacts(coverage, repo, coverage_path)
 
 
 if __name__ == "__main__":

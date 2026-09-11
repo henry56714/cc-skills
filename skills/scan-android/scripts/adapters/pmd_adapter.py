@@ -158,7 +158,11 @@ class PMDAdapter(EngineAdapter):
                 if cand is None:
                     continue
                 rules_seen.add(cand.native_rule_id)
-                if not _should_emit(cand.native_rule_id, include_advisories):
+                if not _should_emit(
+                    cand.native_rule_id,
+                    include_advisories,
+                    str(v.get("ruleset", "")),
+                ):
                     result.suppressed += 1
                     suppressed_by_rule[cand.native_rule_id] = suppressed_by_rule.get(cand.native_rule_id, 0) + 1
                     continue
@@ -220,5 +224,15 @@ def _parse_violation(v: dict, rel: str) -> Candidate | None:
     )
 
 
-def _should_emit(rule: str, include_advisories: bool = False) -> bool:
-    return include_advisories or rule in _HIGH_SIGNAL_RULES
+def _should_emit(
+    rule: str,
+    include_advisories: bool = False,
+    ruleset: str = "",
+) -> bool:
+    """Keep correctness/concurrency/security findings; suppress style-only noise."""
+    normalized = ruleset.lower().replace(" ", "")
+    return (
+        include_advisories
+        or rule in _HIGH_SIGNAL_RULES
+        or any(kind in normalized for kind in ("errorprone", "multithreading", "security"))
+    )

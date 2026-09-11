@@ -96,6 +96,81 @@ class JsonRoundTrip(unittest.TestCase):
             self.assertEqual(list(Path(d).glob("*.tmp")), [])  # temp cleaned up
 
 
+class HuntPolicy(unittest.TestCase):
+    def test_engine_exclusions_accept_only_known_string_names(self):
+        self.assertEqual(lib_scan.effective_excluded_engines({
+            "excluded_engines": [" AI ", "semgrep", "unknown", 7, "ai"],
+        }), ["ai", "semgrep"])
+
+    def test_defaults_and_rejects_bool_or_too_small_values(self):
+        self.assertEqual(lib_scan.effective_hunt_policy({}), {
+            "samples": 2, "batch_size": 10, "token_budget": 24000,
+        })
+        self.assertEqual(lib_scan.effective_hunt_policy({
+            "hunt_samples": True,
+            "hunt_batch_size": 0,
+            "hunt_token_budget": 999,
+        }), {
+            "samples": 2, "batch_size": 10, "token_budget": 24000,
+        })
+
+    def test_accepts_valid_explicit_values(self):
+        self.assertEqual(lib_scan.effective_hunt_policy({
+            "hunt_samples": 1,
+            "hunt_batch_size": 7,
+            "hunt_token_budget": 12000,
+        }), {
+            "samples": 1, "batch_size": 7, "token_budget": 12000,
+        })
+
+
+class StrictJsonEquality(unittest.TestCase):
+    def test_boolean_does_not_equal_integer(self):
+        self.assertFalse(lib_scan.strict_json_equal({"batch": True}, {"batch": 1}))
+        self.assertTrue(lib_scan.strict_json_equal({"batch": 1}, {"batch": 1}))
+
+
+class CliPathSafety(unittest.TestCase):
+    def test_relative_scan_symlink_cannot_escape_repository(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            outside = root / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            try:
+                (repo / ".scan").symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("directory symlinks are unavailable")
+            with self.assertRaisesRegex(ValueError, "符号链接越出仓库"):
+                lib_scan.resolve_cli_path(repo, ".scan/tmp", label="output")
+
+    def test_artifact_absolute_path_must_still_stay_in_repository(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            outside = root / "outside.json"
+            repo.mkdir()
+            outside.write_text("secret")
+            with self.assertRaisesRegex(ValueError, "越出仓库"):
+                lib_scan.resolve_repo_path(repo, outside, label="artifact")
+
+    def test_relative_glob_cannot_follow_symlink_outside_repository(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            outside = root / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            (outside / "verified_batch_0.json").write_text("{}")
+            try:
+                (repo / "results").symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("directory symlinks are unavailable")
+            with self.assertRaisesRegex(ValueError, "符号链接越出仓库"):
+                lib_scan.expand_cli_glob(repo, "results/*.json", label="results")
+
+
 class CandidateContract(unittest.TestCase):
     def test_minimal_emits_core_keys_and_omits_empty_optionals(self):
         d = lib_scan.Candidate(

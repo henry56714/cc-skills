@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ import sys
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from source_nav import SourceNav  # noqa: E402
+from lib_scan import current_skill_fingerprint, run_manifest_invariant_fingerprint  # noqa: E402
 from render_report import (  # noqa: E402
     _coverage_status, _engine_stats_banner, _load_engine_stats,
     _pipeline_stats, _render, _render_needs_review,
@@ -95,6 +97,9 @@ class ReportTests(unittest.TestCase):
     def test_not_applicable_is_not_a_coverage_gap(self):
         self.assertEqual(_coverage_status([{"status": "not_applicable"}]), "complete")
 
+    def test_unknown_status_fails_closed(self):
+        self.assertEqual(_coverage_status([{"status": "invented"}]), "incomplete")
+
     def test_english_report_has_english_static_labels(self):
         md = _render([], language="en", run_manifest={"run_id": "abc"})
         self.assertIn("# Scan results", md)
@@ -140,6 +145,103 @@ class ReportTests(unittest.TestCase):
             )
             self.assertEqual(next(s for s in stats if s["engine"] == "ai_hunter")["status"], "failed")
             self.assertEqual(_coverage_status(stats), "incomplete")
+
+    def test_merge_receipt_rejects_skill_drift_after_merge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            scan_tmp = repo / ".scan/tmp"
+            scan_tmp.mkdir(parents=True)
+            (scan_tmp / "hunt_scope.txt").write_text("")
+            (scan_tmp / "verify_coverage.json").write_text(json.dumps({
+                "coverage_ok": True, "candidates_input": 0,
+                "candidates_batched": 0, "batches": 1,
+                "batch_files": [str(scan_tmp / "verify_batch_0.json")],
+            }))
+            findings = repo / ".scan/findings.json"
+            needs_review = repo / ".scan/needs-review.json"
+            findings.write_text('{"findings": []}')
+            needs_review.write_text('{"needs_review": []}')
+            (scan_tmp / "merge_receipt.json").write_text(json.dumps({
+                "ok": True,
+                "run_id": "r1",
+                "skill_fingerprint": "stale-skill",
+                "results": {"confirmed": 0, "needs_review": 0},
+                "artifacts_sha256": [{
+                    "path": ".scan/findings.json",
+                    "sha256": hashlib.sha256(findings.read_bytes()).hexdigest(),
+                }],
+            }))
+            stats = _pipeline_stats(
+                repo=repo,
+                hunt_result=scan_tmp / "hunt_perspective_coverage.json",
+                verify_coverage=scan_tmp / "verify_coverage.json",
+                merge_receipt=scan_tmp / "merge_receipt.json",
+                findings_path=findings,
+                needs_review_path=needs_review,
+                findings_count=0,
+                needs_review_count=0,
+                run_manifest={
+                    "run_id": "r1",
+                    "skill_fingerprint": current_skill_fingerprint(),
+                },
+            )
+            merge = next(item for item in stats if item["engine"] == "merge")
+            self.assertEqual(merge["status"], "failed")
+            self.assertIn("skill/rules changed", merge["reason"])
+
+    def test_merge_receipt_rejects_post_merge_manifest_policy_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            scan_tmp = repo / ".scan/tmp"
+            scan_tmp.mkdir(parents=True)
+            (scan_tmp / "hunt_scope.txt").write_text("")
+            (scan_tmp / "verify_coverage.json").write_text(json.dumps({
+                "coverage_ok": True, "candidates_input": 0,
+                "candidates_batched": 0, "batches": 1,
+                "batch_files": [str(scan_tmp / "verify_batch_0.json")],
+            }))
+            findings = repo / ".scan/findings.json"
+            needs_review = repo / ".scan/needs-review.json"
+            findings.write_text('{"findings": []}')
+            needs_review.write_text('{"needs_review": []}')
+            original_manifest = {
+                "schema_version": 1,
+                "run_id": "r1",
+                "source_only": True,
+                "skill_fingerprint": current_skill_fingerprint(),
+                "effective_excluded_engines": [],
+                "effective_hunt_policy": {
+                    "samples": 2, "batch_size": 10, "token_budget": 24000,
+                },
+            }
+            (scan_tmp / "merge_receipt.json").write_text(json.dumps({
+                "ok": True,
+                "run_id": "r1",
+                "skill_fingerprint": current_skill_fingerprint(),
+                "run_manifest_invariants_sha256": (
+                    run_manifest_invariant_fingerprint(original_manifest)
+                ),
+                "results": {"confirmed": 0, "needs_review": 0},
+                "artifacts_sha256": [{
+                    "path": ".scan/findings.json",
+                    "sha256": hashlib.sha256(findings.read_bytes()).hexdigest(),
+                }],
+            }))
+            edited_manifest = dict(original_manifest)
+            edited_manifest["effective_excluded_engines"] = ["ai"]
+            stats = _pipeline_stats(
+                repo=repo,
+                hunt_result=scan_tmp / "hunt_perspective_coverage.json",
+                verify_coverage=scan_tmp / "verify_coverage.json",
+                merge_receipt=scan_tmp / "merge_receipt.json",
+                findings_path=findings,
+                needs_review_path=needs_review,
+                findings_count=0, needs_review_count=0,
+                run_manifest=edited_manifest,
+            )
+            merge = next(item for item in stats if item["engine"] == "merge")
+            self.assertEqual(merge["status"], "failed")
+            self.assertIn("manifest policy/scope changed", merge["reason"])
 
     def test_engine_stats_file_is_required_for_complete_gate(self):
         with tempfile.TemporaryDirectory() as tmp:

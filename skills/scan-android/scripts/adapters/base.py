@@ -30,6 +30,12 @@ class ScanContext:
     detect_info: dict = field(default_factory=dict)
     excluded_engines: list[str] = field(default_factory=list)
     allow_build_execution: bool = False
+    # Registry rule packs may contact a remote service.  A repository config is
+    # untrusted input and must never be able to grant this capability.
+    allow_network_rules: bool = False
+    # Allows declarative scan policy (excludes/tasks/packs) from the target
+    # repository.  This never implies build execution or network capability.
+    trust_project_config: bool = False
     # Installation may use network access and write outside the scanned repo.
     # It is therefore an explicit caller decision, never an adapter side effect.
     allow_installation: bool = False

@@ -17,7 +17,8 @@ check_hunt_coverage.py — AI 狩猎支线「文件证据 + 多视角覆盖」�
      ranges 合并后覆盖 1..line_count；
   3. 每批合法独立样本达到 --min-samples，且不接受重复 sample 或游离结果。
 
-schema v2 不再维护与结果重复的 `hunt_attest_*.json`。旧 schema v1 仍兼容原回执。
+schema v2+ 不再维护与结果重复的 `hunt_attest_*.json`。当前 schema v3 还会绑定
+scope/context 清单，并在检查时确定性重建批次与关系图；旧 schema v1 仅兼容原回执。
 
 仅用 Python 标准库。读取仓库文件并只在 .scan/tmp 写 hunt_perspective_coverage.json。
 
@@ -31,7 +32,11 @@ import hashlib
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
+
+from build_hunt_batches import build_batches
+from lib_scan import resolve_cli_path, resolve_repo_path, strict_json_equal
 
 
 def _load_json(p: Path):
@@ -67,9 +72,12 @@ def _ranges_cover(ranges: object, line_count: int) -> bool:
         if not isinstance(item, dict):
             return False
         start, end = item.get("start"), item.get("end")
-        if not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start:
+        if (
+            type(start) is not int or type(end) is not int
+            or start < 1 or end < start or end > line_count
+        ):
             return False
-        normalized.append((start, min(end, line_count)))
+        normalized.append((start, end))
     cursor = 1
     for start, end in sorted(normalized):
         if start > cursor:
@@ -107,16 +115,230 @@ def _validate_file_reads(
         digest, line_count = current
         if item.get("sha256") != digest:
             problems.append(f"文件哈希不匹配: {rel}")
-        if item.get("line_count") != line_count:
+        if type(item.get("line_count")) is not int or item.get("line_count") != line_count:
             problems.append(f"文件行数不匹配: {rel}")
         if not _ranges_cover(item.get("ranges"), line_count):
             problems.append(f"读取范围未覆盖完整文件: {rel}")
     return problems
 
 
+_CASE_STATUSES = {"no_signal", "mitigated", "candidate", "needs_context"}
+
+
+_PLAN_COMPARE_FIELDS = (
+    "schema_version", "total_input", "analyzed", "batched",
+    "generated_excluded", "missing", "uncovered", "coverage_ok", "batches",
+    "batch_size", "token_budget", "batching_strategy", "map_receipts_required",
+    "relation_graph_stats", "tech_present", "marker_scan_truncated",
+    "analysis_gaps", "batches_detail", "scope_receipt",
+    "context_scope_receipt", "context_scope_path", "context_files",
+)
+
+
+def _receipted_input(
+    cov: dict, field: str, repo_root: Path, *, optional: bool = False,
+) -> tuple[Path | None, list[str]]:
+    receipt = cov.get(field)
+    if optional and receipt is None:
+        return None, []
+    if not isinstance(receipt, dict):
+        return None, [f"{field} 缺失或不是对象"]
+    raw_path = receipt.get("file")
+    digest = receipt.get("sha256")
+    if not isinstance(raw_path, str) or not raw_path or not isinstance(digest, str):
+        return None, [f"{field} 缺合法 file/sha256"]
+    try:
+        path = resolve_repo_path(repo_root, raw_path, label=field)
+        current = hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, ValueError) as exc:
+        return None, [str(exc)]
+    if current != digest:
+        return path, [f"{field} 对应输入在分批后发生变化"]
+    return path, []
+
+
+def _validate_v3_plan(out_dir: Path, cov: dict, repo_root: Path) -> list[str]:
+    """Rebuild the deterministic plan so a self-consistent subset cannot pass."""
+    problems: list[str] = []
+    if cov.get("schema_version") != 3:
+        return ["当前完整性闸要求 hunt_coverage schema_version=3"]
+    batch_size = cov.get("batch_size")
+    token_budget = cov.get("token_budget")
+    if type(batch_size) is not int or batch_size < 1:
+        problems.append("hunt_coverage.batch_size 无效")
+    if type(token_budget) is not int or token_budget < 1000:
+        problems.append("hunt_coverage.token_budget 无效")
+    scope_path, scope_problems = _receipted_input(cov, "scope_receipt", repo_root)
+    context_path, context_problems = _receipted_input(
+        cov, "context_scope_receipt", repo_root, optional=True,
+    )
+    problems.extend(scope_problems)
+    problems.extend(context_problems)
+    if problems or scope_path is None:
+        return problems
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".hunt-plan-recheck-", dir=out_dir) as tmp:
+            rebuilt_dir = Path(tmp)
+            # An explicitly absent context receipt means the original build had
+            # no context file. Pass a guaranteed-absent path to reproduce that.
+            rebuilt_context = context_path or (rebuilt_dir / "absent-context-scope.txt")
+            rebuilt = build_batches(
+                repo_root, scope_path, rebuilt_dir, batch_size, token_budget,
+                context_path=rebuilt_context,
+            )
+            for field in _PLAN_COMPARE_FIELDS:
+                if not strict_json_equal(cov.get(field), rebuilt.get(field)):
+                    problems.append(f"Hunter 计划字段与确定性重建不一致: {field}")
+
+            expected_batch_paths = [
+                (out_dir / f"hunt_batch_{index}.json").resolve()
+                for index in range(int(rebuilt.get("batches", 0)))
+            ]
+            actual_batch_paths = {path.resolve() for path in out_dir.glob("hunt_batch_*.json")}
+            if actual_batch_paths != set(expected_batch_paths):
+                problems.append("hunt_batch 文件集合与确定性计划不一致")
+
+            declared_batch_files = cov.get("batch_files")
+            try:
+                declared_paths = [
+                    resolve_repo_path(repo_root, raw, label="hunt_coverage.batch_files")
+                    for raw in declared_batch_files
+                ] if isinstance(declared_batch_files, list) and all(
+                    isinstance(raw, str) for raw in declared_batch_files
+                ) else []
+            except ValueError as exc:
+                problems.append(str(exc))
+                declared_paths = []
+            if declared_paths != expected_batch_paths:
+                problems.append("hunt_coverage.batch_files 与实际计划不一致")
+
+            for index in range(int(rebuilt.get("batches", 0))):
+                actual = _load_json(out_dir / f"hunt_batch_{index}.json")
+                expected = _load_json(rebuilt_dir / f"hunt_batch_{index}.json")
+                if not strict_json_equal(actual, expected):
+                    problems.append(f"hunt_batch_{index}.json 与确定性重建不一致")
+
+            try:
+                graph_path = resolve_repo_path(
+                    repo_root, cov.get("relation_graph_path", ""),
+                    label="hunt_coverage.relation_graph_path",
+                )
+            except ValueError as exc:
+                problems.append(str(exc))
+                graph_path = out_dir / "__invalid_relation_graph__"
+            if graph_path.resolve() != (out_dir / "relation_graph.json").resolve():
+                problems.append("relation_graph_path 未指向当前 Hunter 输出目录")
+            if not strict_json_equal(
+                _load_json(graph_path), _load_json(rebuilt_dir / "relation_graph.json")
+            ):
+                problems.append("relation_graph.json 与当前源码的确定性重建不一致")
+    except (OSError, ValueError, TypeError) as exc:
+        problems.append(f"无法确定性重建 Hunter 计划: {exc}")
+    return list(dict.fromkeys(problems))
+
+
+def _validate_case_assessments(
+    obj: dict,
+    expected_cases: set[str],
+    expected_files: set[str],
+    repo_root: Path,
+) -> list[str]:
+    """Require a per-case judgment, not a copied checklist of ids."""
+    if not expected_cases:
+        return []
+    assessments = obj.get("case_assessments")
+    if not isinstance(assessments, list):
+        return ["缺 case_assessments 数组（case_ids_checked 不能代替逐项判断）"]
+    problems: list[str] = []
+    by_id: dict[str, dict] = {}
+    for assessment in assessments:
+        if not isinstance(assessment, dict) or not isinstance(assessment.get("case_id"), str):
+            problems.append("case_assessments 含无效记录")
+            continue
+        case_id = assessment["case_id"]
+        if case_id in by_id:
+            problems.append(f"重复 case 判断: {case_id}")
+            continue
+        by_id[case_id] = assessment
+
+    missing = expected_cases - set(by_id)
+    if missing:
+        problems.append("漏 case 判断: " + ", ".join(sorted(missing)))
+    extra = set(by_id) - expected_cases
+    if extra:
+        problems.append("计划外 case 判断: " + ", ".join(sorted(extra)))
+    checked = obj.get("case_ids_checked")
+    if not isinstance(checked, list) or not all(isinstance(x, str) for x in checked):
+        problems.append("case_ids_checked 必须是字符串数组")
+    elif set(checked) != set(by_id):
+        problems.append("case_ids_checked 与 case_assessments 不一致")
+
+    candidates = obj.get("candidates", [])
+    candidate_rules = {
+        item.get("rule_id") for item in candidates
+        if isinstance(item, dict) and isinstance(item.get("rule_id"), str)
+    }
+    for case_id in sorted(expected_cases & set(by_id)):
+        assessment = by_id[case_id]
+        status = assessment.get("status")
+        if status not in _CASE_STATUSES:
+            problems.append(f"{case_id} status 无效")
+            continue
+        signals = assessment.get("signals_checked")
+        if not isinstance(signals, list) or not signals or not all(
+            isinstance(value, str) and value.strip() for value in signals
+        ):
+            problems.append(f"{case_id} 缺 signals_checked（至少写明实际检查的条件/不变量）")
+        conclusion = assessment.get("conclusion")
+        if not isinstance(conclusion, str) or len(conclusion.strip()) < 4:
+            problems.append(f"{case_id} 缺有效 conclusion")
+        evidence = assessment.get("evidence", [])
+        if not isinstance(evidence, list):
+            problems.append(f"{case_id} evidence 必须是数组")
+            evidence = []
+        if status in {"candidate", "mitigated"} and not evidence:
+            problems.append(f"{case_id} 的 {status} 判断缺源码证据")
+        for location in evidence:
+            if not isinstance(location, dict):
+                problems.append(f"{case_id} evidence 含无效记录")
+                continue
+            rel = location.get("file")
+            line = location.get("line")
+            if not isinstance(rel, str) or rel.replace("\\", "/") not in expected_files:
+                problems.append(f"{case_id} evidence 指向批外或无效文件")
+            if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+                problems.append(f"{case_id} evidence 缺有效行号")
+            elif isinstance(rel, str) and rel.replace("\\", "/") in expected_files:
+                snapshot = _snapshot(repo_root, rel.replace("\\", "/"))
+                if snapshot is None or line > snapshot[1]:
+                    problems.append(f"{case_id} evidence 行号超出文件范围")
+        if status == "candidate" and case_id not in candidate_rules:
+            problems.append(f"{case_id} 标为 candidate，但 candidates 中没有对应 rule_id")
+        if status == "needs_context":
+            problems.append(f"{case_id} 仍为 needs_context，不能宣称本样本完整")
+    return problems
+
+
 def _check_v2(
     out_dir: Path, cov: dict, min_samples: int, repo_root: Path,
 ) -> dict:
+    upstream_gaps = cov.get("analysis_gaps", [])
+    if cov.get("coverage_ok") is not True:
+        return {
+            "schema_version": cov.get("schema_version", 2),
+            "ok": False,
+            "error": "hunter 批次输入覆盖或分析完整性断言未通过",
+            "analysis_gaps": upstream_gaps if isinstance(upstream_gaps, list) else [],
+            "upstream_coverage_ok": cov.get("coverage_ok"),
+        }
+    if cov.get("map_receipts_required") is not True:
+        return {
+            "schema_version": cov.get("schema_version", 2),
+            "ok": False,
+                "error": "schema v2+ 必须启用 repo_map 导航回执，不能省略完整性闸",
+        }
     expected_by_batch: dict[int, set[str]] = {}
     expected_cases_by_batch: dict[int, set[str]] = {}
     files_by_batch: dict[int, set[str]] = {}
@@ -145,6 +367,48 @@ def _check_v2(
     except (TypeError, ValueError, KeyError) as exc:
         return {"ok": False, "error": f"覆盖率清单批次字段无效: {exc}"}
 
+    navigation_by_batch: dict[int, dict] = {}
+    navigation_problems: dict[int, list[str]] = {}
+    if cov.get("map_receipts_required") is True:
+        for batch in expected_by_batch:
+            meta_path = out_dir / f"repo_map_{batch}.meta.json"
+            map_path = out_dir / f"repo_map_{batch}.md"
+            batch_path = out_dir / f"hunt_batch_{batch}.json"
+            meta = _load_json(meta_path)
+            if not isinstance(meta, dict) or "__error__" in meta:
+                navigation_problems.setdefault(batch, []).append("缺失或无效的 repo_map 导航回执")
+                continue
+            navigation_by_batch[batch] = meta
+            if meta.get("schema_version") != 2:
+                navigation_problems.setdefault(batch, []).append("repo_map 回执 schema 缺失或过旧")
+            if meta.get("backend") != "treesitter" or meta.get("degraded") is not False:
+                navigation_problems.setdefault(batch, []).append(
+                    f"导航后端降级: {meta.get('backend', 'unknown')}"
+                )
+            files_not_indexed = meta.get("files_not_indexed", {})
+            if not isinstance(files_not_indexed, dict):
+                navigation_problems.setdefault(batch, []).append("repo_map 未提供合法 files_not_indexed 回执")
+            elif files_not_indexed:
+                navigation_problems.setdefault(batch, []).append(
+                    "导航索引漏文件: " + ", ".join(sorted(files_not_indexed))
+                )
+            if type(meta.get("map_truncated")) is not bool:
+                navigation_problems.setdefault(batch, []).append("repo_map 未明确声明是否截断")
+            elif meta.get("map_truncated") is True:
+                navigation_problems.setdefault(batch, []).append(
+                    "repo_map 达到 token 预算并发生截断；提高 --budget 后重建"
+                )
+            try:
+                current_batch_hash = hashlib.sha256(batch_path.read_bytes()).hexdigest()
+                current_map_hash = hashlib.sha256(map_path.read_bytes()).hexdigest()
+            except OSError:
+                navigation_problems.setdefault(batch, []).append("repo_map 或 hunt_batch 文件不可读")
+                continue
+            if meta.get("batch_sha256") != current_batch_hash:
+                navigation_problems.setdefault(batch, []).append("repo_map 回执绑定的 hunt_batch 已变化")
+            if meta.get("map_sha256") != current_map_hash:
+                navigation_problems.setdefault(batch, []).append("repo_map 回执绑定的地图已变化")
+
     samples_by_batch: dict[int, set[int]] = {}
     covered_by_batch: dict[int, set[str]] = {}
     sample_problems: dict[int, list[str]] = {}
@@ -165,6 +429,8 @@ def _check_v2(
             or not all(isinstance(x, str) for x in perspectives)
             or not isinstance(cases_checked, list)
             or not all(isinstance(x, str) for x in cases_checked)
+            or type(obj.get("batch")) is not int
+            or type(obj.get("sample")) is not int
         ):
             bad_results.append(result_path.name)
             continue
@@ -193,6 +459,12 @@ def _check_v2(
         missing_cases = expected_cases_by_batch.get(batch, set()) - set(cases_checked)
         if missing_cases:
             problems.append("漏 case: " + ", ".join(sorted(missing_cases)))
+        problems.extend(_validate_case_assessments(
+            obj,
+            expected_cases_by_batch.get(batch, set()),
+            files_by_batch.get(batch, set()),
+            repo_root,
+        ))
         problems.extend(_validate_file_reads(
             obj.get("files_reviewed"), files_by_batch.get(batch, set()), repo_root,
         ))
@@ -205,7 +477,7 @@ def _check_v2(
     all_ok = True
     for batch in sorted(expected_by_batch):
         samples = samples_by_batch.get(batch, set())
-        problems = list(sample_problems.get(batch, []))
+        problems = list(navigation_problems.get(batch, [])) + list(sample_problems.get(batch, []))
         if len(samples) < min_samples:
             problems.append(f"完整样本不足: {len(samples)} < {min_samples}")
         ok = not problems
@@ -223,11 +495,12 @@ def _check_v2(
             "results": len(samples),
             "ok": ok,
             "problems": problems,
+            "navigation": navigation_by_batch.get(batch),
         })
 
     stray_results = sorted(set(samples_by_batch) - set(expected_by_batch))
     return {
-        "schema_version": 2,
+        "schema_version": cov.get("schema_version", 2),
         "coverage_evidence": "file-hash-line-range-receipt",
         "ok": all_ok and not bad_results and not stray_results and not duplicate_samples,
         "min_samples": min_samples,
@@ -238,6 +511,7 @@ def _check_v2(
         "unparseable_attest": [],
         "unparseable_results": bad_results,
         "duplicate_samples": duplicate_samples,
+        "navigation_receipts_required": cov.get("map_receipts_required") is True,
     }
 
 
@@ -248,11 +522,22 @@ def check(
     if not isinstance(cov, dict) or "batches_detail" not in cov:
         return {"ok": False, "error": f"覆盖率清单无效或缺 batches_detail: {coverage_path}"}
 
-    try:
-        schema_version = int(cov.get("schema_version", 1))
-    except (TypeError, ValueError):
+    raw_schema_version = cov.get("schema_version", 1)
+    if type(raw_schema_version) is not int:
         return {"ok": False, "error": "覆盖率清单 schema_version 无效"}
+    schema_version = raw_schema_version
 
+    if schema_version > 3:
+        return {"ok": False, "error": f"不支持未来 hunt_coverage schema_version={schema_version}"}
+    if schema_version == 3:
+        plan_problems = _validate_v3_plan(out_dir, cov, (repo_root or out_dir).resolve())
+        if plan_problems:
+            return {
+                "schema_version": 3,
+                "ok": False,
+                "error": "Hunter 批次计划与当前 scope/源码不一致",
+                "plan_integrity_problems": plan_problems,
+            }
     if schema_version >= 2:
         return _check_v2(out_dir, cov, min_samples, (repo_root or out_dir).resolve())
 
@@ -276,6 +561,7 @@ def check(
             not isinstance(obj, dict) or "batch" not in obj or "__error__" in obj
             or not isinstance(perspectives, list)
             or not all(isinstance(x, str) for x in perspectives)
+            or type(obj.get("batch")) is not int
         ):
             bad_attest.append(ap.name)
             continue
@@ -296,6 +582,7 @@ def check(
             not isinstance(obj, dict) or "batch" not in obj or "__error__" in obj
             or not isinstance(candidates, list)
             or not all(isinstance(x, dict) for x in candidates)
+            or type(obj.get("batch")) is not int
         ):
             bad_results.append(rp.name)
             continue
@@ -377,12 +664,15 @@ def main() -> int:
         return 1
 
     repo_root = Path(args.repo_root).resolve()
-    out_dir = Path(args.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = repo_root / out_dir
-    coverage_path = Path(args.coverage) if args.coverage else out_dir / "hunt_coverage.json"
-    if not coverage_path.is_absolute():
-        coverage_path = repo_root / coverage_path
+    try:
+        out_dir = resolve_cli_path(repo_root, args.out_dir, label="hunter coverage output directory")
+        coverage_path = (
+            resolve_cli_path(repo_root, args.coverage, label="hunter coverage input")
+            if args.coverage else out_dir / "hunt_coverage.json"
+        )
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
 
     if not coverage_path.is_file():
         print(json.dumps(

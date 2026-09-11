@@ -23,14 +23,15 @@ repo_map.py — tree-sitter 驱动的跨文件代码地图与语法级调用/类
     venv 也没有 → **回退 source_nav**（正则名义级，永远能跑）。保证任意工程都能跑出结果。
 
 CLI（与 nav_tools/source_nav 对齐）：
-  repo_map.py --repo <root> --action map --scope-files <f> [--budget 8000]
-  repo_map.py --repo <root> --action map --batch-file <hunt_batch_N.json> [--budget 6000] [--out <md>]
+  repo_map.py --repo <root> --action map --scope-files <f> [--budget 24000]
+  repo_map.py --repo <root> --action map --batch-file <hunt_batch_N.json> [--budget 24000] [--out <md>]
   repo_map.py --repo <root> --action callers|definition|hierarchy|trace-origin --symbol "Class#method"
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -40,18 +41,25 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from lib_scan import resolve_cli_path
+
 SKILL_SCRIPTS = Path(__file__).resolve().parent
 TAGS_DIR = SKILL_SCRIPTS / "tags"
 REPOMAP_VENV = Path(os.environ.get(
     "SCAN_ANDROID_REPOMAP_VENV", Path.home() / ".scan-android" / "repomap-venv"))
 
 _SRC_LANG = {".java": "java", ".kt": "kotlin"}
+_UNSUPPORTED_NAV_SOURCE_EXTENSIONS = {
+    ".aidl", ".c", ".cc", ".cpp", ".h", ".hpp", ".rs",
+    ".js", ".ts", ".dart", ".html", ".htm",
+}
 _SKIP_DIRS = {
     "build", ".gradle", ".git", "generated", ".idea", "node_modules",
     ".cxx", ".externalNativeBuild", "CMakeFiles", ".scan", ".vscode", "docs",
 }
 _MAX_FILE_BYTES = 800_000
 _CHARS_PER_TOKEN = 4  # 粗略 token 估算（char/4），仅用于预算截断
+DEFAULT_MAP_TOKEN_BUDGET = 24_000
 
 
 def _log(msg: str) -> None:
@@ -109,6 +117,7 @@ class RepoMap:
         self._defs: list[dict[str, Any]] | None = None   # {name, kind, file, line, sig}
         self._refs: list[dict[str, Any]] | None = None    # {name, kind, file, line, enclosing, snippet}
         self._receiver_types: dict[tuple[str, str], str] = {}
+        self._files_not_indexed: dict[str, str] = {}
 
     # ---- tree-sitter 资源 ----
     def _parser(self, lang: str):
@@ -207,15 +216,21 @@ class RepoMap:
             lang = _SRC_LANG[p.suffix]
             try:
                 if p.stat().st_size > _MAX_FILE_BYTES:
+                    self._files_not_indexed[self._rel(p)] = f"oversized>{_MAX_FILE_BYTES}"
                     continue
                 src = p.read_bytes()
             except OSError:
+                try:
+                    self._files_not_indexed[self._rel(p)] = "unreadable"
+                except ValueError:
+                    pass
                 continue
             try:
                 tree = self._parser(lang).parse(src)
                 caps = self._captures(self._query(lang), tree.root_node)
             except Exception as e:
                 _log(f"解析失败 {self._rel(p)}: {e}")
+                self._files_not_indexed[self._rel(p)] = f"parse-error:{type(e).__name__}"
                 continue
             lines = src.split(b"\n")
             rel = self._rel(p)
@@ -517,13 +532,11 @@ class RepoMap:
             seg = [
                 f"- **{definition['fqn']}**（所属文件风险 {risk_by_file.get(definition['file'], 0)}）被批外调用："
             ]
-            for r in ext_callers[:8]:
+            for r in ext_callers:
                 seg.append(
                     f"    - {r['file']}:{r['line']}  在 `{r['enclosing_symbol'] or '?'}` "
                     f"[{r['confidence']}/{r['matched_by']}] → `{r['snippet']}`"
                 )
-            if len(ext_callers) > 8:
-                seg.append(f"    - …（共 {len(ext_callers)} 处，余略）")
             chunk = "\n".join(seg) + "\n"
             cost = len(chunk) // _CHARS_PER_TOKEN
             if used + cost > budget_tokens:
@@ -661,7 +674,22 @@ def _degraded_map_from_source(repo: str, files: list[str]) -> str:
 
 def _load_batch_files(repo: Path, batch_file: Path) -> list[str]:
     obj = json.loads(batch_file.read_text(encoding="utf-8"))
-    return [f["file"] for f in obj.get("files", [])]
+    files: list[str] = []
+    for index, item in enumerate(obj.get("files", [])):
+        if not isinstance(item, dict):
+            raise ValueError(f"batch files[{index}] 必须是对象")
+        raw = item.get("file")
+        if not isinstance(raw, str) or Path(raw).is_absolute():
+            raise ValueError(f"batch files[{index}].file 必须是仓库相对路径")
+        resolved = (repo / raw).resolve()
+        try:
+            rel = resolved.relative_to(repo.resolve()).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"batch files[{index}].file 越出仓库: {raw}") from exc
+        if not resolved.is_file():
+            raise ValueError(f"batch files[{index}].file 不存在: {rel}")
+        files.append(rel)
+    return files
 
 
 def _load_batch_risk(repo: Path, batch_file: Path) -> dict[str, int]:
@@ -678,7 +706,7 @@ def _load_batch_risk(repo: Path, batch_file: Path) -> dict[str, int]:
 def _load_batch_relations(batch_file: Path) -> list[dict[str, Any]]:
     obj = json.loads(batch_file.read_text(encoding="utf-8"))
     relations = obj.get("relation_edges", []) + obj.get("boundary_relations", [])
-    return [edge for edge in relations if isinstance(edge, dict)][:120]
+    return [edge for edge in relations if isinstance(edge, dict)]
 
 
 def _load_scope_files(repo: Path, scope_file: Path) -> list[str]:
@@ -686,8 +714,31 @@ def _load_scope_files(repo: Path, scope_file: Path) -> list[str]:
     for ln in scope_file.read_text(encoding="utf-8").splitlines():
         rel = ln.strip().replace("\\", "/")
         if rel and not rel.startswith("#"):
-            out.append(rel)
+            if Path(rel).is_absolute():
+                raise ValueError(f"scope file 必须是仓库相对路径: {rel}")
+            resolved = (repo / rel).resolve()
+            try:
+                normalized = resolved.relative_to(repo.resolve()).as_posix()
+            except ValueError as exc:
+                raise ValueError(f"scope file 越出仓库: {rel}") from exc
+            if not resolved.is_file():
+                raise ValueError(f"scope file 不存在: {normalized}")
+            out.append(normalized)
     return out
+
+
+def _display_repo_path(repo: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def _mark_unsupported_navigation_files(repo_map: RepoMap, files: list[str]) -> None:
+    """Account for source languages the current semantic map cannot index."""
+    for rel in files:
+        if Path(rel).suffix.lower() in _UNSUPPORTED_NAV_SOURCE_EXTENSIONS:
+            repo_map._files_not_indexed.setdefault(rel, "unsupported-navigation-language")
 
 
 def _maybe_reexec() -> None:
@@ -711,37 +762,71 @@ def main() -> int:
     ap.add_argument("--symbol", default="")
     ap.add_argument("--scope-files", default="")
     ap.add_argument("--batch-file", default="")
-    ap.add_argument("--budget", type=int, default=8000, help="地图 token 预算（char/4 估算）")
+    ap.add_argument(
+        "--budget", type=int, default=DEFAULT_MAP_TOKEN_BUDGET,
+        help="地图 token 预算（char/4 估算）",
+    )
     ap.add_argument("--depth", type=int, default=6)
     ap.add_argument("--out", default="", help="map：写入的 .md 路径（缺省打到 stdout）")
     args = ap.parse_args()
 
     _maybe_reexec()
     repo = Path(args.repo).resolve()
+    try:
+        batch_path = (
+            resolve_cli_path(repo, args.batch_file, label="repo-map batch")
+            if args.batch_file else None
+        )
+        scope_path = (
+            resolve_cli_path(repo, args.scope_files, label="repo-map scope")
+            if args.scope_files else None
+        )
+        output_path = (
+            resolve_cli_path(repo, args.out, label="repo-map output")
+            if args.out else None
+        )
+    except ValueError as exc:
+        _log(str(exc))
+        return 1
 
     # ── map 动作 ──
     if args.action == "map":
         if not _ts_available():
-            files = (_load_batch_files(repo, Path(args.batch_file)) if args.batch_file
-                     else _load_scope_files(repo, Path(args.scope_files)) if args.scope_files else [])
+            files = (_load_batch_files(repo, batch_path) if batch_path
+                     else _load_scope_files(repo, scope_path) if scope_path else [])
             md = _degraded_map_from_source(str(repo), files)
         else:
             rm = RepoMap(repo)
-            if args.batch_file:
-                md = rm.focused_map(_load_batch_files(repo, Path(args.batch_file)), args.budget,
-                                    risk_by_file=_load_batch_risk(repo, Path(args.batch_file)),
-                                    structural_relations=_load_batch_relations(Path(args.batch_file)))
-            elif args.scope_files:
+            if batch_path:
+                batch_files = _load_batch_files(repo, batch_path)
+                md = rm.focused_map(batch_files, args.budget,
+                                    risk_by_file=_load_batch_risk(repo, batch_path),
+                                    structural_relations=_load_batch_relations(batch_path))
+                _mark_unsupported_navigation_files(rm, batch_files)
+            elif scope_path:
                 # 全局地图仍先建全量索引，再仅渲染 scope 内文件权重最高者
                 md = rm.global_map(args.budget)
             else:
                 _log("map 需 --batch-file 或 --scope-files")
                 return 1
-        if args.out:
-            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-            Path(args.out).write_text(md + "\n", encoding="utf-8")
-            print(json.dumps({"out": args.out, "backend": "treesitter" if _ts_available() else "source-degraded"},
-                             ensure_ascii=False))
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(md + "\n", encoding="utf-8")
+            backend = "treesitter" if _ts_available() else "source-degraded"
+            meta_path = output_path.with_suffix(".meta.json")
+            meta = {
+                "schema_version": 2,
+                "backend": backend,
+                "degraded": backend != "treesitter",
+                "files_not_indexed": getattr(locals().get("rm"), "_files_not_indexed", {}),
+                "map_truncated": "截断" in md or "已用尽" in md,
+                "batch_file": _display_repo_path(repo, batch_path) if batch_path else None,
+                "batch_sha256": hashlib.sha256(batch_path.read_bytes()).hexdigest() if batch_path and batch_path.is_file() else None,
+                "map_file": _display_repo_path(repo, output_path),
+                "map_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps({"out": args.out, "meta": str(meta_path), "backend": backend}, ensure_ascii=False))
         else:
             print(md)
         return 0

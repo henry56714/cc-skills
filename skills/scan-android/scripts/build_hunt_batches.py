@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from relation_graph import build_relation_graph, cluster_items, edges_for_batch  # noqa: E402
+from lib_scan import resolve_repo_path  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -71,25 +72,43 @@ TECH_MARKERS = {
     ),
     "ipc_aidl": re.compile(
         r"\.Stub\b|extends\s+\w+\.Stub|\bIInterface\b|"
-        r"\bonTransact\b|\bMessenger\b|\.aidl\b"
+        r"\bonTransact\b|\bMessenger\b|\.aidl\b|JNIEXPORT|RegisterNatives"
+    ),
+    "platform_surface": re.compile(
+        r"PendingIntent\.(?:getActivity|getBroadcast|getService|getForegroundService)|"
+        r"\bregisterReceiver\s*\(|RECEIVER_(?:EXPORTED|NOT_EXPORTED)|"
+        r"BroadcastReceiver|Notification(?:Manager|Compat)|RemoteViews|AppWidget|"
+        r"\bstartActivity\s*\(|ActivityOptions|MODE_BACKGROUND_ACTIVITY_START|"
+        r"taskAffinity|launchMode"
     ),
     "content_provider": re.compile(r"ContentProvider|ContentResolver|content://|UriMatcher"),
     "long_conn": re.compile(r"\bSocket\b|WebSocket|OkHttpClient|\bMqtt|\bXMPP\b|EventSource"),
     "database": re.compile(r"SQLiteOpenHelper|rawQuery|execSQL|@Dao\b|RoomDatabase|ContentValues|SQLiteDatabase"),
-    "native": re.compile(r"System\.loadLibrary|System\.load\b|DexClassLoader|InMemoryDexClassLoader|\bJNI\b"),
+    "native": re.compile(
+        r"System\.loadLibrary|System\.load\b|DexClassLoader|InMemoryDexClassLoader|"
+        r"\bJNI(?:EXPORT|Env)?\b|RegisterNatives|#\s*include\s*[<\"]jni\.h[>\"]|"
+        r"\b(?:external|native)\s+fun\b|\bstd::"
+    ),
     "crypto": re.compile(r"\bCipher\b|MessageDigest|KeyStore|SecretKey|\bIvParameterSpec\b"),
     "concurrency": re.compile(r"\bsynchronized\b|\bvolatile\b|Atomic[A-Z]\w+|ExecutorService|\bThread\b|CoroutineScope|runBlocking|GlobalScope"),
     "reflection": re.compile(r"Class\.forName|getDeclaredMethod|getMethod\s*\(|\.invoke\s*\(|getDeclaredField"),
     "exported": re.compile(r'android:exported\s*=\s*"true"'),
     "storage_privacy": re.compile(r"SharedPreferences|DataStore|ClipboardManager|MediaStore|FileProvider|FLAG_SECURE"),
-    "network": re.compile(r"Retrofit|OkHttpClient|HttpURLConnection|networkSecurityConfig|CertificatePinner"),
+    "network": re.compile(
+        r"Retrofit|OkHttpClient|HttpURLConnection|networkSecurityConfig|CertificatePinner|"
+        r"NsdManager|MulticastSocket|DatagramSocket|WifiAwareManager"
+    ),
     "work_background": re.compile(r"WorkManager|Worker\b|JobScheduler|ForegroundService|startForeground|AlarmManager"),
     "room": re.compile(r"@Database\b|@Dao\b|RoomDatabase|@Transaction\b|Migration\b"),
     "compose": re.compile(r"@Composable\b|rememberSaveable|LaunchedEffect|collectAsStateWithLifecycle"),
     "deeplink": re.compile(r"autoVerify|intent-filter|ACTION_VIEW|getDataString|getQueryParameter"),
     "permissions": re.compile(
         r"<uses-permission|requestPermissions|checkSelfPermission|AppOpsManager|"
-        r"ACCESS_(?:FINE|COARSE|BACKGROUND)_LOCATION|NEARBY_WIFI_DEVICES|POST_NOTIFICATIONS"
+        r"ACCESS_(?:FINE|COARSE|BACKGROUND)_LOCATION|NEARBY_WIFI_DEVICES|POST_NOTIFICATIONS|"
+        r"ACCESS_LOCAL_NETWORK|NsdManager|MulticastSocket|WifiAwareManager|"
+        r"BluetoothManager|WifiManager|MediaProjectionManager|HealthConnectClient|"
+        r"android\.permission\.health|"
+        r"READ_MEDIA_(?:IMAGES|VIDEO|AUDIO)|READ_HEALTH_DATA_IN_BACKGROUND"
     ),
     "hidden_api": re.compile(
         r"getDeclaredField|getDeclaredMethod|setAccessible\s*\(\s*true|dalvik\.system|VMRuntime"
@@ -107,6 +126,27 @@ TECH_MARKERS = {
     ),
     "state_snapshot": re.compile(
         r"System\.currentTimeMillis|elapsedRealtime|synchronized|volatile|Atomic|snapshot|generation"
+    ),
+    "serialization": re.compile(
+        r"ObjectInputStream|readObject\s*\(|getSerializableExtra|Parcelable|Parcelize|"
+        r"Gson|Moshi|kotlinx\.serialization|Json\.decodeFromString"
+    ),
+    "logic_state_machine": re.compile(
+        r"enum\s+class\s+\w*(?:State|Status)|sealed\s+(?:class|interface)\s+\w*(?:State|Status)|"
+        r"\b(?:state|status|phase|generation)\b|onSuccess|onFailure|compareAndSet"
+    ),
+    "logic_identity": re.compile(
+        r"\b(?:accountId|userId|tenantId|profileId|sessionId|currentUser|switchAccount)\b"
+    ),
+    "logic_numeric": re.compile(
+        r"\b(?:BigDecimal|amount|price|balance|quota|limit|remaining|currency|roundingMode)\b"
+    ),
+    "logic_pagination": re.compile(
+        r"\b(?:pageToken|nextToken|nextCursor|cursor|offset|hasMore|loadMore|dedup)\b"
+    ),
+    "logic_temporal": re.compile(
+        r"\b(?:Instant|LocalDate|ZonedDateTime|Calendar|TimeZone|expiresAt|ttl|deadline)\b|"
+        r"currentTimeMillis|elapsedRealtime"
     ),
 }
 
@@ -132,7 +172,8 @@ RISK_SIGNALS = [
     (re.compile(r"\bWebView\b"), 1),
 ]
 
-_MAX_READ_BYTES = 400_000  # 单文件读取上限，避免极大文件拖慢扫描
+_MARKER_CHUNK_CHARS = 256_000
+_MARKER_OVERLAP_CHARS = 4_096
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -143,6 +184,10 @@ _MAX_READ_BYTES = 400_000  # 单文件读取上限，避免极大文件拖慢扫
 # ──────────────────────────────────────────────────────────────────────────────
 PERSPECTIVES: list[tuple[str, str | None]] = [
     ("auth_dataflow", None),
+    # Business invariants are often expressed without distinctive API names.
+    # Keep this perspective unconditional so a marker miss cannot suppress the
+    # state/identity/numeric/pagination/time review requested by the user.
+    ("business_logic", None),
     ("platform_ipc", "platform_ipc"),
     ("permissions_platform", "permissions_platform"),
     ("lifecycle_concurrency", None),
@@ -162,20 +207,21 @@ PERSPECTIVES: list[tuple[str, str | None]] = [
 # Every batch carries a deterministic case checklist.  Hunter receipts must
 # cover these ids, so "perspective covered" is no longer a single coarse flag.
 PERSPECTIVE_CASES: dict[str, tuple[str, ...]] = {
-    "auth_dataflow": ("R-AI-001", "R-AI-002", "R-AI-003", "R-AI-004", "R-AI-012", "R-AI-013"),
-    "platform_ipc": ("R-AI-026", "R-AI-027", "R-AI-028", "R-AI-029", "R-AI-030", "R-AI-044", "R-AI-047", "R-AI-049", "R-AI-060"),
-    "permissions_platform": ("R-AI-046", "R-AI-051", "R-AI-052"),
+    "auth_dataflow": ("R-AI-001", "R-AI-002", "R-AI-003", "R-AI-004", "R-AI-012", "R-AI-013", "R-AI-068", "R-AI-069"),
+    "business_logic": tuple(f"R-AI-{n:03d}" for n in range(67, 73)),
+    "platform_ipc": ("R-AI-026", "R-AI-027", "R-AI-028", "R-AI-029", "R-AI-030", "R-AI-044", "R-AI-047", "R-AI-049", "R-AI-060", "R-AI-063", "R-AI-066"),
+    "permissions_platform": ("R-AI-046", "R-AI-051", "R-AI-052", "R-AI-061", "R-AI-062", "R-AI-065"),
     "lifecycle_concurrency": ("R-AI-005", "R-AI-006", "R-AI-007", "R-AI-008", "R-AI-014", "R-AI-015", "R-AI-016", "R-AI-017", "R-AI-039", "R-AI-040"),
-    "state_consistency": ("R-AI-054", "R-AI-056", "R-AI-057"),
-    "failure_reliability": ("R-AI-041", "R-AI-043", "R-AI-055"),
+    "state_consistency": ("R-AI-054", "R-AI-056", "R-AI-057", "R-AI-067", "R-AI-070", "R-AI-071", "R-AI-072"),
+    "failure_reliability": ("R-AI-041", "R-AI-043", "R-AI-055", "R-AI-061", "R-AI-067", "R-AI-070"),
     "storage_privacy": ("R-AI-031", "R-AI-032", "R-AI-035", "R-AI-036"),
     "privacy_consent": ("R-AI-046", "R-AI-059"),
-    "network_crypto": ("R-AI-003", "R-AI-033", "R-AI-034", "R-AI-050", "R-AI-058"),
+    "network_crypto": ("R-AI-003", "R-AI-033", "R-AI-034", "R-AI-050", "R-AI-058", "R-AI-062"),
     "performance": ("R-AI-009", "R-AI-010", "R-AI-011"),
     "modern_runtime": ("R-AI-041", "R-AI-042", "R-AI-043", "R-AI-045"),
     "webview": tuple(f"R-AI-{n:03d}" for n in range(18, 26)) + ("R-AI-048",),
-    "native_dependency": ("R-AI-037", "R-AI-038", "R-AI-058"),
-    "sdk_integration": ("R-AI-038", "R-AI-053", "R-AI-054"),
+    "native_dependency": ("R-AI-037", "R-AI-038", "R-AI-058", "R-AI-064"),
+    "sdk_integration": ("R-AI-038", "R-AI-053", "R-AI-054", "R-AI-061", "R-AI-064"),
     "free": (),
 }
 
@@ -183,9 +229,9 @@ PERSPECTIVE_CASES: dict[str, tuple[str, ...]] = {
 def _expected_perspectives(tech_present: list[str]) -> list[str]:
     tp = set(tech_present)
     capability_gates = {
-        "platform_ipc": {"ipc_aidl", "content_provider", "exported", "deeplink"},
+        "platform_ipc": {"ipc_aidl", "content_provider", "exported", "deeplink", "platform_surface"},
         "permissions_platform": {"permissions", "hidden_api"},
-        "storage_privacy": {"storage_privacy", "content_provider"},
+        "storage_privacy": {"storage_privacy", "content_provider", "serialization"},
         "privacy_consent": {"privacy_identity", "permissions"},
         "network_crypto": {"network", "crypto", "long_conn"},
         "modern_runtime": {"compose", "room", "work_background"},
@@ -202,15 +248,6 @@ def _expected_perspectives(tech_present: list[str]) -> list[str]:
 
 def _is_generated(rel: str) -> bool:
     return any(rx.search(rel) for rx in _GENERATED_RES)
-
-
-def _read_text(path: Path) -> tuple[str, bool] | None:
-    try:
-        size = path.stat().st_size
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            return f.read(_MAX_READ_BYTES), size > _MAX_READ_BYTES
-    except OSError:
-        return None
 
 
 def _snapshot(path: Path) -> tuple[str, int]:
@@ -230,15 +267,62 @@ def _snapshot(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), line_count
 
 
-def _analyze(text: str) -> tuple[int, list[str], int]:
+def _path_tech(rel: str) -> set[str]:
+    path = Path(rel)
+    suffix = path.suffix.lower()
+    result: set[str] = set()
+    if suffix in {".c", ".cc", ".cpp", ".h", ".hpp", ".rs"}:
+        result.add("native")
+    if path.name in {"CMakeLists.txt", "Android.mk", "Application.mk", "Android.bp"}:
+        result.update({"native", "sdk_library"})
+    if path.name == "AndroidManifest.xml":
+        result.add("platform_surface")
+    if suffix in {".gradle", ".kts", ".pro"} or path.name.startswith("build.gradle"):
+        result.add("sdk_library")
+    return result
+
+
+def _analyze(text: str, rel: str = "") -> tuple[int, list[str], int]:
     """返回 (risk_score, tech_list, estimated_tokens)。"""
     risk = sum(w for rx, w in RISK_SIGNALS if rx.search(text))
     if text.count("\n") > 600:
         risk += 1
-    tech = [name for name, rx in TECH_MARKERS.items() if rx.search(text)]
+    tech = {name for name, rx in TECH_MARKERS.items() if rx.search(text)}
+    tech.update(_path_tech(rel))
     # Prompt overhead and code fences make char/4 optimistic; char/3 is safer.
     estimated_tokens = max(64, (len(text) + 2) // 3)
-    return risk, tech, estimated_tokens
+    return risk, sorted(tech), estimated_tokens
+
+
+def _analyze_file(path: Path, rel: str) -> tuple[int, list[str], int] | None:
+    """Scan markers across the full file without loading an unbounded file at once."""
+    risk_hits: set[int] = set()
+    tech_hits = _path_tech(rel)
+    char_count = 0
+    newline_count = 0
+    overlap = ""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            while True:
+                chunk = stream.read(_MARKER_CHUNK_CHARS)
+                if not chunk:
+                    break
+                char_count += len(chunk)
+                newline_count += chunk.count("\n")
+                window = overlap + chunk
+                for index, (rx, _weight) in enumerate(RISK_SIGNALS):
+                    if index not in risk_hits and rx.search(window):
+                        risk_hits.add(index)
+                for name, rx in TECH_MARKERS.items():
+                    if name not in tech_hits and rx.search(window):
+                        tech_hits.add(name)
+                overlap = window[-_MARKER_OVERLAP_CHARS:]
+    except OSError:
+        return None
+    risk = sum(RISK_SIGNALS[index][1] for index in risk_hits)
+    if newline_count > 600:
+        risk += 1
+    return risk, sorted(tech_hits), max(64, (char_count + 2) // 3)
 
 
 def _read_scope(scope_path: Path, repo_root: Path) -> list[str]:
@@ -265,11 +349,25 @@ def _read_scope(scope_path: Path, repo_root: Path) -> list[str]:
     return out
 
 
+def _repo_rel(repo_root: Path, path: Path) -> str:
+    return path.resolve().relative_to(repo_root.resolve()).as_posix()
+
+
+def _input_receipt(repo_root: Path, path: Path) -> dict:
+    return {
+        "file": _repo_rel(repo_root, path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
 def build_batches(
     repo_root: Path, scope_path: Path, out_dir: Path, batch_size: int,
     token_budget: int = 24_000,
+    context_path: Path | None = None,
 ) -> dict:
     inputs = _read_scope(scope_path, repo_root)
+    context_path = context_path or (repo_root / ".scan" / "tmp" / "context_scope.txt")
+    context_files = _read_scope(context_path, repo_root) if context_path.is_file() else []
 
     generated: list[str] = []
     missing: list[str] = []
@@ -283,21 +381,18 @@ def build_batches(
         if not p.is_file():
             missing.append(rel)
             continue
-        read_result = _read_text(p)
-        if read_result is None:
+        analysis = _analyze_file(p, rel)
+        if analysis is None:
             missing.append(rel)
             continue
-        text, content_truncated = read_result
-        risk, tech, _ = _analyze(text)
+        risk, tech, estimated_tokens = analysis
         sha256, line_count = _snapshot(p)
-        # Batch sizing uses full byte size even though marker analysis is capped.
-        estimated_tokens = max(64, (p.stat().st_size + 2) // 3)
         analyzed.append({
             "file": rel,
             "risk_score": risk,
             "tech": tech,
             "estimated_tokens": estimated_tokens,
-            "marker_scan_truncated": content_truncated,
+            "marker_scan_truncated": False,
             "sha256": sha256,
             "line_count": line_count,
         })
@@ -309,10 +404,17 @@ def build_batches(
     out_dir.mkdir(parents=True, exist_ok=True)
     for stale in out_dir.glob("hunt_batch_*.json"):
         stale.unlink()
-    for pattern in ("hunt_result_*.json", "hunt_attest_*.json", "repo_map_*.md"):
+    for pattern in (
+        "hunt_result_*.json", "hunt_attest_*.json", "repo_map_*.md",
+        "repo_map_*.meta.json", "gap_audit_batch_*.json", "gap_prior_*.json",
+        "hunt_gap_result_*.json",
+    ):
         for stale in out_dir.glob(pattern):
             stale.unlink()
-    for stale_name in ("hunt_perspective_coverage.json", "relation_graph.json"):
+    for stale_name in (
+        "hunt_perspective_coverage.json", "relation_graph.json",
+        "gap_audit_plan.json", "gap_audit_coverage.json",
+    ):
         stale = out_dir / stale_name
         if stale.exists():
             stale.unlink()
@@ -356,10 +458,14 @@ def build_batches(
             "files": chunk,
             "relation_edges": internal_edges,
             "boundary_relations": boundary_edges,
+            # Tests/specs/docs are optional read-only clues for deriving business
+            # invariants.  They are never part of finding/file coverage scope.
+            "context_scope_path": _repo_rel(repo_root, context_path) if context_files else None,
+            "context_file_count": len(context_files),
         }
         bf = out_dir / f"hunt_batch_{idx}.json"
         bf.write_text(json.dumps(batch_obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        batch_files.append(str(bf))
+        batch_files.append(_repo_rel(repo_root, bf))
         batches_detail.append({
             "batch": idx,
             "file_count": len(chunk),
@@ -377,13 +483,31 @@ def build_batches(
     # ── 覆盖率断言：每个「存在且非生成」的文件必须恰好进一个批次 ──
     expected = {d["file"] for d in analyzed}
     uncovered = sorted(expected - batched_set)
-    coverage_ok = not uncovered and not missing
+    graph_gaps = list(relation_graph.get("stats", {}).get("files_not_fully_indexed", []))
+    oversized_batches = [
+        detail["batch"] for detail in batches_detail
+        if int(detail["estimated_tokens"]) > token_budget
+    ]
+    analysis_gaps: list[dict] = []
+    if graph_gaps:
+        analysis_gaps.append({
+            "kind": "relation_graph_not_fully_indexed",
+            "files": graph_gaps,
+            "remediation": "拆分/缩小超大源文件，或提升关系索引能力后重跑",
+        })
+    if oversized_batches:
+        analysis_gaps.append({
+            "kind": "batch_token_budget_exceeded",
+            "batches": oversized_batches,
+            "remediation": "提高 --token-budget 或先拆分超大文件；不得把超限批次宣称为已完整通读",
+        })
+    coverage_ok = not uncovered and not missing and not analysis_gaps
 
     tech_present_all = sorted({t for d in analyzed for t in d["tech"]})
     marker_scan_truncated = sorted(d["file"] for d in analyzed if d["marker_scan_truncated"])
 
     coverage = {
-        "schema_version": 2,
+        "schema_version": 3,
         "total_input": len(inputs),
         "analyzed": len(analyzed),
         "batched": len(batched_set),
@@ -395,12 +519,20 @@ def build_batches(
         "batch_size": batch_size,
         "token_budget": token_budget,
         "batching_strategy": "relation-clustered",
-        "relation_graph_path": str(out_dir / "relation_graph.json"),
+        "relation_graph_path": _repo_rel(repo_root, out_dir / "relation_graph.json"),
+        "map_receipts_required": True,
         "relation_graph_stats": relation_graph.get("stats", {}),
         "tech_present": tech_present_all,
         "marker_scan_truncated": marker_scan_truncated,
+        "analysis_gaps": analysis_gaps,
         "batch_files": batch_files,
         "batches_detail": batches_detail,
+        "scope_receipt": _input_receipt(repo_root, scope_path),
+        "context_scope_receipt": (
+            _input_receipt(repo_root, context_path) if context_path.is_file() else None
+        ),
+        "context_scope_path": _repo_rel(repo_root, context_path) if context_files else None,
+        "context_files": len(context_files),
     }
     (out_dir / "hunt_coverage.json").write_text(
         json.dumps(coverage, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -422,6 +554,10 @@ def main() -> int:
         help="批次与覆盖率清单输出目录（默认 .scan/tmp）",
     )
     ap.add_argument(
+        "--context-files", default=".scan/tmp/context_scope.txt",
+        help="只读逻辑上下文清单（测试/规格/文档）；不进入 finding 作用域",
+    )
+    ap.add_argument(
         "--batch-size", type=int, default=10,
         help="每批文件数上限（默认 10；hunter 子代理逐文件通读）",
     )
@@ -432,12 +568,13 @@ def main() -> int:
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
-    scope_path = Path(args.scope_files)
-    if not scope_path.is_absolute():
-        scope_path = repo_root / scope_path
-    out_dir = Path(args.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = repo_root / out_dir
+    try:
+        scope_path = resolve_repo_path(repo_root, args.scope_files, label="hunt scope")
+        out_dir = resolve_repo_path(repo_root, args.out_dir, label="hunt output directory")
+        context_path = resolve_repo_path(repo_root, args.context_files, label="context scope")
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        return 1
 
     if args.batch_size < 1:
         print(json.dumps({"error": "batch-size 必须 >= 1"}, ensure_ascii=False))
@@ -453,7 +590,10 @@ def main() -> int:
         return 1
 
     try:
-        cov = build_batches(repo_root, scope_path, out_dir, args.batch_size, args.token_budget)
+        cov = build_batches(
+            repo_root, scope_path, out_dir, args.batch_size, args.token_budget,
+            context_path=context_path,
+        )
     except (OSError, ValueError) as exc:
         print(json.dumps({"error": str(exc), "coverage_ok": False}, ensure_ascii=False))
         return 1

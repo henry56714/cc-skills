@@ -13,7 +13,8 @@
 
 --engines:
     auto（默认）= 运行所有"可用"的已注册引擎
-    CSV         = 仅运行指定引擎（如 regex,semgrep），不可用的会被跳过并记录原因
+    CSV         = 仅运行指定引擎（如 semgrep,pmd）；未选和不可用的引擎
+                  都会显式记为覆盖缺口，不会伪装成 complete
 
 引擎缺失、超时或执行失败会记录为 incomplete，不丢弃其他引擎已经产出的候选。
 Lint 会执行目标仓库的 Gradle 逻辑，默认禁用，只有显式授权后才运行。
@@ -35,6 +36,7 @@ engine_stats 逐引擎给出本次"命中规则种类数"与"产出候选数"，
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -46,7 +48,9 @@ from adapters.detekt_adapter import DetektAdapter
 from adapters.pmd_adapter import PMDAdapter
 from adapters.lint_adapter import LintAdapter
 from detect_project import detect_project
-from lib_scan import atomic_write_json
+from lib_scan import (
+    atomic_write_json, effective_excluded_engines, resolve_cli_path,
+)
 
 # 已注册引擎，按"广度→深度"优先级排列。规则全部来自社区库/引擎自带。
 # - P1: semgrep（社区 registry + 本地补充，含 taint 模式）、detekt（Kotlin）、pmd（Java）、lint（Android）
@@ -79,20 +83,37 @@ def main() -> int:
         help="允许执行仓库的 Gradle/Lint 构建逻辑；仅对可信仓库使用",
     )
     ap.add_argument(
+        "--allow-network-rules", action="store_true",
+        help="允许 Semgrep 联网获取固定 registry 规则包；受信配置只能选择 pack，不能授权联网",
+    )
+    ap.add_argument(
+        "--trust-project-config", action="store_true",
+        help="允许已审阅的仓库配置改变引擎/任务策略；不授予构建或联网能力",
+    )
+    ap.add_argument(
         "--install-missing", action="store_true",
         help="显式允许联网并将缺失引擎安装到 ~/.scan-android",
     )
     args = ap.parse_args()
 
     repo = Path(args.repo_root).resolve()
+    safe_output: str | None = None
     try:
-        scope_files = _read_scope(args.scope_files, repo)
+        resolve_cli_path(repo, ".scan/tmp", label="scan working directory")
+        scope_path = resolve_cli_path(repo, args.scope_files, label="scope file")
+        if args.output:
+            safe_output = str(resolve_cli_path(repo, args.output, label="engine output"))
+            args.output = safe_output
+        scope_files = _read_scope(str(scope_path), repo)
+        scope_snapshot_before = _scope_snapshot(repo, scope_files)
     except (OSError, ValueError) as exc:
-        _emit({"status": "incomplete", "scan_complete": False, "error": str(exc)}, args.output)
+        _emit({"status": "incomplete", "scan_complete": False, "error": str(exc)}, safe_output)
         return 2
 
-    excluded, config = _load_engine_config(repo)
-    detect_info = detect_project(repo)
+    _, declared_config = _load_engine_config(repo)
+    config = declared_config if args.trust_project_config else {}
+    excluded = effective_excluded_engines(config)
+    detect_info = detect_project(repo, trust_project_config=args.trust_project_config)
     ctx = ScanContext(
         repo=repo,
         scope_files=scope_files,
@@ -100,7 +121,11 @@ def main() -> int:
         max_per_rule=args.max_per_rule,
         detect_info=detect_info,
         excluded_engines=excluded,
-        allow_build_execution=args.allow_build_execution or config.get("allow_gradle_execution", False) is True,
+        # These are invocation capabilities.  Never allow untrusted repository
+        # configuration to grant execution or network access to itself.
+        allow_build_execution=args.allow_build_execution,
+        allow_network_rules=args.allow_network_rules,
+        trust_project_config=args.trust_project_config,
         allow_installation=args.install_missing,
     )
     _invalidate_downstream(repo)
@@ -121,19 +146,48 @@ def main() -> int:
         }, args.output)
         return 2
     selected = _select_engines(args.engines)
+    selected_names = {adapter.name for adapter in selected}
 
     engines_used: list[str] = []
     engines_skipped: list[dict] = []
     engine_stats: list[dict] = []
     all_candidates: list[dict] = []
     all_notes: list[dict] = []
-    if config.get("__config_error__"):
+    if declared_config.get("__config_error__"):
         all_notes.append({
             "engine": "config",
-            "note": f"配置无效，已使用安全默认值: {config['__config_error__']}",
+            "note": f"配置无效，已使用安全默认值: {declared_config['__config_error__']}",
+        })
+    if declared_config and not args.trust_project_config and not declared_config.get("__config_error__"):
+        all_notes.append({
+            "engine": "config",
+            "note": "目标仓库扫描策略默认不受信任，已忽略 excluded_engines/extra_excludes/lint_tasks 等配置",
+        })
+    if declared_config.get("allow_gradle_execution") is True and not args.allow_build_execution:
+        all_notes.append({
+            "engine": "config",
+            "note": "忽略仓库 config.allow_gradle_execution；仅命令行 --allow-build-execution 可授权执行目标仓库代码",
+        })
+    if declared_config.get("semgrep_use_registry") is True and not args.allow_network_rules:
+        all_notes.append({
+            "engine": "config",
+            "note": "仓库请求了 Semgrep registry，但未获调用方 --allow-network-rules 授权；保持离线本地规则模式",
         })
     rules_run = 0
     rules_total = 0
+
+    for engine, reason in _unselected_engine_gaps(selected_names, set(excluded)):
+        engines_skipped.append({"engine": engine, "reason": reason})
+        engine_stats.append({
+            "engine": engine,
+            "status": "skipped",
+            "rules_run": 0,
+            "rules_triggered": 0,
+            "rules_configured": None,
+            "candidates": 0,
+            "truncated": 0,
+            "reason": reason,
+        })
 
     for adapter in selected:
         if adapter.name in ctx.excluded_engines:
@@ -180,6 +234,13 @@ def main() -> int:
                                  "candidates": 0, "truncated": 0, "reason": reason})
             all_notes.append({"engine": adapter.name, "note": reason})
             continue
+        if res.status not in {"complete", "partial", "failed", "skipped", "not_applicable"}:
+            invalid_status = res.status
+            res.status = "failed"
+            res.notes.append({
+                "engine": adapter.name,
+                "note": f"引擎返回未知状态 {invalid_status!r}；已按 failed 处理",
+            })
         raw_candidate_count = len(res.candidates)
         res.candidates = _dedupe_candidates(res.candidates)
         if len(res.candidates) != raw_candidate_count:
@@ -224,6 +285,32 @@ def main() -> int:
         # 各引擎规则命名空间彼此独立，汇总应求和；取最大值会低报覆盖量。
         rules_total += res.rules_total
 
+    scope_snapshot_error = ""
+    try:
+        scope_snapshot_after = _scope_snapshot(repo, scope_files)
+    except OSError as exc:
+        scope_snapshot_after = []
+        scope_snapshot_error = str(exc)
+    scope_changed = bool(scope_snapshot_error) or scope_snapshot_before != scope_snapshot_after
+    if scope_changed:
+        engine_stats.append({
+            "engine": "scope_integrity",
+            "status": "failed",
+            "rules_run": 0,
+            "rules_triggered": 0,
+            "rules_configured": 0,
+            "candidates": 0,
+            "truncated": 0,
+            "reason": (
+                "作用域源码在工具引擎运行期间发生变化；结果不能绑定到单一版本"
+                + (f": {scope_snapshot_error}" if scope_snapshot_error else "")
+            ),
+        })
+        all_notes.append({
+            "engine": "scope_integrity",
+            "note": "作用域源码在工具引擎运行期间发生变化；请停止写入后重跑",
+        })
+
     incomplete = sorted(
         str(s.get("engine")) for s in engine_stats
         if s.get("status") in ("partial", "failed")
@@ -246,6 +333,20 @@ def main() -> int:
         "rules_run": rules_run,
         "rules_total": rules_total,
         "candidates": all_candidates,
+        "scope_snapshot": scope_snapshot_before,
+        "scope_changed_during_scan": scope_changed,
+        "config_fingerprint": hashlib.sha256(
+            json.dumps(
+                detect_info.get("config", {}), sort_keys=True, ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "config_trusted": bool(detect_info.get("config_trusted")),
+        "effective_excluded_engines": excluded,
+        "invocation_capabilities": {
+            "build_execution": bool(args.allow_build_execution),
+            "network_rules": bool(args.allow_network_rules),
+            "install_missing": bool(args.install_missing),
+        },
     }
     if all_notes:
         out["notes"] = all_notes
@@ -275,13 +376,33 @@ def _invalidate_downstream(repo: Path) -> None:
 def _select_engines(spec: str) -> list[EngineAdapter]:
     if spec.strip().lower() == "auto":
         return list(_REGISTRY)
-    wanted = [s.strip() for s in spec.split(",") if s.strip()]
+    # Preserve caller order but do not run an adapter twice when a CSV repeats
+    # a name.  Duplicate stats would make the scanner reject its own artifact.
+    wanted = list(dict.fromkeys(s.strip() for s in spec.split(",") if s.strip()))
     by_name = {a.name: a for a in _REGISTRY}
     return [by_name[n] for n in wanted if n in by_name]
 
 
+def _unselected_engine_gaps(
+    selected_names: set[str], excluded_names: set[str],
+) -> list[tuple[str, str]]:
+    gaps: list[tuple[str, str]] = []
+    for adapter in _REGISTRY:
+        if adapter.name in selected_names:
+            continue
+        reason = (
+            "excluded_engines 配置排除"
+            if adapter.name in excluded_names
+            else "未被本次 --engines 选择"
+        )
+        gaps.append((adapter.name, reason))
+    return gaps
+
+
 def _overall_status(engine_stats: list[dict]) -> str:
     statuses = {str(stat.get("status", "complete")) for stat in engine_stats}
+    if statuses - {"complete", "partial", "failed", "skipped", "not_applicable"}:
+        return "incomplete"
     if statuses & {"partial", "failed"}:
         return "incomplete"
     if "skipped" in statuses:
@@ -343,10 +464,26 @@ def _read_scope(path: str, repo: Path) -> list[str]:
     return result
 
 
+def _scope_snapshot(repo: Path, scope_files: list[str]) -> list[dict]:
+    receipts: list[dict] = []
+    for rel in scope_files:
+        path = repo / rel
+        data = path.read_bytes()
+        receipts.append({
+            "file": rel,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+        })
+    return receipts
+
+
 def _load_engine_config(repo: Path) -> tuple[list[str], dict]:
     """从 .scan/config.json 读取 excluded_engines 与其余配置。"""
     cfg: dict = {}
-    config_path = repo / ".scan" / "config.json"
+    try:
+        config_path = resolve_cli_path(repo, ".scan/config.json", label="scan config")
+    except ValueError as exc:
+        return [], {"__config_error__": str(exc)}
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -358,22 +495,7 @@ def _load_engine_config(repo: Path) -> tuple[list[str], dict]:
         except Exception as exc:
             cfg = {"__config_error__": str(exc)}
 
-    raw_excluded = cfg.get("excluded_engines", [])
-    from_config_excluded = (
-        [str(e).strip() for e in raw_excluded if str(e).strip()]
-        if isinstance(raw_excluded, list) else []
-    )
-
-    def _dedup(items: list[str]) -> list[str]:
-        seen: set[str] = set()
-        result: list[str] = []
-        for e in items:
-            if e not in seen:
-                seen.add(e)
-                result.append(e)
-        return result
-
-    return _dedup(from_config_excluded), cfg
+    return effective_excluded_engines(cfg), cfg
 
 
 if __name__ == "__main__":

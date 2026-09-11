@@ -13,8 +13,9 @@
 - 宿主有 LSP 时优先用 definition/reference/implementation/call hierarchy；否则 tree-sitter/source-nav 降级。任何后端都可能受 Android Variant、生成代码、动态分派或反射影响，不得称为完整语义/精确调用图；verifier 必须逐跳读源码。
 - `relation_graph.py` 只使用源码可证的 Manifest/component、资源、source-set overlay、import、唯一类型和 Gradle module 关系。边必须带 kind/evidence，只用于作用域扩展与聚类，不作为漏洞证据。
 - hunter 覆盖率逐样本核对 result 内的文件 sha256、行数和 Read ranges。回执能验证文件版本与声明的读取范围，不能证明模型理解质量，仍需独立 verifier。
-- hunter 还必须逐样本覆盖批次 `expected_case_ids`；最终渲染必须校验 engine/Hunter/verifier/merge 四段状态并 fail closed。
+- hunter 还必须逐样本覆盖批次 `expected_case_ids`；gap auditor 必须独立覆盖相同源码/视角/case；最终渲染校验 engine/Hunter/gap-audit/verifier/merge 并 fail closed。
 - 工具安装是显式授权行为。preflight 和 adapter 默认都不得联网或写 `~/.scan-android`。
+- `.scan/config.json` 是被审仓库数据，默认忽略。即使调用方显式信任其扫描策略，也不能授权 Gradle、网络规则、工具安装或把 `project_context` 注入代理提示词。
 
 ## 两个根目录
 
@@ -26,10 +27,10 @@
 - Semgrep：本地 Android 规则 + taint，online registry 显式 opt-in。
 - Detekt：Kotlin。
 - PMD：Java。
-- Android Lint：只有 `allow_gradle_execution=true` 或 CLI 显式授权才运行。
+- Android Lint：只有调用方对本次命令显式传 `--allow-build-execution` 才运行，并逐项覆盖 release/shipping 任务；仓库配置不能授权。
 - 导航：宿主 LSP 优先；RepoMap tree-sitter 次之，source-nav 兜底。`Class#method` 按 owner 过滤定义，调用边标注置信度；所有关系都需要源码复核。
 - Android relation graph：关系聚类批次、diff 结构影响扩展和聚焦地图的结构边。
-- AI hunter + 独立 verifier：深层逻辑与跨文件判断。
+- AI hunter + 独立 gap auditor + verifier：第一遍逐 case 狩猎，第二遍先独立通读再挑战 `no_signal/mitigated`，最后对全部候选取证。
 
 ## 规则维护
 

@@ -20,6 +20,15 @@ class HuntBatchTests(unittest.TestCase):
         expected = {case for cases in hb.PERSPECTIVE_CASES.values() for case in cases}
         self.assertTrue(expected <= set(re.findall(r"R-AI-\d{3}", rules)))
 
+    def test_business_logic_cases_are_unconditional(self):
+        perspectives = hb._expected_perspectives([])
+        self.assertIn("business_logic", perspectives)
+        expected = {
+            case for perspective in perspectives
+            for case in hb.PERSPECTIVE_CASES[perspective]
+        }
+        self.assertTrue({f"R-AI-{number:03d}" for number in range(67, 73)} <= expected)
+
     def test_plain_local_binder_does_not_claim_aidl_ipc(self):
         _, tech, _ = hb._analyze(
             "class S : Service() { val b = Binder(); fun onBind(): IBinder = b }"
@@ -92,7 +101,7 @@ class HuntBatchTests(unittest.TestCase):
     def test_optional_perspectives_are_technology_gated(self):
         base = hb._expected_perspectives([])
         self.assertEqual(base, [
-            "auth_dataflow", "lifecycle_concurrency", "failure_reliability",
+            "auth_dataflow", "business_logic", "lifecycle_concurrency", "failure_reliability",
             "performance", "free"
         ])
         network = hb._expected_perspectives(["network"])
@@ -113,7 +122,65 @@ class HuntBatchTests(unittest.TestCase):
 
     def test_all_numbered_ai_cases_are_assigned_to_a_perspective(self):
         mapped = {case for cases in hb.PERSPECTIVE_CASES.values() for case in cases}
-        self.assertEqual(mapped, {f"R-AI-{index:03d}" for index in range(1, 61)})
+        self.assertEqual(mapped, {f"R-AI-{index:03d}" for index in range(1, 73)})
+
+    def test_markers_after_old_400k_boundary_are_not_missed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "Large.kt"
+            source.write_text("x" * 410_000 + "\nWebView(context)\n")
+            scope = repo / "scope.txt"
+            scope.write_text("Large.kt\n")
+            result = hb.build_batches(repo, scope, repo / "out", 1, token_budget=200_000)
+            self.assertTrue(result["coverage_ok"])
+            self.assertIn("webview", result["tech_present"])
+            self.assertEqual(result["marker_scan_truncated"], [])
+
+    def test_android_platform_and_native_markers_route_specialized_cases(self):
+        _, tech, _ = hb._analyze(
+            "PendingIntent.getActivity(ctx, 0, intent, 0); "
+            "registerReceiver(receiver, filter, RECEIVER_EXPORTED); JNIEXPORT void f();",
+            "src/main/cpp/bridge.cpp",
+        )
+        self.assertIn("platform_surface", tech)
+        self.assertIn("native", tech)
+        perspectives = hb._expected_perspectives(tech)
+        self.assertIn("platform_ipc", perspectives)
+        self.assertIn("native_dependency", perspectives)
+
+    def test_new_platform_surfaces_route_android_17_cases(self):
+        _, tech, _ = hb._analyze(
+            "val nsd = NsdManager(); val widget = RemoteViews(pkg, layout); "
+            "context.startActivity(intent); val socket = MulticastSocket()"
+        )
+        self.assertIn("permissions", tech)
+        self.assertIn("platform_surface", tech)
+        self.assertIn("network", tech)
+        perspectives = hb._expected_perspectives(tech)
+        cases = {
+            case for perspective in perspectives
+            for case in hb.PERSPECTIVE_CASES[perspective]
+        }
+        self.assertTrue({"R-AI-062", "R-AI-063", "R-AI-066"} <= cases)
+
+    def test_platform_behavior_matrix_is_unconditional(self):
+        perspectives = hb._expected_perspectives([])
+        cases = {
+            case for perspective in perspectives
+            for case in hb.PERSPECTIVE_CASES[perspective]
+        }
+        self.assertIn("R-AI-061", cases)
+
+    def test_oversized_relation_index_is_an_explicit_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "Huge.kt"
+            source.write_text("x" * 810_000)
+            scope = repo / "scope.txt"
+            scope.write_text("Huge.kt\n")
+            result = hb.build_batches(repo, scope, repo / "out", 1, token_budget=400_000)
+            self.assertFalse(result["coverage_ok"])
+            self.assertEqual(result["analysis_gaps"][0]["kind"], "relation_graph_not_fully_indexed")
 
     def test_related_files_stay_together_before_unrelated_high_risk_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,8 +211,10 @@ class VerifyBatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             source = repo / "engine.json"
+            for i in range(47):
+                (repo / f"F{i}.kt").write_text("fun f() = 1\n")
             source.write_text(json.dumps({"candidates": [
-                {"file": f"F{i}.kt", "line": i} for i in range(47)
+                {"file": f"F{i}.kt", "line": 1} for i in range(47)
             ]}))
             result = vb.build(repo, [source], repo / "out", max_candidates=20, token_budget=100000)
             self.assertTrue(result["coverage_ok"])
@@ -167,6 +236,7 @@ class VerifyBatchTests(unittest.TestCase):
             repo = Path(tmp)
             source0 = repo / "hunt_result_2_0.json"
             source1 = repo / "hunt_result_2_1.json"
+            (repo / "A.kt").write_text("\n" * 7)
             candidate = {"file": "A.kt", "line": 7, "rule_id": "R-AI-1"}
             source0.write_text(json.dumps({"batch": 2, "candidates": [candidate]}))
             source1.write_text(json.dumps({"batch": 2, "candidates": [candidate]}))
@@ -179,10 +249,29 @@ class VerifyBatchTests(unittest.TestCase):
             self.assertEqual(batch[1]["provenance"][0]["hunter_sample"], 1)
             self.assertEqual(result["candidate_ids_unique"], 2)
 
+    def test_gap_audit_candidates_have_distinct_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "A.kt").write_text("fun refresh() = Unit\n")
+            source = repo / "hunt_gap_result_3.json"
+            source.write_text(json.dumps({
+                "batch": 3,
+                "candidates": [{
+                    "file": "A.kt", "line": 1, "rule_id": "R-AI-067",
+                }],
+            }))
+            vb.build(repo, [source], repo / "out")
+            candidate = json.loads((repo / "out/verify_batch_0.json").read_text())[0]
+            self.assertEqual(candidate["engine"], "ai-gap-audit")
+            self.assertEqual(candidate["provenance"][0]["source_kind"], "ai_gap_auditor")
+            self.assertEqual(candidate["provenance"][0]["hunter_batch"], 3)
+
     def test_root_cause_hints_keep_cross_rule_duplicates_in_one_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             source = repo / "engine.json"
+            (repo / "A.java").write_text("\n" * 12)
+            (repo / "B.java").write_text("\n" * 32)
             hint = {
                 "primary_file": "A.java", "symbol": "A.start",
                 "failure_mode": "worker-overlap",
@@ -195,6 +284,25 @@ class VerifyBatchTests(unittest.TestCase):
             self.assertEqual(result["batches"], 1)
             batch = json.loads((repo / "out/verify_batch_0.json").read_text())
             self.assertEqual({item["rule_id"] for item in batch}, {"R-AI-005", "R-AI-057"})
+
+    def test_candidate_path_escape_is_rejected_before_verifier_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "engine.json"
+            source.write_text(json.dumps({"candidates": [{"file": "../secret", "line": 1}]}))
+            with self.assertRaisesRegex(ValueError, "越出仓库"):
+                vb.build(repo, [source], repo / "out")
+
+    def test_zero_based_candidate_line_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "A.kt").write_text("fun a() = Unit\n")
+            source = repo / "engine.json"
+            source.write_text(json.dumps({
+                "candidates": [{"file": "A.kt", "line": 0}],
+            }))
+            with self.assertRaisesRegex(ValueError, "从 1 开始"):
+                vb.build(repo, [source], repo / "out")
 
 
 class FallbackVerifierTests(unittest.TestCase):
@@ -269,12 +377,57 @@ class HuntCoverageTests(unittest.TestCase):
             self.assertEqual(result["unparseable_attest"], ["hunt_attest_0_0.json"])
 
 
+class HuntCoverageV3PlanTests(unittest.TestCase):
+    def test_plan_is_rebuilt_from_receipted_scope_and_rejects_subset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            out = repo / ".scan/tmp"
+            out.mkdir(parents=True)
+            (repo / "A.kt").write_text("fun a() = 1\n")
+            (repo / "B.kt").write_text("fun b() = a()\n")
+            scope = out / "hunt_scope.txt"
+            context = out / "context_scope.txt"
+            scope.write_text("A.kt\nB.kt\n")
+            context.write_text("")
+            coverage = hb.build_batches(
+                repo, scope, out, batch_size=10, token_budget=24000,
+                context_path=context,
+            )
+            self.assertEqual(coverage["schema_version"], 3)
+            self.assertEqual(hc._validate_v3_plan(out, coverage, repo), [])
+
+            coverage["batches_detail"][0]["files"] = ["A.kt"]
+            problems = hc._validate_v3_plan(out, coverage, repo)
+            self.assertTrue(any("batches_detail" in problem for problem in problems))
+
+    def test_read_ranges_must_be_exact_integer_ranges_within_file(self):
+        self.assertTrue(hc._ranges_cover([{"start": 1, "end": 3}], 3))
+        self.assertFalse(hc._ranges_cover([{"start": True, "end": 3}], 3))
+        self.assertFalse(hc._ranges_cover([{"start": 1, "end": 999}], 3))
+
+
 class HuntCoverageV2Tests(unittest.TestCase):
     def _coverage(self, root: Path) -> Path:
         path = root / "out/hunt_coverage.json"
         path.parent.mkdir()
+        batch = root / "out/hunt_batch_0.json"
+        code_map = root / "out/repo_map_0.md"
+        batch.write_text('{"batch": 0}')
+        code_map.write_text("# complete map\n")
+        (root / "out/repo_map_0.meta.json").write_text(json.dumps({
+            "schema_version": 2,
+            "backend": "treesitter",
+            "degraded": False,
+            "files_not_indexed": {},
+            "map_truncated": False,
+            "batch_sha256": hashlib.sha256(batch.read_bytes()).hexdigest(),
+            "map_sha256": hashlib.sha256(code_map.read_bytes()).hexdigest(),
+        }))
         path.write_text(json.dumps({
             "schema_version": 2,
+            "coverage_ok": True,
+            "analysis_gaps": [],
+            "map_receipts_required": True,
             "batches_detail": [{
                 "batch": 0,
                 "expected_perspectives": ["auth_dataflow", "free"],
@@ -309,6 +462,24 @@ class HuntCoverageV2Tests(unittest.TestCase):
             result = hc.check(repo / "out", coverage, 1, repo_root=repo)
             self.assertTrue(result["ok"])
             self.assertEqual(result["coverage_evidence"], "file-hash-line-range-receipt")
+
+    def test_v2_rejects_boolean_batch_and_sample_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            result_path = repo / "out/hunt_result_0_0.json"
+            result_path.write_text(json.dumps({
+                "batch": False,
+                "sample": False,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "files_reviewed": [self._receipt(source)],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn(result_path.name, result["unparseable_results"])
 
     def test_v2_rejects_partial_read_range(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -346,6 +517,80 @@ class HuntCoverageV2Tests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("文件哈希不匹配", " ".join(result["batches"][0]["problems"]))
 
+    def test_v2_requires_navigation_receipt_when_declared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            (repo / "out/repo_map_0.meta.json").unlink()
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0,
+                "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "files_reviewed": [self._receipt(source)],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("导航回执", " ".join(result["batches"][0]["problems"]))
+
+    def test_v2_rejects_truncated_repository_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            obj = json.loads(coverage.read_text())
+            obj["map_receipts_required"] = True
+            coverage.write_text(json.dumps(obj))
+            batch = repo / "out/hunt_batch_0.json"
+            code_map = repo / "out/repo_map_0.md"
+            batch.write_text('{"batch": 0}')
+            code_map.write_text("# truncated map\n")
+            (repo / "out/repo_map_0.meta.json").write_text(json.dumps({
+                "schema_version": 2,
+                "backend": "treesitter",
+                "degraded": False,
+                "files_not_indexed": {},
+                "map_truncated": True,
+                "batch_sha256": hashlib.sha256(batch.read_bytes()).hexdigest(),
+                "map_sha256": hashlib.sha256(code_map.read_bytes()).hexdigest(),
+            }))
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0,
+                "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "files_reviewed": [self._receipt(source)],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("token 预算", " ".join(result["batches"][0]["problems"]))
+
+    def test_v2_rejects_source_missing_from_navigation_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            meta_path = repo / "out/repo_map_0.meta.json"
+            meta = json.loads(meta_path.read_text())
+            meta["files_not_indexed"] = {
+                "native.cpp": "unsupported-navigation-language",
+            }
+            meta_path.write_text(json.dumps(meta))
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0,
+                "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "files_reviewed": [self._receipt(source)],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("导航索引漏文件", " ".join(result["batches"][0]["problems"]))
+
     def test_v2_each_sample_must_cover_all_perspectives(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -378,12 +623,65 @@ class HuntCoverageV2Tests(unittest.TestCase):
                 "sample": 0,
                 "perspectives_covered": ["auth_dataflow", "free"],
                 "case_ids_checked": ["R-AI-001"],
+                "case_assessments": [{
+                    "case_id": "R-AI-001",
+                    "status": "no_signal",
+                    "signals_checked": ["checked auth source"],
+                    "evidence": [],
+                    "conclusion": "no auth state in batch",
+                }],
                 "files_reviewed": [self._receipt(source)],
                 "candidates": [],
             }))
             result = hc.check(repo / "out", coverage, 1, repo_root=repo)
             self.assertFalse(result["ok"])
             self.assertIn("R-AI-055", " ".join(result["batches"][0]["problems"]))
+
+    def test_v2_rejects_copied_case_ids_without_assessments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            obj = json.loads(coverage.read_text())
+            obj["batches_detail"][0]["expected_case_ids"] = ["R-AI-001"]
+            coverage.write_text(json.dumps(obj))
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0, "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "case_ids_checked": ["R-AI-001"],
+                "files_reviewed": [self._receipt(source)],
+                "candidates": [],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("case_assessments", " ".join(result["batches"][0]["problems"]))
+
+    def test_v2_rejects_case_evidence_line_outside_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "A.kt"
+            source.write_text("one\ntwo\nthree\n")
+            coverage = self._coverage(repo)
+            obj = json.loads(coverage.read_text())
+            obj["batches_detail"][0]["expected_case_ids"] = ["R-AI-067"]
+            coverage.write_text(json.dumps(obj))
+            (repo / "out/hunt_result_0_0.json").write_text(json.dumps({
+                "batch": 0, "sample": 0,
+                "perspectives_covered": ["auth_dataflow", "free"],
+                "case_ids_checked": ["R-AI-067"],
+                "case_assessments": [{
+                    "case_id": "R-AI-067", "status": "candidate",
+                    "signals_checked": ["callback ordering"],
+                    "evidence": [{"file": "A.kt", "line": 999}],
+                    "conclusion": "late callback overwrites state",
+                }],
+                "files_reviewed": [self._receipt(source)],
+                "candidates": [{"rule_id": "R-AI-067"}],
+            }))
+            result = hc.check(repo / "out", coverage, 1, repo_root=repo)
+            self.assertFalse(result["ok"])
+            self.assertIn("行号超出", " ".join(result["batches"][0]["problems"]))
 
     def test_v2_rejects_filename_batch_sample_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:

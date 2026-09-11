@@ -14,7 +14,7 @@ scan-android 只扫描 Android 源码仓库。它不安装或调用 APK/AAB 反�
 
 Python 编排脚本需要 Python 3.9+。Semgrep 与 tree-sitter 的隔离环境需要 Python 3.10+；安装器会自动寻找合适解释器。Detekt、PMD 和已授权的 Lint 需要 Java 11+。
 
-## 推荐方式：预检自动安装
+## 推荐方式：先只读预检，再显式授权安装
 
 从被扫描源码仓库根目录执行：
 
@@ -22,7 +22,13 @@ Python 编排脚本需要 Python 3.9+。Semgrep 与 tree-sitter 的隔离环境�
 python3 <SKILL_DIR>/scripts/preflight.py --repo-root .
 ```
 
-预检会检测固定版本并自动补装缺失项。首次安装需要联网，并写入 `~/.scan-android/`。Python 是唯一硬前提；某个可选工具安装失败时，扫描保留其他引擎结果并明确标记 incomplete。
+这一步只检测，不联网、不安装。调用方审阅缺失项并明确授权后，才运行：
+
+```bash
+python3 <SKILL_DIR>/scripts/preflight.py --repo-root . --install-missing
+```
+
+首次安装需要联网，并写入 `~/.scan-android/`。Python 是唯一硬前提；某个可选工具缺失或安装失败时，扫描保留其他引擎结果并明确标记 incomplete。
 
 ## 手动预热
 
@@ -65,28 +71,28 @@ python3 <SKILL_DIR>/scripts/run_engines.py \
   --allow-build-execution
 ```
 
-也可在 `.scan/config.json` 设置：
-
-```json
-{
-  "allow_gradle_execution": true
-}
-```
-
-适配器不会修改 `gradlew` 权限；wrapper 不可执行时会报告失败，而不是改写目标仓库。
+项目 `.scan/config.json` 不能授予这个能力；即使其中存在旧的
+`allow_gradle_execution=true` 也会被忽略并记录警告。适配器不会修改
+`gradlew` 权限；wrapper 不可执行时会报告失败，而不是改写目标仓库。
 
 ## Semgrep 规则来源
 
-本地 Android 规则默认离线运行。在线 registry 包默认关闭，避免扫描时隐式联网和规则漂移。确需使用时显式配置：
+本地 Android 规则默认离线运行。在线 registry 包默认关闭，避免扫描时隐式联网和规则漂移。确需使用时，调用方必须在当次引擎命令显式传入：
+
+```bash
+--allow-network-rules
+```
+
+如果还需要从已审阅的项目策略选择 registry pack，可配置：
 
 ```json
 {
-  "semgrep_use_registry": true,
   "semgrep_registry_packs": ["p/security-audit", "p/owasp-top-ten"]
 }
 ```
 
-registry 内容可能变化；报告会记录实际规则来源。
+此时还要传 `--trust-project-config`。配置只能选择受限的 `p/...` ID，
+不能授权联网。registry 内容可能变化；报告会记录实际规则来源。
 
 ## 导航层
 

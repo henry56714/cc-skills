@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import glob as globlib
 import json
 import os
 import re
@@ -14,6 +15,13 @@ from typing import Any, Iterable
 
 
 CST = timezone(timedelta(hours=8))
+KNOWN_ENGINES = ("semgrep", "detekt", "pmd", "lint", "ai")
+RUN_MANIFEST_INVARIANT_FIELDS = (
+    "schema_version", "run_id", "started_at", "source_only",
+    "repo_revision", "repo_dirty", "skill_fingerprint", "config_fingerprint",
+    "language", "scan_mode", "scope", "config_trusted",
+    "effective_hunt_policy", "effective_excluded_engines",
+)
 
 
 def now_iso() -> str:
@@ -57,6 +65,153 @@ def load_json(path: str | Path, default: Any = None) -> Any:
         return default
     with p.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def strict_json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values without Python's ``True == 1`` coercion."""
+    try:
+        options = {
+            "sort_keys": True,
+            "ensure_ascii": False,
+            "separators": (",", ":"),
+            "allow_nan": False,
+        }
+        return json.dumps(left, **options) == json.dumps(right, **options)
+    except (TypeError, ValueError):
+        return False
+
+
+def resolve_cli_path(repo: str | Path, raw: str | Path, *, label: str = "path") -> Path:
+    """Resolve a caller path and reject relative ``..``/symlink escapes.
+
+    Absolute paths remain an explicit caller choice. Relative paths are scoped
+    to the scanned repository, so a target-controlled ``.scan`` symlink cannot
+    redirect ordinary pipeline reads or writes outside that repository.
+    """
+    base = Path(repo).resolve()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    resolved = (base / candidate).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"{label} 通过相对路径或符号链接越出仓库: {raw}") from exc
+    return resolved
+
+
+def resolve_repo_path(repo: str | Path, raw: str | Path, *, label: str = "path") -> Path:
+    """Resolve an artifact/repository supplied path and require repo containment.
+
+    Unlike :func:`resolve_cli_path`, an absolute path here is not automatically
+    trusted: paths read from project files, model output, or intermediate JSON
+    are data rather than caller authority.  Absolute paths are accepted only
+    when they still resolve inside the scanned repository.
+    """
+    base = Path(repo).resolve()
+    candidate = Path(raw)
+    resolved = candidate.resolve() if candidate.is_absolute() else (base / candidate).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"{label} 越出仓库: {raw}") from exc
+    return resolved
+
+
+def effective_hunt_policy(config: dict | None) -> dict[str, int]:
+    """Return the fail-safe, normalized AI batching policy for one run.
+
+    ``bool`` is deliberately rejected even though it is an ``int`` subclass:
+    repository JSON such as ``"hunt_samples": true`` must not silently turn
+    into a one-sample scan.
+    """
+    values = config if isinstance(config, dict) else {}
+
+    def positive_int(key: str, default: int, minimum: int) -> int:
+        value = values.get(key, default)
+        return value if type(value) is int and value >= minimum else default
+
+    return {
+        "samples": positive_int("hunt_samples", 2, 1),
+        "batch_size": positive_int("hunt_batch_size", 10, 1),
+        "token_budget": positive_int("hunt_token_budget", 24_000, 1_000),
+    }
+
+
+def effective_excluded_engines(config: dict | None) -> list[str]:
+    """Normalize the only engine names a trusted project policy may exclude."""
+    values = config if isinstance(config, dict) else {}
+    raw = values.get("excluded_engines", [])
+    if not isinstance(raw, list):
+        return []
+    allowed = set(KNOWN_ENGINES)
+    result: list[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        name = value.strip().lower()
+        if name in allowed and name not in result:
+            result.append(name)
+    return result
+
+
+def current_skill_fingerprint() -> str:
+    """Hash every executable rule, prompt, query and dependency declaration."""
+    skill_dir = Path(__file__).resolve().parent.parent
+    roots = [
+        skill_dir / "SKILL.md",
+        skill_dir / "CONVENTIONS.md",
+        skill_dir / "requirements.txt",
+    ]
+    for relative, pattern in (
+        ("scripts", "*.py"),
+        ("scripts", "*.scm"),
+        ("agents", "*.md"),
+        ("rules", "*"),
+        ("queries", "*"),
+    ):
+        roots.extend(sorted((skill_dir / relative).rglob(pattern)))
+    digest = hashlib.sha256()
+    for path in roots:
+        if not path.is_file():
+            continue
+        digest.update(path.relative_to(skill_dir).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def run_manifest_invariant_fingerprint(manifest: dict | None) -> str:
+    """Hash scope-time manifest facts while ignoring render-time annotations.
+
+    ``render_report.py`` deliberately adds ``finished_at``, model IDs, phase
+    stats and result counts to the same manifest.  Binding the entire file
+    would therefore invalidate every successful render; binding only the
+    immutable preparation facts still detects post-merge policy/scope edits.
+    """
+    source = manifest if isinstance(manifest, dict) else {}
+    payload = {key: source.get(key) for key in RUN_MANIFEST_INVARIANT_FIELDS}
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def expand_cli_glob(repo: str | Path, pattern: str, *, label: str = "glob") -> list[Path]:
+    """Expand a caller glob while containing every relative match in ``repo``."""
+    base = Path(repo).resolve()
+    raw = str(pattern)
+    candidate = Path(raw)
+    if not candidate.is_absolute() and ".." in candidate.parts:
+        raise ValueError(f"{label} 含仓库外相对路径: {pattern}")
+    expanded = raw if candidate.is_absolute() else str(base / raw)
+    matches = sorted(Path(value).resolve() for value in globlib.glob(expanded))
+    if not candidate.is_absolute():
+        for match in matches:
+            try:
+                match.relative_to(base)
+            except ValueError as exc:
+                raise ValueError(f"{label} 通过符号链接越出仓库: {pattern}") from exc
+    return matches
 
 
 def atomic_write_json(path: str | Path, data: Any, *, indent: int = 2) -> None:

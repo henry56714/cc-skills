@@ -22,9 +22,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from lib_scan import (
     atomic_write_json,
+    current_skill_fingerprint,
     load_json,
     now_iso,
+    resolve_cli_path,
+    run_manifest_invariant_fingerprint,
     severity_rank,
+    strict_json_equal,
 )
 
 
@@ -55,6 +59,7 @@ def main() -> int:
     ap.add_argument("--language", choices=("auto", "zh", "en"), default="auto")
     ap.add_argument("--run-manifest", default=".scan/tmp/run_manifest.json")
     ap.add_argument("--hunt-coverage-result", default=".scan/tmp/hunt_perspective_coverage.json")
+    ap.add_argument("--gap-audit-coverage", default=".scan/tmp/gap_audit_coverage.json")
     ap.add_argument("--verify-coverage", default=".scan/tmp/verify_coverage.json")
     ap.add_argument("--merge-receipt", default=".scan/tmp/merge_receipt.json")
     args = ap.parse_args()
@@ -84,6 +89,7 @@ def main() -> int:
     pipeline_stats = [engine_gate] + _pipeline_stats(
         repo=repo,
         hunt_result=_repo_path(repo, args.hunt_coverage_result),
+        gap_audit_coverage=_repo_path(repo, args.gap_audit_coverage),
         verify_coverage=_repo_path(repo, args.verify_coverage),
         merge_receipt=_repo_path(repo, args.merge_receipt),
         findings_path=findings_path,
@@ -128,8 +134,7 @@ def main() -> int:
 
 
 def _repo_path(repo: Path, raw: str) -> Path:
-    path = Path(raw)
-    return path if path.is_absolute() else repo / path
+    return resolve_cli_path(repo, raw, label="report path")
 
 
 def _read_object(path: Path) -> tuple[dict | None, str]:
@@ -194,15 +199,11 @@ def _pipeline_stats(
     *, repo: Path, hunt_result: Path, verify_coverage: Path, merge_receipt: Path,
     findings_path: Path, needs_review_path: Path, findings_count: int,
     needs_review_count: int, run_manifest: dict,
+    gap_audit_coverage: Path | None = None,
 ) -> list[dict]:
     stats: list[dict] = []
-    config, _ = _read_object(repo / ".scan" / "config.json")
-    excluded = (
-        set(config.get("excluded_engines", []))
-        if isinstance(config, dict)
-        and isinstance(config.get("excluded_engines", []), list)
-        else set()
-    )
+    excluded_values = run_manifest.get("effective_excluded_engines", [])
+    excluded = set(excluded_values) if isinstance(excluded_values, list) else set()
     hunt_scope = repo / ".scan" / "tmp" / "hunt_scope.txt"
     if "ai" in excluded:
         stats.append(_phase("ai_hunter", "skipped", "excluded_engines configuration"))
@@ -218,13 +219,28 @@ def _pipeline_stats(
             "" if hunt is not None and hunt.get("ok") is True else error or "hunter coverage ok=false",
         ))
 
+    if "ai" in excluded:
+        stats.append(_phase("ai_gap_audit", "skipped", "AI hunter excluded by effective policy"))
+    elif not hunt_scope.is_file() or not hunt_scope.read_text(encoding="utf-8").strip():
+        stats.append(_phase("ai_gap_audit", "not_applicable"))
+    else:
+        gap_path = gap_audit_coverage or repo / ".scan/tmp/gap_audit_coverage.json"
+        gap, gap_error = _read_object(gap_path)
+        stats.append(_phase(
+            "ai_gap_audit",
+            "complete" if gap is not None and gap.get("ok") is True else "failed",
+            "" if gap is not None and gap.get("ok") is True else gap_error or "gap audit coverage ok=false",
+        ))
+
     verify, error = _read_object(verify_coverage)
     verify_ok = (
         verify is not None
         and verify.get("coverage_ok") is True
         and type(verify.get("candidates_input")) is int
+        and type(verify.get("candidates_batched")) is int
         and verify.get("candidates_input") == verify.get("candidates_batched")
         and isinstance(verify.get("batch_files"), list)
+        and type(verify.get("batches")) is int
         and verify.get("batches") == len(verify.get("batch_files"))
     )
     stats.append(_phase(
@@ -235,21 +251,35 @@ def _pipeline_stats(
     receipt, error = _read_object(merge_receipt)
     run_id = run_manifest.get("run_id")
     artifacts_ok, artifacts_error = _verify_receipt_artifacts(repo, receipt)
+    fingerprint_ok = (
+        isinstance(receipt, dict)
+        and receipt.get("skill_fingerprint") == run_manifest.get("skill_fingerprint")
+        and receipt.get("skill_fingerprint") == current_skill_fingerprint()
+    )
+    manifest_binding_ok = (
+        isinstance(receipt, dict)
+        and receipt.get("run_manifest_invariants_sha256")
+        == run_manifest_invariant_fingerprint(run_manifest)
+    )
     receipt_ok = (
         receipt is not None
         and receipt.get("ok") is True
         and findings_path.is_file()
         and needs_review_path.is_file()
-        and receipt.get("results") == {
+        and strict_json_equal(receipt.get("results"), {
             "confirmed": findings_count, "needs_review": needs_review_count,
-        }
+        })
         and (not run_id or receipt.get("run_id") == run_id)
+        and fingerprint_ok
+        and manifest_binding_ok
         and artifacts_ok
     )
     stats.append(_phase(
         "merge", "complete" if receipt_ok else "failed",
         "" if receipt_ok else (
             error or artifacts_error
+            or ("scan-android skill/rules changed after merge" if not fingerprint_ok else "")
+            or ("run manifest policy/scope changed after merge" if not manifest_binding_ok else "")
             or (str(receipt.get("reason", "")) if isinstance(receipt, dict) else "")
             or "merge receipt/results/run_id mismatch"
         ),
@@ -517,6 +547,8 @@ def _lang_for(file_: str) -> str:
 
 def _coverage_status(stats: list[dict]) -> str:
     statuses = {str(s.get("status", "complete")) for s in stats}
+    if statuses - {"complete", "partial", "failed", "skipped", "not_applicable"}:
+        return "incomplete"
     if statuses & {"partial", "failed"}:
         return "incomplete"
     if "skipped" in statuses:

@@ -117,6 +117,25 @@
 | `R-AI-058` | **客户端共享秘密、AEAD 与重放**：APK/so 中可恢复的固定密钥不能充当服务端秘密；CBC/CTR 加密若无 MAC/AEAD 可被篡改；请求若无 nonce/timestamp/服务端去重可重放。必须区分仅混淆常量与真正安全边界，并追到协议使用点。 |
 | `R-AI-059` | **同意、最小化、标识符与保留期**：采集 ANDROID_ID、IMEI、SSID/BSSID、定位、安装包列表等数据时，确认目的、用户同意/撤销、权限降级、字段最小化、落盘/上传和删除/保留路径；有权限不等于有隐私授权。无法取得产品政策时进入 needs-review。 |
 | `R-AI-060` | **跨进程载荷与序列化容量**：Intent/Bundle/Parcelable/Binder 传大集合、Bitmap、深层对象或不可信序列化数据时，检查 classloader、类型、长度和约 1MB Binder 事务上限；失败后状态不能部分提交。纯进程内 Bundle 使用是反例。 |
+| `R-AI-061` | **API 35/36/37 行为矩阵缺口**：从实际 `compileSdk/targetSdk/minSdk`、设备 API、compat flag 和发布变体出发，分别核对“影响所有 app”与“仅 target 门控”的平台行为；代码仅按 `SDK_INT` 分支却忽略 target/compat 状态，或捕获新限制异常后仍标记成功，均需追到失败传播。不得仅因版本号存在就报问题。 |
+| `R-AI-062` | **本地网络权限与能力降级**：局域网发现/连接、mDNS/NSD、Wi-Fi multicast 或原始 socket 必须区分 Android 16 的 opt-in 试验路径与 Android 17 对 target 37+ 的 `ACCESS_LOCAL_NETWORK` 强制路径；检查声明、运行时请求、用户拒绝/撤销、系统 picker 替代方案及半初始化清理。要区分互联网访问与本地网络访问。 |
+| `R-AI-063` | **后台启动与 PendingIntent 授权链**：后台 Activity 启动、通知 trampoline、PendingIntent/IntentSender 创建方与发送方的 BAL opt-in、发送时可见性和 API/target 门控变化后，流程是否静默失效或被非预期调用方借身份启动；同时核对任务栈与重新鉴权，不能把“mutable/immutable 正确”等同于 BAL 授权正确。 |
+| `R-AI-064` | **16 KB page size 与 native 发布兼容性**：含 JNI/预编译 `.so` 时，检查发布 ABI、ELF LOAD/ZIP 对齐、打包方式、`PAGE_SIZE`/4096 假设、`mmap` 对齐及第三方 native 依赖；兼容模式能启动不等于真正兼容。仅 Java/Kotlin 项目通常不适用；无法检查 APK/AAB/ELF 产物时必须保留证据缺口。 |
+| `R-AI-065` | **健康/健身及后台数据权限演进**：Health Connect、传感器、后台健康数据或历史数据访问必须联合核对平台版本、target、Android 16 细粒度 `android.permissions.health` 迁移、用途和授权粒度；拒绝/撤销后，缓存、上传与定时任务不得继续沿用旧状态。 |
+| `R-AI-066` | **RemoteViews/通知/小组件载荷预算**：通知、自定义 RemoteViews、AppWidget 或跨进程 UI 传递大量 Bitmap/Icon/集合时，检查尺寸与解码内存、更新频率、失败回滚及低内存路径；对 target 37+ 还要验证 Android 17 的 RemoteViews 严格内存上限与致命异常路径。压缩后的文件大小不能替代实际 parcel/解码内存判断。 |
+
+平台规则维护依据（新 SDK 发布后必须重新校准）：[Android 17 行为变更](https://developer.android.com/about/versions/17/behavior-changes-17)、[本地网络权限](https://developer.android.com/privacy-and-security/local-network-permission)、[后台 Activity 启动安全](https://developer.android.com/guide/components/activities/secure-bal)、[16 KB 页面支持](https://developer.android.com/guide/practices/page-sizes)、[Android 16 target 行为变更](https://developer.android.com/about/versions/16/behavior-changes-16)。这些链接是规则校准依据，不是项目 finding 证据；确认问题仍必须给出当前仓库的可达路径与源码位置。
+
+## 业务逻辑与状态机（每批都要主动检查）
+
+| id | 触发条件与必须验证的不变量 |
+|---|---|
+| `R-AI-067` | **状态机非法跃迁与旧回调覆盖新状态**：列出关键状态及允许边，检查重复事件、乱序回调、重入、进程恢复和 stale response 是否能跨过前置状态，或让较早 generation 覆盖较新结果。不能只看单个 `if`。 |
+| `R-AI-068` | **用户/账户/租户绑定错误**：异步请求、缓存键、PendingIntent、通知 action、数据库行和回调是否绑定发起时的 user/account/tenant；切号或多 profile 后旧结果不得写入当前身份。 |
+| `R-AI-069` | **金额、配额与计数不变量**：检查负数、零、溢出、精度/舍入、单位换算、重复扣减和上下限；金额不得用浮点跨边界比较，客户端展示值不得被当作服务端授权值。 |
+| `R-AI-070` | **分页、去重与事件顺序**：cursor/page token、稳定排序键、去重键和重试合并是否在插入/删除/乱序/重复响应下造成永久漏项、重复副作用或无限翻页。 |
+| `R-AI-071` | **时间、时区与日历边界**：过期、每日额度、订阅周期、调度和展示转换是否混用 wall/monotonic time、秒/毫秒、UTC/本地时区，或在 DST、跨午夜、闰日与系统调时后违背业务不变量。 |
+| `R-AI-072` | **分支方向、默认值与复制粘贴语义错误**：结合调用者期望、测试名、相邻分支和状态定义，检查 `&&/||`、正反条件、枚举默认分支、错误变量/错误账户/错误集合被复制使用。注释矛盾只是线索，必须用可达路径和结果证明。 |
 
 每条 case 的判断至少包含：是否存在触发信号、跨文件终端条件、已发现的缓解/反例以及对应源码位置。无触发信号记为已检查，不制造候选；缺少关键变体、协议或产品契约时进入 needs-review。
 

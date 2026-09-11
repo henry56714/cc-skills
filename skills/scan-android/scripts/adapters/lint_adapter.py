@@ -7,13 +7,14 @@ Android Lint 对 manifest / 资源 / API 使用有最精准的感知能力。
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lib_scan import Candidate
+from lib_scan import Candidate, resolve_repo_path
 
 from .base import AdapterResult, EngineAdapter, ScanContext
 
@@ -84,7 +85,11 @@ class LintAdapter(EngineAdapter):
                 "--allow-build-execution"
             )
         gradlew = ctx.repo / "gradlew"
-        if not gradlew.exists():
+        try:
+            gradlew = resolve_repo_path(ctx.repo, gradlew, label="Gradle wrapper")
+        except ValueError as exc:
+            return False, str(exc)
+        if not gradlew.is_file():
             return False, f"gradlew 未找到（{gradlew}），Android Lint 不可用"
         return True, ""
 
@@ -109,13 +114,39 @@ class LintAdapter(EngineAdapter):
             return result
 
         gradlew = ctx.repo / "gradlew"
-        if not gradlew.exists():
+        try:
+            gradlew = resolve_repo_path(ctx.repo, gradlew, label="Gradle wrapper")
+        except ValueError as exc:
+            result.available = False
+            result.status = "failed"
+            result.unavailable_reason = str(exc)
+            return result
+        if not gradlew.is_file():
             result.available = False
             result.unavailable_reason = "gradlew 未找到"
             return result
 
-        lint_tasks = ctx.detect_info.get("suggested_lint_tasks", ["lintDebug", "lint"])
-        ran_task = None
+        lint_tasks = ctx.detect_info.get("suggested_lint_tasks", ["lintRelease", "lint"])
+        if not isinstance(lint_tasks, list):
+            lint_tasks = []
+        unsafe_tasks = [
+            str(task) for task in lint_tasks
+            if not isinstance(task, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9:_-]*", task)
+        ]
+        lint_tasks = [
+            task for task in lint_tasks
+            if isinstance(task, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9:_-]*", task)
+        ]
+        if unsafe_tasks:
+            result.status = "partial"
+            result.notes.append({
+                "engine": self.name,
+                "note": "拒绝不安全的 Gradle task 名称",
+                "tasks": unsafe_tasks,
+            })
+        ran_tasks: list[str] = []
+        tasks_with_reports: list[str] = []
+        tasks_without_reports: list[str] = []
         xml_reports: list[Path] = []
         task_succeeded_without_report = False
 
@@ -123,10 +154,10 @@ class LintAdapter(EngineAdapter):
             launcher = [str(gradlew)] if os.access(gradlew, os.X_OK) else ["bash", str(gradlew)]
             cmd = launcher + [task, "--no-daemon", "--continue"]
             before = {
-                p.resolve(): p.stat().st_mtime_ns
-                for p in ctx.repo.rglob("lint-results*.xml")
+                p: p.stat().st_mtime_ns for p in _discovered_reports(ctx.repo)
             }
             try:
+                ran_tasks.append(task)
                 proc = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -134,18 +165,19 @@ class LintAdapter(EngineAdapter):
                     timeout=600,
                     cwd=str(ctx.repo),
                 )
-                reports = list(ctx.repo.rglob("lint-results*.xml"))
+                reports = _discovered_reports(ctx.repo)
                 fresh = [
                     p for p in reports
-                    if p.resolve() not in before or p.stat().st_mtime_ns > before[p.resolve()]
+                    if p not in before or p.stat().st_mtime_ns > before[p]
                 ]
                 # Lint 发现问题时可能非零退出，但会写出报告；无新报告的失败 task 继续尝试。
                 if fresh:
-                    ran_task = task
-                    xml_reports = fresh
-                    break
+                    tasks_with_reports.append(task)
+                    xml_reports.extend(fresh)
+                    continue
                 if proc.returncode == 0:
                     task_succeeded_without_report = True
+                    tasks_without_reports.append(task)
                     result.notes.append({
                         "engine": self.name,
                         "note": f"lint 任务 {task} 成功但未产生新的 XML 报告，继续尝试",
@@ -155,16 +187,19 @@ class LintAdapter(EngineAdapter):
                     "engine": self.name,
                     "note": f"lint 任务 {task} 失败且未产生报告: {(proc.stderr or proc.stdout)[-300:]}",
                 })
+                tasks_without_reports.append(task)
             except subprocess.TimeoutExpired:
                 result.status = "partial"
+                tasks_without_reports.append(task)
                 result.notes.append({"engine": self.name, "note": f"lint 任务 {task} 超时（600s）"})
                 continue
             except Exception as e:
                 result.status = "partial"
+                tasks_without_reports.append(task)
                 result.notes.append({"engine": self.name, "note": f"lint 任务 {task} 失败: {e}"})
                 continue
 
-        if ran_task is None:
+        if not tasks_with_reports:
             result.available = False
             result.status = "failed"
             result.unavailable_reason = (
@@ -173,8 +208,16 @@ class LintAdapter(EngineAdapter):
             )
             return result
 
-        _populate_from_reports(result, xml_reports, ctx)
-        result.notes.append({"engine": self.name, "note": f"已运行 lint 任务: {ran_task}"})
+        _populate_from_reports(result, sorted(set(xml_reports)), ctx)
+        if tasks_without_reports or unsafe_tasks:
+            result.status = "partial"
+        result.notes.append({
+            "engine": self.name,
+            "note": "已执行并逐项记账 shipping lint 任务",
+            "tasks_ran": ran_tasks,
+            "tasks_with_fresh_reports": tasks_with_reports,
+            "tasks_without_fresh_reports": tasks_without_reports,
+        })
         return result
 
 
@@ -190,14 +233,27 @@ def _existing_reports(ctx: ScanContext) -> list[Path]:
             path = Path(raw)
             path = path if path.is_absolute() else ctx.repo / path
             try:
-                path.resolve().relative_to(ctx.repo.resolve())
+                path = resolve_repo_path(ctx.repo, path, label="Lint report")
             except ValueError:
                 continue
             if path.is_file() and path.suffix.lower() == ".xml":
                 reports.append(path)
     if not reports:
-        reports = [path for path in ctx.repo.rglob("lint-results*.xml") if path.is_file()]
+        reports = _discovered_reports(ctx.repo)
     return sorted(dict.fromkeys(path.resolve() for path in reports))
+
+
+def _discovered_reports(repo: Path) -> list[Path]:
+    """Discover reports without following target-controlled links outside repo."""
+    reports: list[Path] = []
+    for candidate in repo.rglob("lint-results*.xml"):
+        try:
+            resolved = resolve_repo_path(repo, candidate, label="Lint report")
+        except ValueError:
+            continue
+        if resolved.is_file() and resolved.suffix.lower() == ".xml":
+            reports.append(resolved)
+    return sorted(dict.fromkeys(reports))
 
 
 def _populate_from_reports(result: AdapterResult, reports: list[Path], ctx: ScanContext) -> None:

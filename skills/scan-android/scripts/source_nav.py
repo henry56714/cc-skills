@@ -96,6 +96,11 @@ class SourceNav:
         self.repo = Path(repo).resolve()
         self._files: list[Path] | None = None
         self._lines: dict[str, list[str]] = {}
+        self._files_not_indexed: dict[str, str] = {}
+
+    @property
+    def files_not_indexed(self) -> dict[str, str]:
+        return dict(self._files_not_indexed)
 
     # ---- 文件/行缓存 ----
     def _source_files(self) -> list[Path]:
@@ -115,10 +120,12 @@ class SourceNav:
             try:
                 if p.stat().st_size > _MAX_FILE_BYTES:
                     self._lines[rel] = []
+                    self._files_not_indexed[rel] = f"oversized>{_MAX_FILE_BYTES}"
                 else:
                     self._lines[rel] = p.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 self._lines[rel] = []
+                self._files_not_indexed[rel] = "unreadable"
         return rel, self._lines[rel]
 
     def _enclosing(self, lines: list[str], idx: int) -> str:

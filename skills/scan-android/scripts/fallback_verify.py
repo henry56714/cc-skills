@@ -9,6 +9,8 @@ import re
 import sys
 from pathlib import Path
 
+from lib_scan import resolve_cli_path
+
 
 def build_fallback(batch_path: Path, reason: str, language: str = "zh") -> dict:
     values = json.loads(batch_path.read_text(encoding="utf-8"))
@@ -54,6 +56,7 @@ def build_fallback(batch_path: Path, reason: str, language: str = "zh") -> dict:
         "candidates_input": len(values),
         "candidates_adjudicated": len(values),
         "false_positive_count": 0,
+        "false_positive_ids": [],
         "duplicates_merged_count": 0,
         "confirmed": [],
         "needs_review": review,
@@ -68,8 +71,10 @@ def main() -> int:
     parser.add_argument("--language", choices=("zh", "en"), default="zh")
     args = parser.parse_args()
     try:
-        result = build_fallback(Path(args.input), args.reason, args.language)
-        output = Path(args.output)
+        repo = Path.cwd().resolve()
+        input_path = resolve_cli_path(repo, args.input, label="fallback verifier input")
+        output = resolve_cli_path(repo, args.output, label="fallback verifier output")
+        result = build_fallback(input_path, args.reason, args.language)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except (OSError, ValueError, json.JSONDecodeError) as exc:

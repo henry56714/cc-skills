@@ -35,14 +35,20 @@ _needs_origin）的 finding 必须带回溯源头链（非空 `dataflow_path` �
 from __future__ import annotations
 
 import argparse
-import glob
 import hashlib
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from lib_scan import atomic_write_json, finding_id, root_cause_id, severity_rank
+from check_gap_audit_coverage import check as check_gap_audit_coverage  # noqa: E402
+from check_hunt_coverage import check as check_hunt_coverage  # noqa: E402
+from lib_scan import (
+    atomic_write_json, current_skill_fingerprint, effective_excluded_engines,
+    effective_hunt_policy, expand_cli_glob, finding_id, resolve_cli_path,
+    resolve_repo_path, root_cause_id, run_manifest_invariant_fingerprint,
+    severity_rank, strict_json_equal,
+)
 
 REQUIRED_INPUT_FIELDS = {
     "file", "line", "rule_id", "category", "severity",
@@ -71,6 +77,8 @@ ORIGIN_REQUIRED_PREFIXES = (
     "security/deeplink",
 )
 ORIGIN_REQUIRED_SUBSTRINGS = ("-data-flow", "unvalidated-input", "越权")
+EXPECTED_TOOL_ENGINES = {"semgrep", "detekt", "pmd", "lint"}
+ENGINE_STATUSES = {"complete", "partial", "failed", "skipped", "not_applicable"}
 
 
 def _needs_origin(category: str) -> bool:
@@ -103,6 +111,10 @@ def main() -> int:
         default=".scan/tmp/hunt_perspective_coverage.json",
     )
     ap.add_argument(
+        "--gap-audit-coverage",
+        default=".scan/tmp/gap_audit_coverage.json",
+    )
+    ap.add_argument(
         "--receipt", default=None,
         help="成功合并回执；render_report 用它阻止缺失 verifier 的假完成报告",
     )
@@ -121,9 +133,15 @@ def main() -> int:
     verify_coverage_path = _repo_path(repo, args.verify_coverage)
     engine_results_path = _repo_path(repo, args.engine_results)
     hunt_coverage_path = _repo_path(repo, args.hunt_coverage_result)
+    gap_audit_coverage_path = _repo_path(repo, args.gap_audit_coverage)
     run_manifest_path = _repo_path(repo, args.run_manifest)
     if receipt_path.exists():
         receipt_path.unlink()
+    if args.verified_glob:
+        # A failed re-merge must not leave prior-run final JSON looking current.
+        for stale_output in (findings_path, needs_review_path):
+            if stale_output.is_file():
+                stale_output.unlink()
 
     raw = sys.stdin.read().strip()
     try:
@@ -224,8 +242,6 @@ def main() -> int:
 
     findings_list = list(records.values())
     needs_review_list = list(review_records.values())
-    atomic_write_json(findings_path, {"schema_version": 4, "findings": findings_list})
-    atomic_write_json(needs_review_path, {"schema_version": 2, "needs_review": needs_review_list})
 
     out = {
         "findings_total": len(findings_list),
@@ -245,49 +261,243 @@ def main() -> int:
         except (OSError, json.JSONDecodeError):
             pass
     verified_files = _verified_paths(args.verified_glob, repo) if args.verified_glob else []
-    artifact_paths = [findings_path, needs_review_path]
+    artifact_paths: list[Path] = []
     missing_inputs: list[str] = []
     if args.verified_glob:
+        if (
+            type(run_manifest.get("schema_version")) is not int
+            or run_manifest.get("schema_version") != 1
+            or run_manifest.get("source_only") is not True
+            or not isinstance(run_manifest.get("run_id"), str)
+            or not run_manifest.get("run_id")
+            or type(run_manifest.get("config_trusted")) is not bool
+        ):
+            missing_inputs.append("run_manifest missing source-only run identity")
+        current_fingerprint = current_skill_fingerprint()
+        if run_manifest.get("skill_fingerprint") != current_fingerprint:
+            missing_inputs.append("scan-android skill/rules changed after scope preparation")
         verify_inputs = _verify_input_paths(repo, verify_coverage_path)
+        project_path = repo / ".scan/tmp/project.json"
+        scope_path = repo / ".scan/tmp/scope.txt"
+        hunt_scope_path = repo / ".scan/tmp/hunt_scope.txt"
+        context_scope_path = repo / ".scan/tmp/context_scope.txt"
+        scope_meta_path = repo / ".scan/tmp/scope_meta.json"
         required_paths = [
             engine_results_path, verify_coverage_path,
+            project_path, scope_path, hunt_scope_path, context_scope_path, scope_meta_path,
             *verify_inputs, *verified_files,
         ]
-        if _ai_hunt_required(repo):
-            required_paths.append(hunt_coverage_path)
-            hunt_results = sorted((repo / ".scan/tmp").glob("hunt_result_*.json"))
-            if hunt_results:
-                required_paths.extend(hunt_results)
+        try:
+            project = json.loads(project_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            project = {}
+        effective_config = project.get("config", {}) if isinstance(project, dict) else {}
+        if not isinstance(effective_config, dict):
+            effective_config = {}
+            missing_inputs.append("project.config missing or invalid")
+        config_digest = hashlib.sha256(
+            json.dumps(effective_config, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        if run_manifest.get("config_fingerprint") != config_digest:
+            missing_inputs.append("project config no longer matches run_manifest fingerprint")
+        expected_hunt_policy = effective_hunt_policy(effective_config)
+        if run_manifest.get("effective_hunt_policy") != expected_hunt_policy:
+            missing_inputs.append("effective Hunter policy changed or missing after scope preparation")
+        project_excluded = effective_excluded_engines(effective_config)
+        if run_manifest.get("effective_excluded_engines", []) != project_excluded:
+            missing_inputs.append("effective excluded engines changed after scope preparation")
+        try:
+            engine_results = json.loads(engine_results_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            engine_results = {}
+        if isinstance(engine_results, dict):
+            if engine_results.get("config_fingerprint") != run_manifest.get("config_fingerprint"):
+                missing_inputs.append("engine run config does not match scope run")
+            if engine_results.get("config_trusted") is not run_manifest.get("config_trusted"):
+                missing_inputs.append("engine run config trust does not match scope run")
+            if engine_results.get("effective_excluded_engines") != project_excluded:
+                missing_inputs.append("engine run exclusions do not match scope run")
+            missing_inputs.extend(_engine_integrity_problems(engine_results))
+        scope_snapshot = (
+            engine_results.get("scope_snapshot", [])
+            if isinstance(engine_results, dict) else []
+        )
+        if not isinstance(engine_results, dict) or "scope_snapshot" not in engine_results:
+            missing_inputs.append("engine-results.scope_snapshot missing")
+        if not isinstance(engine_results, dict) or type(
+            engine_results.get("scope_changed_during_scan")
+        ) is not bool:
+            missing_inputs.append("engine-results.scope_changed_during_scan missing or invalid")
+        if not isinstance(scope_snapshot, list):
+            missing_inputs.append("engine-results.scope_snapshot must be an array")
+            scope_snapshot = []
+        for index, receipt in enumerate(scope_snapshot):
+            if not isinstance(receipt, dict):
+                missing_inputs.append(f"engine-results.scope_snapshot[{index}] invalid")
+                continue
+            try:
+                normalized = _validated_repo_file(
+                    repo, receipt.get("file"), f"engine-results.scope_snapshot[{index}].file",
+                )
+                source_path = repo / normalized
+                digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            except (OSError, ValueError) as exc:
+                missing_inputs.append(str(exc))
+                continue
+            if receipt.get("sha256") != digest:
+                missing_inputs.append(f"engine scope source changed: {normalized}")
+            required_paths.append(source_path)
+        if isinstance(engine_results, dict) and engine_results.get("scope_changed_during_scan") is True:
+            missing_inputs.append("engine scope changed during scan")
+        if _ai_hunt_required(repo, run_manifest):
+            tmp_dir = repo / ".scan/tmp"
+            hunt_input_coverage = tmp_dir / "hunt_coverage.json"
+            gap_plan = tmp_dir / "gap_audit_plan.json"
+            required_paths.extend([
+                hunt_input_coverage, hunt_coverage_path,
+                tmp_dir / "relation_graph.json", gap_plan,
+                gap_audit_coverage_path,
+            ])
+
+            artifact_groups = {
+                ".scan/tmp/hunt_batch_*.json": sorted(tmp_dir.glob("hunt_batch_*.json")),
+                ".scan/tmp/repo_map_*.md": sorted(tmp_dir.glob("repo_map_*.md")),
+                ".scan/tmp/repo_map_*.meta.json": sorted(tmp_dir.glob("repo_map_*.meta.json")),
+                ".scan/tmp/hunt_result_*.json": sorted(tmp_dir.glob("hunt_result_*.json")),
+                ".scan/tmp/gap_audit_batch_*.json": sorted(tmp_dir.glob("gap_audit_batch_*.json")),
+                ".scan/tmp/gap_prior_*.json": sorted(tmp_dir.glob("gap_prior_*.json")),
+                ".scan/tmp/hunt_gap_result_*.json": sorted(tmp_dir.glob("hunt_gap_result_*.json")),
+            }
+            for label, paths in artifact_groups.items():
+                if paths:
+                    required_paths.extend(paths)
+                else:
+                    missing_inputs.append(label)
+
+            try:
+                input_coverage = json.loads(hunt_input_coverage.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                input_coverage = {}
+            if (
+                not isinstance(input_coverage, dict)
+                or type(input_coverage.get("schema_version")) is not int
+                or input_coverage.get("schema_version") != 3
+                or input_coverage.get("coverage_ok") is not True
+            ):
+                missing_inputs.append("hunt_coverage.coverage_ok != true")
+            elif (
+                input_coverage.get("batch_size") != expected_hunt_policy["batch_size"]
+                or input_coverage.get("token_budget") != expected_hunt_policy["token_budget"]
+            ):
+                missing_inputs.append("Hunter batch policy does not match run_manifest")
             else:
-                missing_inputs.append(".scan/tmp/hunt_result_*.json")
+                for field, expected_path in (
+                    ("scope_receipt", hunt_scope_path),
+                    ("context_scope_receipt", context_scope_path),
+                ):
+                    receipt = input_coverage.get(field)
+                    try:
+                        bound_scope_path = resolve_repo_path(
+                            repo,
+                            receipt.get("file", "") if isinstance(receipt, dict) else "",
+                            label=f"hunt_coverage.{field}.file",
+                        )
+                    except ValueError as exc:
+                        missing_inputs.append(str(exc))
+                        continue
+                    if bound_scope_path != expected_path.resolve():
+                        missing_inputs.append(f"hunt_coverage.{field} does not bind current scope")
+
+            try:
+                hunter_coverage = json.loads(hunt_coverage_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                hunter_coverage = {}
+            if not isinstance(hunter_coverage, dict) or hunter_coverage.get("ok") is not True:
+                missing_inputs.append("hunt_perspective_coverage.ok != true")
+            else:
+                min_samples = hunter_coverage.get("min_samples")
+                if type(min_samples) is not int or min_samples < 1:
+                    missing_inputs.append("hunt_perspective_coverage.min_samples missing or invalid")
+                elif min_samples != expected_hunt_policy["samples"]:
+                    missing_inputs.append("Hunter sample count does not match run_manifest")
+                else:
+                    live_hunter = check_hunt_coverage(
+                        tmp_dir, hunt_input_coverage, min_samples, repo_root=repo,
+                    )
+                    if live_hunter.get("ok") is not True:
+                        missing_inputs.append("live Hunter coverage revalidation failed")
+                    elif not strict_json_equal(live_hunter, hunter_coverage):
+                        missing_inputs.append("Hunter coverage receipt does not match live artifacts")
+
+            try:
+                gap_coverage = json.loads(gap_audit_coverage_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                gap_coverage = {}
+            if not isinstance(gap_coverage, dict) or gap_coverage.get("ok") is not True:
+                missing_inputs.append("gap_audit_coverage.ok != true")
+            else:
+                live_gap = check_gap_audit_coverage(
+                    repo, tmp_dir, gap_plan, write_output=False,
+                )
+                if live_gap.get("ok") is not True:
+                    missing_inputs.append("live gap-audit coverage revalidation failed")
+                elif not strict_json_equal(live_gap, gap_coverage):
+                    missing_inputs.append("gap-audit coverage receipt does not match live artifacts")
+
+            # Bind the live production files reviewed by both AI passes.  If a
+            # source changes after coverage checks, report rendering will
+            # invalidate this receipt instead of presenting stale conclusions.
+            if isinstance(input_coverage, dict):
+                for detail in input_coverage.get("batches_detail", []):
+                    if not isinstance(detail, dict):
+                        continue
+                    for rel in detail.get("files", []):
+                        try:
+                            normalized = _validated_repo_file(
+                                repo, rel, "hunt_coverage.batches_detail.files",
+                            )
+                        except ValueError as exc:
+                            missing_inputs.append(str(exc))
+                            continue
+                        required_paths.append(repo / normalized)
         missing_inputs.extend(
             _display_path(repo, path) for path in required_paths if not path.is_file()
         )
         artifact_paths = [*required_paths, *artifact_paths]
     artifact_paths = list(dict.fromkeys(path.resolve() for path in artifact_paths if path.is_file()))
     receipt_ok = not missing_inputs
+    if receipt_ok:
+        atomic_write_json(findings_path, {"schema_version": 4, "findings": findings_list})
+        atomic_write_json(
+            needs_review_path,
+            {"schema_version": 2, "needs_review": needs_review_list},
+        )
+        artifact_paths.extend((findings_path.resolve(), needs_review_path.resolve()))
     atomic_write_json(receipt_path, {
         "ok": receipt_ok,
         "reason": "" if receipt_ok else "missing pipeline inputs: " + ", ".join(missing_inputs),
         "run_id": run_manifest.get("run_id", "unknown"),
+        "skill_fingerprint": run_manifest.get("skill_fingerprint", ""),
+        "run_manifest_invariants_sha256": run_manifest_invariant_fingerprint(run_manifest),
         "verified_glob": args.verified_glob or None,
         "verify_coverage": args.verify_coverage if args.verified_glob else None,
         "artifacts_sha256": [_artifact_digest(repo, path) for path in artifact_paths],
         "results": {"confirmed": len(findings_list), "needs_review": len(needs_review_list)},
         "stats": out,
     })
+    if not receipt_ok:
+        print("合并完整性回执失败: " + ", ".join(missing_inputs), file=sys.stderr)
+        return 2
     print(json.dumps(out, ensure_ascii=False))
     return 0
 
 
 def _repo_path(repo: Path, raw: str | Path) -> Path:
-    path = Path(raw)
-    return path if path.is_absolute() else repo / path
+    return resolve_cli_path(repo, raw, label="pipeline path")
 
 
 def _verified_paths(pattern: str, repo: Path) -> list[Path]:
-    raw_pattern = pattern if Path(pattern).is_absolute() else str(repo / pattern)
-    return sorted(Path(raw).resolve() for raw in glob.glob(raw_pattern))
+    return expand_cli_glob(repo, pattern, label="verified output glob")
 
 
 def _artifact_digest(repo: Path, path: Path) -> dict:
@@ -305,6 +515,42 @@ def _display_path(repo: Path, path: Path) -> str:
         return str(path.resolve())
 
 
+def _validated_repo_file(repo: Path, value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or Path(value).is_absolute():
+        raise ValueError(f"{label} 必须是仓库相对文件路径")
+    resolved = (repo / value).resolve()
+    try:
+        rel = resolved.relative_to(repo.resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"{label} 越出仓库: {value}") from exc
+    if not resolved.is_file():
+        raise ValueError(f"{label} 文件不存在: {rel}")
+    return rel
+
+
+def _validate_verified_locations(repo: Path, record: dict, source: Path) -> None:
+    """Reject model-created paths before they are persisted or exposed as links."""
+    record["file"] = _validated_repo_file(repo, record.get("file"), f"{source}: file")
+    root = record.get("root_cause")
+    if isinstance(root, dict) and "primary_file" in root:
+        root["primary_file"] = _validated_repo_file(
+            repo, root["primary_file"], f"{source}: root_cause.primary_file",
+        )
+    for field in ("dataflow_path", "origin_trace", "related_locations"):
+        locations = record.get(field)
+        if locations is None:
+            continue
+        if not isinstance(locations, list):
+            raise ValueError(f"{source}: {field} 必须是数组")
+        for index, location in enumerate(locations):
+            if not isinstance(location, dict):
+                raise ValueError(f"{source}: {field}[{index}] 必须是对象")
+            if "file" in location:
+                location["file"] = _validated_repo_file(
+                    repo, location["file"], f"{source}: {field}[{index}].file",
+                )
+
+
 def _verify_input_paths(repo: Path, coverage_path: Path) -> list[Path]:
     try:
         coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
@@ -319,13 +565,11 @@ def _verify_input_paths(repo: Path, coverage_path: Path) -> list[Path]:
     ]
 
 
-def _ai_hunt_required(repo: Path) -> bool:
-    config_path = repo / ".scan/config.json"
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        config = {}
-    excluded = config.get("excluded_engines", []) if isinstance(config, dict) else []
+def _ai_hunt_required(repo: Path, run_manifest: dict | None = None) -> bool:
+    # Use the scanner-generated invocation manifest rather than re-reading raw
+    # target configuration at the decision point.
+    manifest = run_manifest if isinstance(run_manifest, dict) else {}
+    excluded = manifest.get("effective_excluded_engines", [])
     if isinstance(excluded, list) and "ai" in excluded:
         return False
     hunt_scope = repo / ".scan/tmp/hunt_scope.txt"
@@ -333,6 +577,66 @@ def _ai_hunt_required(repo: Path) -> bool:
         return bool(hunt_scope.read_text(encoding="utf-8").strip())
     except OSError:
         return False
+
+
+def _engine_integrity_problems(engine_results: dict) -> list[str]:
+    stats = engine_results.get("engine_stats")
+    if not isinstance(stats, list) or not all(isinstance(item, dict) for item in stats):
+        return ["engine-results.engine_stats missing or invalid"]
+    names = [item.get("engine") for item in stats]
+    if any(not isinstance(name, str) or not name for name in names):
+        return ["engine-results contains an invalid engine name"]
+    problems: list[str] = []
+    if len(names) != len(set(names)):
+        problems.append("engine-results contains duplicate engine stats")
+    missing = EXPECTED_TOOL_ENGINES - set(names)
+    if missing:
+        problems.append("engine-results omitted engines: " + ", ".join(sorted(missing)))
+    unexpected = set(names) - EXPECTED_TOOL_ENGINES - {"scope_integrity"}
+    if unexpected:
+        problems.append("engine-results contains unknown engines: " + ", ".join(sorted(unexpected)))
+    statuses = [item.get("status") for item in stats]
+    if any(status not in ENGINE_STATUSES for status in statuses):
+        problems.append("engine-results contains invalid engine status")
+        return problems
+    expected_status = (
+        "incomplete" if set(statuses) & {"partial", "failed"}
+        else "complete_with_skips" if "skipped" in statuses
+        else "complete"
+    )
+    if engine_results.get("status") != expected_status:
+        problems.append("engine-results overall status does not match per-engine stats")
+    if engine_results.get("scan_complete") is not (expected_status == "complete"):
+        problems.append("engine-results.scan_complete does not match per-engine stats")
+
+    incomplete_names = sorted(
+        str(item["engine"])
+        for item in stats if item.get("status") in {"partial", "failed"}
+    )
+    skipped_stats = [item for item in stats if item.get("status") == "skipped"]
+    expected_gaps = [
+        {"engine": item["engine"], "reason": item.get("reason", "skipped")}
+        for item in skipped_stats
+    ]
+    expected_used = [
+        str(item["engine"])
+        for item in stats
+        if item.get("engine") in EXPECTED_TOOL_ENGINES
+        and item.get("status") in {"complete", "partial"}
+    ]
+    if engine_results.get("configured_complete") is not (not incomplete_names):
+        problems.append("engine-results.configured_complete does not match per-engine stats")
+    if engine_results.get("coverage_complete") is not (
+        not incomplete_names and not skipped_stats
+    ):
+        problems.append("engine-results.coverage_complete does not match per-engine stats")
+    if engine_results.get("incomplete_engines") != incomplete_names:
+        problems.append("engine-results.incomplete_engines does not match per-engine stats")
+    if engine_results.get("coverage_gaps") != expected_gaps:
+        problems.append("engine-results.coverage_gaps does not match skipped engines")
+    if engine_results.get("engines_used") != expected_used:
+        problems.append("engine-results.engines_used does not match per-engine stats")
+    return problems
 
 
 def _confirmed_record(cand: dict, fid: str, semantic: bool) -> dict:
@@ -471,7 +775,12 @@ def _load_verified_glob(pattern: str, coverage_path: Path, repo: Path) -> dict:
     if not coverage_file.is_file():
         raise ValueError(f"verifier 覆盖率清单不存在: {coverage_file}")
     coverage = json.loads(coverage_file.read_text(encoding="utf-8"))
-    if not isinstance(coverage, dict) or coverage.get("coverage_ok") is not True:
+    if (
+        not isinstance(coverage, dict)
+        or type(coverage.get("schema_version")) is not int
+        or coverage.get("schema_version") != 2
+        or coverage.get("coverage_ok") is not True
+    ):
         raise ValueError(f"verifier 覆盖率清单无效或 coverage_ok=false: {coverage_file}")
     batch_files = coverage.get("batch_files")
     if not isinstance(batch_files, list) or not all(isinstance(x, str) for x in batch_files):
@@ -479,10 +788,12 @@ def _load_verified_glob(pattern: str, coverage_path: Path, repo: Path) -> dict:
     if (
         type(coverage.get("candidates_input")) is not int
         or type(coverage.get("candidates_batched")) is not int
+        or type(coverage.get("batches")) is not int
         or coverage["candidates_input"] != coverage["candidates_batched"]
         or coverage.get("batches") != len(batch_files)
     ):
         raise ValueError(f"verifier 覆盖率计数不守恒: {coverage_file}")
+    _validate_verify_coverage_artifacts(coverage, repo, coverage_file)
     expected = {
         _repo_path(repo, raw).resolve().with_name(
             Path(raw).name.replace("verify_batch_", "verified_batch_", 1)
@@ -514,6 +825,10 @@ def _load_verified_glob(pattern: str, coverage_path: Path, repo: Path) -> dict:
         if not isinstance(input_obj, list):
             raise ValueError(f"verifier 输入批次必须是数组: {input_path}")
         _validate_adjudication(obj, path, batch_index, input_obj)
+        for record in obj.get("confirmed", []) + obj.get("needs_review", []):
+            if not isinstance(record, dict):
+                raise ValueError(f"verifier finding 必须是对象: {path}")
+            _validate_verified_locations(repo, record, path)
         confirmed.extend(obj.get("confirmed", []))
         needs_review.extend(obj.get("needs_review", []))
     return {"confirmed": confirmed, "needs_review": needs_review}
@@ -549,10 +864,26 @@ def _validate_adjudication(
             f"verifier 判定计数不守恒: {path} accounted={accounted}, input={input_count}"
         )
     if isinstance(input_items, list):
-        input_ids = {
-            str(item.get("candidate_id")) for item in input_items
+        input_by_id = {
+            str(item.get("candidate_id")): item for item in input_items
             if isinstance(item, dict) and item.get("candidate_id")
         }
+        input_ids = set(input_by_id)
+        if len(input_ids) != input_count:
+            raise ValueError(f"verifier 输入 candidate_id 缺失或重复: {path}")
+        false_ids = obj.get("false_positive_ids")
+        if (
+            not isinstance(false_ids, list)
+            or not all(isinstance(value, str) and value for value in false_ids)
+            or len(false_ids) != len(set(false_ids))
+            or len(false_ids) != false_count
+        ):
+            raise ValueError(f"verifier false_positive_ids 与计数不一致: {path}")
+        unknown_false = set(false_ids) - input_ids
+        if unknown_false:
+            raise ValueError(
+                f"verifier false_positive_ids 含未知 ID: {path} ids={sorted(unknown_false)}"
+            )
         emitted_ids: set[str] = set()
         for record in obj.get("confirmed", []) + obj.get("needs_review", []):
             root = record.get("root_cause") if isinstance(record, dict) else None
@@ -565,6 +896,8 @@ def _validate_adjudication(
             provenance = record.get("provenance")
             if not isinstance(source_ids, list) or not source_ids or not all(isinstance(x, str) for x in source_ids):
                 raise ValueError(f"verifier 输出缺少 source_candidate_ids: {path}")
+            if len(source_ids) != len(set(source_ids)):
+                raise ValueError(f"verifier finding 重复 source_candidate_ids: {path}")
             if not isinstance(provenance, list) or not provenance or not all(isinstance(x, dict) for x in provenance):
                 raise ValueError(f"verifier 输出缺少 provenance: {path}")
             unknown = set(source_ids) - input_ids
@@ -574,15 +907,128 @@ def _validate_adjudication(
             if repeated:
                 raise ValueError(f"同一 candidate_id 被输出到多个 finding: {path} ids={sorted(repeated)}")
             emitted_ids.update(source_ids)
-        expected_emitted = (
-            len(obj.get("confirmed", [])) + len(obj.get("needs_review", []))
-            + duplicate_count
-        )
+            expected_provenance: list[dict] = []
+            for source_id in source_ids:
+                values = input_by_id[source_id].get("provenance", [])
+                if isinstance(values, list):
+                    expected_provenance.extend(
+                        value for value in values if isinstance(value, dict)
+                    )
+            actual_provenance = {
+                json.dumps(value, sort_keys=True, ensure_ascii=False) for value in provenance
+            }
+            expected_provenance_set = {
+                json.dumps(value, sort_keys=True, ensure_ascii=False)
+                for value in expected_provenance
+            }
+            if len(actual_provenance) != len(provenance) or actual_provenance != expected_provenance_set:
+                raise ValueError(
+                    f"verifier finding provenance 未按输入 ID 原样守恒: {path}"
+                )
+        output_records = len(obj.get("confirmed", [])) + len(obj.get("needs_review", []))
+        expected_emitted = output_records + duplicate_count
         if len(emitted_ids) != expected_emitted:
             raise ValueError(
                 f"verifier provenance 数量不守恒: {path} "
                 f"emitted_ids={len(emitted_ids)}, expected={expected_emitted}"
             )
+        if emitted_ids & set(false_ids):
+            raise ValueError(f"candidate_id 同时被判为 finding 与 false positive: {path}")
+        if emitted_ids | set(false_ids) != input_ids:
+            missing_ids = sorted(input_ids - emitted_ids - set(false_ids))
+            raise ValueError(
+                f"verifier 未逐 ID 完整处理输入: {path} missing={missing_ids}"
+            )
+
+
+def _validate_verify_coverage_artifacts(coverage: dict, repo: Path, source: Path) -> None:
+    """Bind verifier batches to the exact candidate inputs used to build them."""
+    inputs = coverage.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        raise ValueError(f"verifier 覆盖率缺候选输入回执: {source}")
+    candidate_total = 0
+    for index, receipt in enumerate(inputs):
+        if not isinstance(receipt, dict):
+            raise ValueError(f"verifier 输入回执无效: {source} inputs[{index}]")
+        try:
+            path = resolve_repo_path(
+                repo,
+                receipt.get("file", ""),
+                label=f"verify coverage inputs[{index}].file",
+            )
+            raw = path.read_bytes()
+        except (OSError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+        if receipt.get("sha256") != hashlib.sha256(raw).hexdigest():
+            raise ValueError(f"verifier 候选输入在分批后发生变化: {path}")
+        count = receipt.get("candidates")
+        if type(count) is not int or count < 0:
+            raise ValueError(f"verifier 输入候选计数无效: {source} inputs[{index}]")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"verifier 候选输入 JSON 无效: {path}: {exc}") from exc
+        if isinstance(payload, list):
+            actual_count = len(payload)
+        elif isinstance(payload, dict) and isinstance(payload.get("candidates"), list):
+            actual_count = len(payload["candidates"])
+        else:
+            raise ValueError(f"verifier 候选输入缺 candidates 数组: {path}")
+        if actual_count != count:
+            raise ValueError(f"verifier 候选输入计数在分批后发生变化: {path}")
+        candidate_total += count
+    if candidate_total != coverage.get("candidates_input"):
+        raise ValueError(f"verifier 输入回执候选总数不守恒: {source}")
+
+    batch_files = coverage.get("batch_files", [])
+    receipts = coverage.get("batch_receipts")
+    if not isinstance(receipts, list) or len(receipts) != len(batch_files):
+        raise ValueError(f"verifier 批次哈希回执缺失: {source}")
+    expected_paths = {
+        resolve_repo_path(repo, raw, label="verify coverage batch file")
+        for raw in batch_files
+    }
+    seen_paths: set[Path] = set()
+    batched_total = 0
+    candidate_ids: set[str] = set()
+    for index, receipt in enumerate(receipts):
+        if not isinstance(receipt, dict):
+            raise ValueError(f"verifier 批次回执无效: {source} batch_receipts[{index}]")
+        path = resolve_repo_path(
+            repo,
+            receipt.get("file", ""),
+            label=f"verify coverage batch_receipts[{index}].file",
+        )
+        if path in seen_paths:
+            raise ValueError(f"verifier 批次回执重复: {path}")
+        seen_paths.add(path)
+        try:
+            raw = path.read_bytes()
+            batch = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"verifier 批次不可读: {path}: {exc}") from exc
+        if not isinstance(batch, list) or not all(isinstance(item, dict) for item in batch):
+            raise ValueError(f"verifier 批次必须是对象数组: {path}")
+        if receipt.get("sha256") != hashlib.sha256(raw).hexdigest():
+            raise ValueError(f"verifier 批次在生成后发生变化: {path}")
+        if type(receipt.get("candidates")) is not int or (
+            receipt.get("candidates") != len(batch)
+        ):
+            raise ValueError(f"verifier 批次候选计数变化: {path}")
+        batched_total += len(batch)
+        for item in batch:
+            candidate_id = item.get("candidate_id")
+            if not isinstance(candidate_id, str) or not candidate_id or candidate_id in candidate_ids:
+                raise ValueError(f"verifier 批次 candidate_id 缺失或重复: {path}")
+            candidate_ids.add(candidate_id)
+    if seen_paths != expected_paths:
+        raise ValueError(f"verifier 批次回执与 batch_files 不一致: {source}")
+    if batched_total != coverage.get("candidates_batched"):
+        raise ValueError(f"verifier 批次回执总数不守恒: {source}")
+    if type(coverage.get("candidate_ids_unique")) is not int or (
+        coverage.get("candidate_ids_unique") != len(candidate_ids)
+    ):
+        raise ValueError(f"verifier candidate_ids_unique 回执不一致: {source}")
 
 
 if __name__ == "__main__":

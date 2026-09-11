@@ -2,8 +2,8 @@
 """
 scan-android 预检工具
 
-在扫描开始前检查所有必需的引擎与环境条件，自动下载/修复可自动处理的问题，
-循环"检测 → 安装 → 再检测"直到 ready=true 或出现无法自动修复的阻塞项。
+在扫描开始前检查所有必需的引擎与环境条件。默认只读检测；只有调用方
+显式传入 --install-missing 时，才循环"检测 → 安装 → 再检测"。
 
 用法:
     python3 preflight.py [--repo-root DIR]
@@ -31,7 +31,8 @@ stdout JSON:
       "warnings": []
     }
 
-模式: Python 运行时是唯一硬前提。扫描引擎缺失会自动安装；仍不可用时记录为 warning，
+模式: Python 运行时是唯一硬前提。扫描引擎缺失默认只记录 warning；
+--install-missing 显式授权后才尝试安装，仍不可用时保留 warning，
 后续保留其他引擎的部分结果并把整次扫描标记为 incomplete。
 
 status 值语义:
@@ -42,7 +43,7 @@ status 值语义:
     skip    — 不需要此引擎（在 excluded_engines 中关闭，或依赖它的引擎都关了），跳过
 
 引擎预检范围规则（excluded_engines 中的引擎 → 工具 skip，不参与中断判定）:
-    • venv / semgrep / detekt / pmd — 自动安装；失败为 warning
+    • venv / semgrep / detekt / pmd — 只在 --install-missing 后安装；失败为 warning
     • lint                       — 仅在明确允许 Gradle 执行时启用
     • repomap                    — tree-sitter 语法索引；失败回退 source-nav
     • gradle_wrapper             — 仅在 Lint 已授权时检查
@@ -89,6 +90,7 @@ from tools.installer import (  # noqa: E402  (依赖上方 sys.path.insert)
     ensure_repomap_venv,
     REPOMAP_VENV_DIR,
 )
+from lib_scan import effective_excluded_engines, resolve_cli_path  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -137,7 +139,10 @@ class CheckResult:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _read_scan_config(repo_root: Path) -> dict:
-    config_path = repo_root / ".scan" / "config.json"
+    try:
+        config_path = resolve_cli_path(repo_root, ".scan/config.json", label="scan config")
+    except ValueError as exc:
+        return {"__config_error__": str(exc)}
     if not config_path.exists():
         return {}
     try:
@@ -230,16 +235,17 @@ def _detect_pmd(pmd_needed: bool) -> CheckResult:
 
 
 def _detect_repomap_venv(repo_root: Path) -> CheckResult:
-    """tree-sitter 语法索引层（nav_backend=auto/treesitter 时启用）。
+    """tree-sitter 语法索引层（调用方选择 auto/treesitter 时启用）。
 
     tree-sitter + tree-sitter-language-pack 装在独立 venv（~/.scan-android/repomap-venv/，
     比照 semgrep 隔离）。用于 hunter 的 RepoMap（签名骨架 + PageRank + 跨文件关系）与 verifier
     的语法级导航。**永不阻塞**——venv/包缺失则地图降级、导航自动回退 source-nav（纯标准库）。"""
     pref = (os.environ.get("SCAN_ANDROID_NAV_BACKEND") or "").strip().lower()
-    if not pref:
-        pref = str(_read_scan_config(repo_root).get("nav_backend", "")).strip().lower()
     if pref == "source":
-        return CheckResult("repomap", "skip", "nav_backend=source（纯标准库，无需 tree-sitter）")
+        return CheckResult(
+            "repomap", "skip",
+            "调用方 SCAN_ANDROID_NAV_BACKEND=source（纯标准库，无需 tree-sitter）",
+        )
     venv_py = REPOMAP_VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if venv_py.exists():
         # 校验包可导入
@@ -351,13 +357,17 @@ def _try_install(name: str) -> tuple[bool, str]:
 # 主流程：检测 → 安装 → 再检测，循环直到 ready 或无可安装项
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_preflight(repo_root: Path, install_missing: bool = False) -> dict:
-    config = dict(_read_scan_config(repo_root))
-    config_error = str(config.pop("__config_error__", ""))
-    raw_excluded = config.get("excluded_engines", [])
-    excluded_engines: list[str] = (
-        [str(x) for x in raw_excluded] if isinstance(raw_excluded, list) else []
-    )
+def run_preflight(
+    repo_root: Path,
+    install_missing: bool = False,
+    allow_build_execution: bool = False,
+    trust_project_config: bool = False,
+) -> dict:
+    declared_config = dict(_read_scan_config(repo_root))
+    config = dict(declared_config) if trust_project_config else {}
+    config_error = str(declared_config.get("__config_error__", ""))
+    config.pop("__config_error__", None)
+    excluded_engines = effective_excluded_engines(config)
 
     # 每个引擎是否需要（被配置排除的引擎不检测）。
     # excluded_engines 里的引擎 → 工具标记 skip，不参与就绪判定（决定 3）。
@@ -365,7 +375,9 @@ def run_preflight(repo_root: Path, install_missing: bool = False) -> dict:
     detekt_needed = "detekt" not in excluded_engines
     pmd_needed = "pmd" not in excluded_engines
     lint_needed = "lint" not in excluded_engines
-    allow_gradle_execution = config.get("allow_gradle_execution", False) is True
+    # Invocation capability only: target-controlled config is untrusted and
+    # cannot authorize execution of its own Gradle scripts.
+    allow_gradle_execution = allow_build_execution
     # 依赖关系：Detekt / PMD / Lint 需要 Java；Semgrep 需要 venv。
     java_needed = detekt_needed or pmd_needed or (lint_needed and allow_gradle_execution)
     venv_needed = semgrep_needed
@@ -431,6 +443,10 @@ def run_preflight(repo_root: Path, install_missing: bool = False) -> dict:
     warnings = [f"{r.name}: {r.detail}" for r in results if r.status == "missing"]
     if config_error:
         warnings.insert(0, f"config: 配置无效，已使用安全默认值: {config_error}")
+    if declared_config and not trust_project_config and not config_error:
+        warnings.insert(0, "config: 目标仓库扫描策略未受信任，未用于关闭预检项")
+    if declared_config.get("allow_gradle_execution") is True and not allow_build_execution:
+        warnings.insert(0, "config: 忽略 allow_gradle_execution；仅命令行 --allow-build-execution 可授权")
 
     return {
         "ready": len(blockers) == 0,
@@ -499,11 +515,24 @@ def main() -> int:
         "--install-missing", action="store_true",
         help="显式允许联网并将缺失引擎安装到 ~/.scan-android",
     )
+    ap.add_argument(
+        "--allow-build-execution", action="store_true",
+        help="允许预检目标仓库的 Gradle/Lint 执行前提；不会读取仓库配置作为授权",
+    )
+    ap.add_argument(
+        "--trust-project-config", action="store_true",
+        help="允许已审阅的仓库配置改变预检策略；不授予构建或联网能力",
+    )
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
 
-    result = run_preflight(repo_root, install_missing=args.install_missing)
+    result = run_preflight(
+        repo_root,
+        install_missing=args.install_missing,
+        allow_build_execution=args.allow_build_execution,
+        trust_project_config=args.trust_project_config,
+    )
 
     _print_summary(result)
 
