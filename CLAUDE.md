@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A collection of Claude Code **skills**. Currently one skill: `skills/scan-android/` (an Android source/APK scanner). Skills are **markdown-orchestrated**:
+A collection of Claude Code **skills**:
+
+- `skills/scan-android/` — an Android source/APK scanner.
+- `skills/teach/`, `skills/improve-notes/` — prompt-only skills (one SKILL.md each, no scripts) for deep-learning teaching and note improvement; Chinese output.
+
+Skills are **markdown-orchestrated**:
 
 - `skills/scan-android/SKILL.md` is the **single source of truth** for the scan workflow — Claude follows its numbered steps. Change behavior there, not by guessing.
 - `skills/scan-android/agents/*.md` (`hunter.md`, `verifier.md`) are **subagent prompt templates** filled by the orchestrator (`{PLACEHOLDER}` substitution), then dispatched as subagents.
